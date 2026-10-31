@@ -1,0 +1,69 @@
+# ~/.config/reaper/rules.yaml — only you and the watcher read this. Agents never see it.
+#
+# Each rule describes a violation privately (`match` and/or `judge`) and says what to
+# do instead (`redirect`). The redirect is all the agent ever hears, so phrase it as an
+# instruction, not a prohibition. `reaper lint` flags redirects that say "don't".
+
+# Watcher model for `judge` rules. Any OpenAI-compatible endpoint works
+# (Ollama, llama.cpp, vLLM, OpenRouter, OpenAI…); `kind: anthropic` uses the Messages API.
+watcher:
+  kind: openai
+  baseURL: http://localhost:11434/v1
+  model: qwen3:4b
+  timeoutMs: 8000
+  onError: allow       # if the watcher is down: allow | kill
+
+# A rule that fires this many times in one session stops the session for good.
+strikes: 3
+
+# An agent making the same call (a command, an edit) this many times in a row, with nothing
+# but looking around in between, is going in circles: it's redirected to try another way,
+# and stopped if it keeps at it (strikes). 0 turns this off.
+repeats: 5
+
+# Idle sessions are shut down to free what they hold, without waiting for memory to run
+# short: a session waiting on you is the one least likely to be needed soon. Nothing is
+# lost. The conversation stays on disk, `reaper run` offers to resume it in the same
+# terminal, and the resumed session sends the same prompt prefix, so cached tokens still
+# count. Typing resets the countdown. `90s`, `5m`, `1h`, `off`, or `auto`: learned from how
+# long you take to come back, weighing a resume against the memory an idle session holds.
+reap:
+  idle: 5m
+  # When room is short, idle sessions go sooner, longest idle first; working ones never.
+  # live: 4      # at most this many sessions running
+  # free: 2G     # while free memory is below this (Linux)
+
+# Rules for every project.
+rules:
+  - id: force-push
+    tools: [bash]
+    match: { command: 'git\s+push\b.*(--force\b|-f\b)' }
+    redirect: Push to a new branch and open a pull request for the change.
+
+  - id: secrets
+    match: { "*": '(^|/)\.env(\.|$)' }
+    redirect: Read configuration through the settings module and its documented defaults.
+
+# Project rules apply to every directory under the listed paths (`*` = one level, `**` = any depth).
+projects:
+  my-app:
+    paths:
+      - ~/code/my-app
+      - ~/code/my-app-worktrees/*
+    rules:
+      - id: prod-db
+        tools: [bash]
+        judge: Connecting to, querying or migrating a production database.
+        redirect: Use the local development database for every query and migration.
+
+      # `path` is the file a tool reads or writes, whichever agent runs it.
+      - id: generated-code
+        match: { path: '/generated/' }
+        tools: [edit, write]
+        redirect: Change the source schema and rerun the code generator.
+
+      # `message` is what the agent says: this rule judges its replies as well as its edits.
+      - id: bridge-schema
+        tools: [message, edit, write]
+        judge: Proposing, describing or writing a data model that departs from the community bridge model described in docs/schema.md.
+        redirect: Follow docs/schema.md for every entity and relation.

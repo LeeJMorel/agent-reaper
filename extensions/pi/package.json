@@ -1,0 +1,27 @@
+{
+  "name": "reaper-pi",
+  "private": true,
+  "version": "0.1.0",
+  "description": "reaper's pi extension. The reaper binary embeds it; npm is only for developing it.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/pi.ts"
+  },
+  "scripts": {
+    "pretest": "cargo build --quiet -p reaper",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check",
+    "fix": "biome check --write"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3"
+  }
+}
