@@ -5,6 +5,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flate2::read::GzDecoder;
 use reaper_core::paths;
@@ -34,7 +35,7 @@ pub fn binary(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
         return if path.is_file() { Ok(path) } else { Err(format!("no pi at {}", path.display())) };
     }
     let dir = paths::data_dir().join("pi").join(VERSION);
-    let exe = dir.join("pi").join("pi");
+    let exe = pi_in(&dir);
     if !exe.is_file() {
         let (name, sha) = asset(env::consts::OS, env::consts::ARCH).ok_or_else(|| {
             format!(
@@ -46,6 +47,10 @@ pub fn binary(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
         fetch(name, sha, &dir)?;
     }
     if exe.is_file() { Ok(exe) } else { Err(format!("pi {VERSION} unpacked without {}", exe.display())) }
+}
+
+fn pi_in(dir: &Path) -> PathBuf {
+    dir.join("pi").join("pi")
 }
 
 fn fetch(name: &str, sha: &str, dir: &Path) -> Result<(), String> {
@@ -72,14 +77,22 @@ fn verify(bytes: &[u8], expected: &str, name: &str) -> Result<(), String> {
     }
 }
 
-/// Unpacks beside `dir`, then moves into place: no half-installed pi after a crash.
+/// Unpacks beside `dir`, then moves into place: no half-installed pi after a crash, and
+/// fetches racing each other (two first runs, or threads in one) each unpack on their own.
 fn unpack(archive: &[u8], dir: &Path) -> std::io::Result<()> {
+    static UNPACKS: AtomicUsize = AtomicUsize::new(0);
     let parent = dir.parent().expect("versioned dir has a parent");
     fs::create_dir_all(parent)?;
-    let partial = parent.join(format!(".{VERSION}-partial-{}", std::process::id()));
+    let n = UNPACKS.fetch_add(1, Ordering::Relaxed);
+    let partial = parent.join(format!(".{VERSION}-partial-{}-{n}", std::process::id()));
     let _ = fs::remove_dir_all(&partial);
     tar::Archive::new(GzDecoder::new(archive)).unpack(&partial)?;
     if fs::rename(&partial, dir).is_err() {
+        // Something is there already: another fetch's pi, which is kept, or a broken one.
+        if !pi_in(dir).is_file() {
+            let _ = fs::remove_dir_all(dir);
+            let _ = fs::rename(&partial, dir);
+        }
         let _ = fs::remove_dir_all(&partial);
     }
     Ok(())
@@ -104,5 +117,32 @@ mod tests {
         let good = hex(&Sha256::digest(b"archive"));
         assert!(verify(b"archive", &good, "x").is_ok());
         assert!(verify(b"archive!", &good, "x").unwrap_err().contains("failed its checksum"));
+    }
+
+    #[test]
+    fn racing_fetches_over_a_broken_install_leave_one_whole_pi() {
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o755);
+        tar.append_data(&mut header, "pi/pi", &b"pi"[..]).unwrap();
+        let archive = tar.into_inner().unwrap().finish().unwrap();
+
+        let root = env::temp_dir().join(format!("reaper-pi-release-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join(VERSION);
+        // What a fetch cut short used to leave in place for good: the version, but no pi.
+        fs::create_dir_all(dir.join("pi")).unwrap();
+        fs::write(dir.join("pi").join("LICENSE"), "").unwrap();
+
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| unpack(&archive, &dir).unwrap());
+            }
+        });
+        assert!(pi_in(&dir).is_file());
+        let left: Vec<_> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [VERSION], "no partial unpacks are left behind");
+        let _ = fs::remove_dir_all(&root);
     }
 }
