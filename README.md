@@ -7,7 +7,7 @@
 <p align="center">Rules for coding agents that the agents never see.</p>
 
 <p align="center">
-  <a href="https://github.com/LeeJMorel/reaper/actions/workflows/ci.yml"><img src="https://github.com/LeeJMorel/reaper/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/LeeJMorel/agent-reaper/actions/workflows/ci.yml"><img src="https://github.com/LeeJMorel/agent-reaper/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/rust-1.89%2B-orange" alt="Rust 1.89+">
   <img src="https://img.shields.io/badge/agents-pi%20%C2%B7%20Claude%20Code-6e5494" alt="Works with pi and Claude Code">
@@ -57,11 +57,12 @@ runtime enforcement monitor).
 ## Install
 
 ```sh
-git clone https://github.com/LeeJMorel/reaper
-cargo install --path reaper/crates/reaper
+curl -fsSL https://github.com/LeeJMorel/agent-reaper/releases/latest/download/install.sh | sh
 ```
 
-That's the whole install: a single `reaper` binary (Rust 1.89+) with the pi extension built in.
+That's the whole install, on Linux and macOS: a single `reaper` binary with the pi extension
+built in. Run it again to update. To build it yourself (Rust 1.89+),
+`cargo install --git https://github.com/LeeJMorel/agent-reaper agent-reaper`.
 
 ## Quick start
 
@@ -209,7 +210,7 @@ model (see [docs/background.md](docs/background.md)). It runs for an hour or mor
 from a terminal, not alongside big builds:
 
 ```sh
-cargo test -p reaper --test eval -- --ignored --nocapture --test-threads=1
+cargo test -p agent-reaper --test eval -- --ignored --nocapture --test-threads=1
 ```
 
 ## License

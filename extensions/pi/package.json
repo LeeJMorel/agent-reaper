@@ -9,7 +9,7 @@
     ".": "./src/pi.ts"
   },
   "scripts": {
-    "pretest": "cargo build --quiet -p reaper",
+    "pretest": "cargo build --quiet -p agent-reaper",
     "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "lint": "biome check",

@@ -114,7 +114,7 @@ jobs:
           for tab in live rules mori; do "$REAPER" --dump $tab; done
       - uses: actions/upload-artifact@v7
         with:
-          name: reaper-linux-x86_64
+          name: agent-reaper-linux-x86_64
           path: target/release/reaper
           retention-days: 14
 

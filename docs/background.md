@@ -90,7 +90,7 @@ as specified. That shows the mechanisms work, not that they help.
   with Claude Code on a hosted model.
 
 The harness is `crates/reaper/tests/eval.rs`
-(`cargo test -p reaper --test eval -- --ignored --nocapture --test-threads=1`).
+(`cargo test -p agent-reaper --test eval -- --ignored --nocapture --test-threads=1`).
 
 ## References
 

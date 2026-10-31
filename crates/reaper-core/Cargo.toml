@@ -1,9 +1,14 @@
 [package]
-name = "reaper-core"
+name = "agent-reaper-core"
+description = "Rules, events and paths shared by agent-reaper's hooks and console."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "reaper_core"
 
 [dependencies]
 regress.workspace = true

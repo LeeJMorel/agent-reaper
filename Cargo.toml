@@ -7,9 +7,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
+repository = "https://github.com/LeeJMorel/agent-reaper"
 
 [workspace.dependencies]
-reaper-core = { version = "0.1.0", path = "crates/reaper-core" }
+agent-reaper-core = { version = "0.1.0", path = "crates/reaper-core" }
 regress = "0.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

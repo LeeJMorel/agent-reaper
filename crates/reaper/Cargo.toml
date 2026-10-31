@@ -1,21 +1,27 @@
 [package]
-name = "reaper"
+name = "agent-reaper"
+description = "Rules for coding agents that the agents never see."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 flate2 = "1.1.10"
 jiff = "0.2.38"
 ratatui = "0.30.2"
-reaper-core.workspace = true
+agent-reaper-core.workspace = true
 regress.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 sha2 = "0.11.1"
 tar = "0.4.46"
 ureq = "3.5.0"
+
+[[bin]]
+name = "reaper"
+path = "src/main.rs"
 
 [lints]
 workspace = true

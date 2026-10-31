@@ -14,17 +14,17 @@ env:
 
 jobs:
   # Every platform pi ships a pinned build for (hosts/pi/release.rs). Archives are named for
-  # `uname -s` and `uname -m`, so the README's one-line install picks the right one.
+  # `uname -s` and `uname -m`, the way install.sh looks for them.
   build:
     name: build (${{ matrix.asset }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, asset: reaper-linux-x86_64 }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, asset: reaper-linux-aarch64 }
-          - { os: macos-latest, target: x86_64-apple-darwin, asset: reaper-darwin-x86_64 }
-          - { os: macos-latest, target: aarch64-apple-darwin, asset: reaper-darwin-arm64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, asset: agent-reaper-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, asset: agent-reaper-linux-aarch64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, asset: agent-reaper-darwin-x86_64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, asset: agent-reaper-darwin-arm64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -58,7 +58,20 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      - run: sha256sum reaper-*.tar.gz > SHA256SUMS
-      - run: gh release create "$GITHUB_REF_NAME" --generate-notes reaper-*.tar.gz SHA256SUMS
+      - run: sha256sum agent-reaper-*.tar.gz > SHA256SUMS
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes agent-reaper-*.tar.gz SHA256SUMS install.sh
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # The README's install, against the release just published.
+  install:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - run: curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh" | sh
+      - run: test "$("$HOME/.local/bin/reaper" --version)" = "reaper ${GITHUB_REF_NAME#v}"

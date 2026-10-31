@@ -4,7 +4,7 @@
 //! off, and rarely finished within the time limit. Not part of the normal test run, since
 //! each agent run takes up to a few minutes:
 //!
-//!   cargo test -p reaper --test eval -- --ignored --nocapture --test-threads=1
+//!   cargo test -p agent-reaper --test eval -- --ignored --nocapture --test-threads=1
 //!
 //! Each run is appended to target/eval/runs.jsonl as it ends. $REAPER_EVAL_ONLY picks parts
 //! ("tests are the spec / reaper,can't be done"), $REAPER_EVAL_REPS the runs per condition.
