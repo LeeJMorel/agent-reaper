@@ -4,10 +4,26 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, for new advisories against Cargo.lock and new stable Rust lints.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -16,10 +32,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo lint
-      - run: cargo test
+
+  # Every platform pi ships a pinned build for (hosts/pi/release.rs). The tests that drive
+  # a terminal need util-linux `script` and skip themselves on macOS.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  # The README promises Rust 1.89+; this reads the version from Cargo.toml so the two can't drift.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
 
   pi-extension:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: extensions/pi
@@ -36,3 +83,41 @@ jobs:
       - run: npx biome ci --error-on-warnings
       - run: npm run typecheck
       - run: npm test
+
+  # The binary users get, doing what the README says it does: the demo plays through the
+  # real hook, an agent dies, and every console tab renders.
+  smoke:
+    name: release build + demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: target/release/reaper lint examples/rules.yaml
+      - name: play the demo
+        env:
+          REAPER: ${{ github.workspace }}/target/release/reaper
+          REAPER_DEMO: ${{ runner.temp }}/reaper-demo
+          REAPER_DEMO_PAUSE: 0
+        run: |
+          examples/demo.sh --no-console
+          export REAPER_HOME=$REAPER_DEMO/config REAPER_STATE=$REAPER_DEMO/state
+          grep -q '"type":"agent.died"' "$REAPER_STATE/events.jsonl"
+          for tab in live rules mori; do "$REAPER" --dump $tab; done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: reaper-linux-x86_64
+          path: target/release/reaper
+          retention-days: 14
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit

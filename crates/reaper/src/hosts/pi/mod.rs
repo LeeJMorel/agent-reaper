@@ -139,7 +139,9 @@ mod tests {
         let first = start("a");
         let mark = std::path::PathBuf::from(first["live"]["mark"].as_str().unwrap());
         assert!(!mark.exists(), "alone, nobody is in the way");
-        // The second session is the newest idle one, so the first goes.
+        // The second session is the newest idle one, so the first goes. Idle times are in ms,
+        // and two sessions started in the same one tie, leaving the pick to directory order.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let second = start("b");
         assert_eq!(std::fs::read_to_string(&mark).unwrap(), "crowded");
         assert!(!std::path::Path::new(second["live"]["mark"].as_str().unwrap()).exists());

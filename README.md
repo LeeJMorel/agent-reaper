@@ -6,26 +6,46 @@
 
 <p align="center">Rules for coding agents that the agents never see.</p>
 
+<p align="center">
+  <a href="https://github.com/LeeJMorel/reaper/actions/workflows/ci.yml"><img src="https://github.com/LeeJMorel/reaper/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/rust-1.89%2B-orange" alt="Rust 1.89+">
+  <img src="https://img.shields.io/badge/agents-pi%20%C2%B7%20Claude%20Code-6e5494" alt="Works with pi and Claude Code">
+</p>
+
 ---
 
 **Kill your agents, mercilessly and with gusto.**
 It's not murder if you can resume them.
 
+AI coding agents like Claude Code and pi will sometimes do things you'd never let a person
+do, like force-pushing over your work or running a migration against the production
+database. reaper checks every command an agent runs and every file it touches against a list
+of rules you wrote. When the agent tries something on the list, reaper stops it and gives it
+a better instruction instead ("use the local database"), and the agent keeps working without
+ever seeing the rule. An agent that breaks the same rule three times is killed. Agents you
+start through reaper are put down after five idle minutes to free up memory, and pick up
+exactly where they left off when you come back.
+
+You can watch all of this happen. The console's **memento mori** tab draws each agent as a
+small coloured rectangle with a name and a personality, and a narrator follows them as they
+work and get stopped. When an agent is killed, it dies on screen. How it dies is left for
+you to find out. If nothing is dying, press `d` and some stand-ins will do it for you.
+
+> Otto arrived. Nobody had asked Otto whether they wanted to arrive. Nobody ever asked.
+>
+> Otto went the other way, grumbling. It was a perfectly good way. That wasn't the point.
+>
+> Nobody had needed Otto for ages. So Otto lay down. Let them come looking.
+
 ## What it does
 
-You write down what your coding agents must never do: force-push, touch the production
-database, edit generated code, whatever matters in your project. The agents never see that
-list.
-
-reaper watches everything an agent does, every command it runs and every file it reads or
-edits, and, for rules that ask, what it says. When something breaks a rule, reaper stops it
-and tells the agent what to do instead: not "don't touch production" but "use the local
-database". The agent carries on with the better instruction and never learns the rule. In
-pi, the attempt is wiped from its memory too.
-
-An agent that breaks the same rule three times, or keeps repeating the same step, has its
-session ended. Agents you start through reaper are shut down after five idle minutes to free
-the memory, and pick up exactly where they were when you come back.
+A rule describes a violation privately, either as a pattern or in plain English for a small
+watcher model to judge, and says what to do instead. That redirect is the only thing the
+agent ever hears, so it's written as an instruction: not "don't touch production" but "use
+the local database". In pi, the blocked attempt is also wiped from the agent's memory. An
+agent that keeps repeating the same step is treated as breaking a rule too, so a stuck one
+gets nudged and then killed.
 
 Why hide the rules? Because telling a model "don't" works less well than you'd hope. In one
 study, models told not to bring up a topic still did: two open models as often as when told
@@ -165,7 +185,7 @@ Run `reaper` with no arguments:
 
 1. **live**: agents, violations and strikes as they happen
 2. **rules**: what's in force and where; `e` opens the file in `$EDITOR`
-3. **memento mori**: every agent as a small coloured rectangle with a name, working, getting redirected, dying
+3. **memento mori**: every agent as a small coloured rectangle with a name, working, getting redirected, dying; `d` plays a death on demand
 
 ## Development
 
@@ -180,7 +200,9 @@ npm run typecheck
 npm test             # the pi extension, run against the real binary
 ```
 
-CI runs the same checks and fails on any formatting difference or warning.
+CI runs the same checks on Linux (x86_64 and arm64) and macOS, fails on any formatting
+difference or warning, builds with the oldest supported Rust, and plays the demo against a
+release build.
 
 `crates/reaper/tests/eval.rs` measures reaper against baselines with a real agent and a local
 model (see [docs/background.md](docs/background.md)). It runs for an hour or more, so run it

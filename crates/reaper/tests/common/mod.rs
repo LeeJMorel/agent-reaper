@@ -220,7 +220,8 @@ impl Terminal {
 }
 
 pub fn has_terminal() -> bool {
-    let found = Path::new(SCRIPT).exists();
+    // macOS has a BSD `script` at the same path, which takes other flags.
+    let found = cfg!(target_os = "linux") && Path::new(SCRIPT).exists();
     if !found {
         eprintln!("skipped: needs util-linux script for a terminal");
     }
