@@ -1818,6 +1818,7 @@ mod tests {
             seen.push(m);
             let start = a.actors[0].death.unwrap().at;
             let stood = stage(&a, start - 1).actors[0].clone();
+            assert_eq!(stood.x, level(&a).x(Spot::Centre, 0, stood.w), "{m:?}: plays in the middle");
             let after = stage(&a, start + 6000);
             let actor = &after.actors[0];
             assert_eq!(actor.label, Some(Label::Epitaph(m.epitaph())), "{m:?}");
@@ -2169,6 +2170,8 @@ mod tests {
             let s = a.scene(now + 500, 80, 22);
             assert_eq!(s.strips.len(), 1, "never a strip");
             let stage = s.stage.unwrap();
+            let c = &stage.actors[0];
+            assert_eq!(c.x + c.w / 2, 40, "dropped into the middle");
             assert_eq!(stage.title.unwrap().text, format!("rehearsal · {}", expected.epitaph()));
             let after = a.scene(now + 6000, 80, 22).stage.unwrap();
             assert!(after.actors.iter().all(|c| c.label == Some(Label::Epitaph(expected.epitaph()))), "{expected:?}");

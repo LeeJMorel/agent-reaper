@@ -35,6 +35,8 @@ pub enum Spot {
     Landing,
     /// On the high ledge: the web.
     High,
+    /// The middle of the stage, where deaths play.
+    Centre,
     /// Just outside its own exit.
     Porch,
     Exit,
@@ -48,7 +50,7 @@ impl Spot {
             Spot::Bench { .. } => Some(Station::Bench),
             Spot::Lip | Spot::Landing => Some(Station::Engine),
             Spot::High => Some(Station::Window),
-            Spot::Start | Spot::Porch | Spot::Exit => None,
+            Spot::Start | Spot::Centre | Spot::Porch | Spot::Exit => None,
         }
     }
 
@@ -64,6 +66,7 @@ impl Spot {
             Spot::Start => 0,
             Spot::Shelf(i) => 4 + i64::from(i),
             Spot::Bench { slot, .. } => 9 + i64::from(slot) / 2,
+            Spot::Centre => 12,
             Spot::Lip => 13,
             Spot::Landing => 17,
             Spot::High => 20,
@@ -260,6 +263,8 @@ impl Level {
             Spot::Lip => self.lip + 1 - w - spread,
             Spot::Landing => self.landing + spread,
             Spot::High => self.high.0 + (self.high.1 - w) / 2,
+            // The first dead centre, the rest either side of it.
+            Spot::Centre => self.cols / 2 - w / 2 + [0, -1, 1][k % 3] * (w + 1),
             Spot::Exit => self.exit(k, w).0,
             Spot::Porch => self.exit(k, w).0 - w - 1,
         };

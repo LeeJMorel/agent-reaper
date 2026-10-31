@@ -841,6 +841,8 @@ impl Mori {
                 Spot::Exit => Spot::Porch,
                 spot => spot,
             },
+            // Stand-ins drop into the middle, where they die.
+            None if self.sessions[s].rehearsal.is_some() => Spot::Centre,
             None if who == Personality::Loner => Spot::Landing,
             None => Spot::Start,
         };
@@ -1170,6 +1172,8 @@ impl Mori {
             }
         }
         self.sessions[s].last_death = Some(method);
+        // Deaths play in the middle of the stage: it walks there first.
+        self.go(a, at, Spot::Centre);
         let c = &mut self.actors[a];
         c.alive = false;
         c.home = false;
