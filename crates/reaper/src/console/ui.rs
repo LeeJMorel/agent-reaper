@@ -259,11 +259,12 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
 /// Only the keys that do something just now, most useful first, so a narrow terminal loses
 /// the least useful.
 fn mori_keys(app: &App) -> Vec<(&'static str, &'static str)> {
-    let mut keys = vec![("←→", "switch session"), ("↑↓", "pick agent")];
+    let mut keys = vec![("←→", "switch session"), ("↑↓", "check on agent")];
     if app.mori.picked().is_some() {
-        keys.extend([("enter", "details"), ("esc", "unpick")]);
+        keys.extend([("enter", "details"), ("esc", "deselect")]);
     } else if !app.mori.following_the_action() {
-        keys.push(("esc", "follow activity"));
+        // Back to showing whichever session is busy.
+        keys.push(("esc", "auto-switch"));
     }
     if app.mori.prompt(app.mori_now()).is_some() {
         keys.push(("p", if app.prompt_open { "hide prompt" } else { "show prompt" }));
@@ -764,7 +765,7 @@ mod tests {
         assert!(!screen.contains("the stacks") && !screen.contains("the engine room"), "{screen}");
         assert!(rows[22].starts_with("████"), "land along the bottom: {screen}");
         assert!(rows[22].contains("▀▀▀"), "with a gap in it: {screen}");
-        assert!(rows[23].contains("pick"), "{screen}");
+        assert!(rows[23].contains("check on agent"), "{screen}");
         let Ok(mut terminal) = Terminal::new(TestBackend::new(80, 24));
         let Ok(_) = terminal.draw(|f| draw(f, &app));
         let buffer = terminal.backend().buffer();
@@ -790,7 +791,7 @@ mod tests {
         // At 80 columns, the demo death makes room for what picking adds.
         assert_eq!(
             screen.lines().last(),
-            Some(" ←→ switch session  ↑↓ pick agent  enter details  esc unpick  q quit"),
+            Some(" ←→ switch session  ↑↓ check on agent  enter details  esc deselect  q quit"),
             "{screen}"
         );
 
@@ -820,7 +821,7 @@ mod tests {
         assert!(rows[2].starts_with(" Make the tests pass. Then tidy up.") && rows[2].ends_with('…'), "{screen}");
         assert_eq!(rows[2].chars().count(), 79, "{screen}");
         assert_eq!(
-            rows[23], " ←→ switch session  ↑↓ pick agent  p show prompt  q quit  d demo a death",
+            rows[23], " ←→ switch session  ↑↓ check on agent  p show prompt  q quit  d demo a death",
             "only keys that do something: {screen}"
         );
 

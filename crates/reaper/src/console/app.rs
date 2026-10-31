@@ -501,6 +501,22 @@ pub mod tests {
     }
 
     #[test]
+    fn esc_lets_go_of_the_agent_then_of_the_chosen_session() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::Char('3')));
+        let auto = app.mori.followed();
+        app.on_key(key(KeyCode::Right));
+        assert_ne!(app.mori.followed(), auto, "chosen");
+        app.on_key(key(KeyCode::Up));
+        assert!(app.mori.picked().is_some());
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.mori.picked().is_none() && !app.mori.following_the_action(), "the agent first");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.mori.following_the_action());
+        assert_eq!(app.mori.followed(), auto, "back to the busy one");
+    }
+
+    #[test]
     fn kill_log_follows_the_newest_until_you_move() {
         let mut app = fixture();
         assert_eq!(app.selected_kill().map(|k| k.is_final), Some(true), "newest kill: the agent that died");

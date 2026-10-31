@@ -77,8 +77,8 @@ pub struct Mini {
     pub alive: bool,
     /// Reaped while idle, until resumed.
     pub asleep: bool,
-    /// In its exit, its turn over: not at work.
-    pub home: bool,
+    /// Not at work: home in its exit after a turn, or not given anything to do yet.
+    pub waiting: bool,
 }
 
 /// The followed session's level, and everyone on it.
@@ -348,7 +348,8 @@ impl Mori {
             .map(|&m| {
                 let c = &self.actors[m];
                 let dead = c.death.is_some_and(|d| d.at <= now) && !c.alive;
-                Mini { hue: c.hue, alive: !dead, asleep: c.asleep_at(now), home: c.home_at(now) }
+                let waiting = c.home_at(now) || self.status(m) == Some(Status::Idle);
+                Mini { hue: c.hue, alive: !dead, asleep: c.asleep_at(now), waiting }
             })
             .collect();
         let flash = session.kill_at.is_some_and(|k| now >= k && now < k + STRIP_FLASH_FOR);
@@ -2363,8 +2364,10 @@ mod tests {
         assert!(health(80_000).dead, "flat once it's dead");
 
         let mini = |t| a.scene(t, SIZE.0, SIZE.1).strips[0].minis[0];
-        assert!(!mini(42_000).home, "at work");
-        assert!(mini(46_000).home, "waiting for its next turn");
+        assert!(!mini(42_000).waiting, "at work");
+        assert!(mini(46_000).waiting, "waiting for its next turn");
+        let arrived = mori(&[spawn(0, "b", "m")]);
+        assert!(arrived.scene(5_000, SIZE.0, SIZE.1).strips[0].minis[0].waiting, "nothing to do yet");
     }
 
     #[test]

@@ -167,6 +167,40 @@ pub enum DeathReason {
     Together,
 }
 
+/// What the human wrote in a prompt, without the blocks agents wrap around it, like Claude
+/// Code's `<ide_selection>…</ide_selection>` or `<system-reminder>…`. Those tags have a `-` or
+/// `_` in their names, unlike HTML's. `None` when nothing the human wrote is left: a
+/// background task reporting back.
+pub fn written(text: &str) -> Option<&str> {
+    let tag = |name: &str| {
+        name.contains(['-', '_']) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    let mut text = text.trim();
+    loop {
+        let before = text;
+        if let Some(rest) = text.strip_prefix('<') {
+            let name = rest.split(['>', ' ', '\n']).next().unwrap_or_default();
+            let close = format!("</{name}>");
+            if tag(name)
+                && let Some(end) = text.find(&close)
+            {
+                text = text[end + close.len()..].trim_start();
+            }
+        }
+        if let Some(open) = text.strip_suffix('>').and_then(|t| t.rfind("</")) {
+            let name = &text[open + 2..text.len() - 1];
+            if tag(name)
+                && let Some(start) = text[..open].rfind(&format!("<{name}"))
+            {
+                text = text[..start].trim_end();
+            }
+        }
+        if text == before {
+            return (!text.is_empty()).then_some(text);
+        }
+    }
+}
+
 pub fn parse_line(line: &str) -> Option<Event> {
     let line = line.trim();
     if line.is_empty() {
@@ -178,6 +212,18 @@ pub fn parse_line(line: &str) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_is_what_the_human_wrote_without_what_their_editor_added() {
+        let opened = "<ide_opened_file>The user opened a.rs.</ide_opened_file>still no prompt?";
+        assert_eq!(written(opened), Some("still no prompt?"));
+        let around =
+            "<ide_selection lines=\"3\">fn a() {}</ide_selection>\n\nfix this\n<system-reminder>x</system-reminder>";
+        assert_eq!(written(around), Some("fix this"));
+        assert_eq!(written("<task-notification>done</task-notification>"), None, "a task reporting back");
+        assert_eq!(written("<div>keep</div> as written"), Some("<div>keep</div> as written"), "HTML stays");
+        assert_eq!(written("<ide_selection>cut off before the end"), Some("<ide_selection>cut off before the end"));
+    }
 
     #[test]
     fn parses_every_kind_written_by_the_engine() {

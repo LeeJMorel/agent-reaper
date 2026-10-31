@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::events::{DeathReason, Event, Kind, Tier};
+use crate::events::{DeathReason, Event, Kind, Tier, written};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -120,7 +120,9 @@ impl Model {
         agent.last_at = agent.last_at.max(event.at);
         // Kept apart from what it did: a prompt can run to pages.
         if let Kind::Prompted { prompt } = &event.kind {
-            agent.prompt.get_or_insert_with(|| prompt.clone());
+            if agent.prompt.is_none() {
+                agent.prompt = written(prompt).map(String::from);
+            }
             return;
         }
         if agent.recent.len() == RECENT {

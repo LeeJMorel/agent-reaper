@@ -559,8 +559,8 @@ impl Pen<'_> {
             } else if mini.asleep {
                 // Lying down, in its own colour: asleep, not gone.
                 ("▂", mini.hue.dim(0.6))
-            } else if mini.home {
-                // Hollow while it waits for its next turn: only those at work are solid.
+            } else if mini.waiting {
+                // Hollow while it waits for something to do: only those at work are solid.
                 ("▫", mini.hue.dim(0.6))
             } else {
                 ("▪", mini.hue)

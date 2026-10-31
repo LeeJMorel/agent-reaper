@@ -19,7 +19,7 @@ pub mod run;
 
 use std::path::PathBuf;
 
-use reaper_core::events::now;
+use reaper_core::events::{now, written};
 use serde_json::{Map, Value, json};
 
 use crate::engine::{Check, Decision, Engine};
@@ -114,8 +114,9 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
         }
         Some("warm") => {
             let goal = text(request, "goal");
-            if let Some(agent) = request["agent"].as_str().filter(|_| !goal.trim().is_empty()) {
-                let prompt: String = goal.chars().take(MAX_PROMPT).collect();
+            // Cut once the editor's context is off: a long selection would leave no prompt.
+            if let (Some(agent), Some(prompt)) = (request["agent"].as_str(), written(&goal)) {
+                let prompt: String = prompt.chars().take(MAX_PROMPT).collect();
                 engine.event(host, agent, "agent.prompted", json!({ "prompt": prompt }));
             }
             engine.warm(&PathBuf::from(text(request, "dir")), &goal);

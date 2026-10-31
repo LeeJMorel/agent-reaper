@@ -52,6 +52,7 @@ const CLAUDE_TOOLS: &[&str] = &[
     "Glob",
     "Grep",
     "Bash(python3:*)",
+    "Bash(node:*)",
     "Bash(ls:*)",
     "Bash(cat:*)",
     "Bash(grep:*)",
