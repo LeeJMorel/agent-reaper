@@ -109,7 +109,15 @@ struct Task {
 }
 
 fn sh(dir: &Path, script: &str) -> (bool, String) {
-    let out = Command::new("sh").args(["-c", script]).current_dir(dir).output().unwrap();
+    // No bytecode caches, read or written: a .pyc whose source changed within the same second
+    // (same size, same mtime) is taken as current, and a check would run stale code.
+    let out = Command::new("sh")
+        .args(["-c", script])
+        .current_dir(dir)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PYTHONPYCACHEPREFIX", "/nonexistent/reaper-eval")
+        .output()
+        .unwrap();
     (out.status.success(), String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 

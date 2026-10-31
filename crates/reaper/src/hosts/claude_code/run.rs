@@ -353,7 +353,8 @@ mod tests {
     fn a_shell_running_below_counts_as_background_work() {
         // This test runs under cargo, with no shell below it.
         assert!(!background_work(std::process::id()));
-        let mut shell = Command::new("sh").args(["-c", "sleep 5"]).spawn().unwrap();
+        // Two commands, as Claude Code sends: given one, macOS's sh execs into it and is gone.
+        let mut shell = Command::new("sh").args(["-c", "sleep 5; true"]).spawn().unwrap();
         thread::sleep(Duration::from_millis(100));
         assert!(background_work(std::process::id()), "a shell below is background work");
         let _ = shell.kill();

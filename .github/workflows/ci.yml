@@ -47,6 +47,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # tests/claude.rs drives the real `claude`. It isn't pinned, so the weekly run also
+      # catches a Claude Code release that breaks the hooks.
+      - name: install Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "REAPER_TEST_CLAUDE=$HOME/.local/bin/claude" >> "$GITHUB_ENV"
       - run: cargo test --workspace --locked
 
   # The README promises Rust 1.89+; this reads the version from Cargo.toml so the two can't drift.
