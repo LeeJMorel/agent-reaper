@@ -52,6 +52,9 @@ pub enum Kind {
         model: Option<String>,
         label: Option<String>,
     },
+    /// The human asked the session for something. Cut short: some prompts are whole files.
+    #[serde(rename = "agent.prompted")]
+    Prompted { prompt: String },
     #[serde(rename = "agent.acted")]
     Acted { tool: String },
     #[serde(rename = "agent.checked")]

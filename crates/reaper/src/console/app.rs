@@ -83,6 +83,8 @@ pub struct App {
     /// When memento mori next wants a frame, as of the last one drawn.
     pub mori_next: Cell<Option<i64>>,
     pub colors: Colors,
+    /// Memento mori shows the followed session's whole prompt, not just its start.
+    pub prompt_open: bool,
     /// The agents reaper is installed in, by name.
     pub guarded: Vec<&'static str>,
     /// A fixed memento mori clock, for frames printed by `--dump` and for tests.
@@ -112,6 +114,7 @@ impl App {
             mori: Mori::new(),
             mori_next: Cell::new(None),
             colors: Colors::detect(),
+            prompt_open: false,
             guarded: Vec::new(),
             clock: None,
             dirty: true,
@@ -276,6 +279,7 @@ impl App {
                 self.pane = Pane::Agents;
                 self.agent_sel = Some(id);
             }
+            KeyCode::Char('p') => self.prompt_open = !self.prompt_open,
             // A death for fun, played by stand-ins on a level of their own.
             KeyCode::Char('d') => {
                 self.mori.rehearse(now);

@@ -30,6 +30,8 @@ pub struct Agent {
     pub dir: Option<String>,
     pub model: Option<String>,
     pub label: Option<String>,
+    /// What the human first asked it for, which tells sessions apart.
+    pub prompt: Option<String>,
     pub status: Status,
     pub first_at: i64,
     pub last_at: i64,
@@ -116,6 +118,11 @@ impl Model {
         }
         let agent = self.agent_mut(event);
         agent.last_at = agent.last_at.max(event.at);
+        // Kept apart from what it did: a prompt can run to pages.
+        if let Kind::Prompted { prompt } = &event.kind {
+            agent.prompt.get_or_insert_with(|| prompt.clone());
+            return;
+        }
         if agent.recent.len() == RECENT {
             agent.recent.pop_front();
         }
@@ -193,7 +200,7 @@ impl Model {
                     }
                 }
             }
-            Kind::Idle | Kind::Reaped { .. } | Kind::Unknown => {}
+            Kind::Idle | Kind::Reaped { .. } | Kind::Prompted { .. } | Kind::Unknown => {}
         }
     }
 
@@ -207,6 +214,7 @@ impl Model {
                 dir: None,
                 model: None,
                 label: None,
+                prompt: None,
                 status: Status::Idle,
                 first_at: event.at,
                 last_at: event.at,

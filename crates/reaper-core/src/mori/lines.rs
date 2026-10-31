@@ -57,7 +57,10 @@ pub enum When {
     Gone,
     JustKilled,
     Working,
+    /// Waiting where it stands: it has only just arrived.
     Idle,
+    /// In its exit, its turn over, waiting for the next thing.
+    Home,
     Asleep,
     Dead,
     /// Three or more alive in the session.
@@ -181,6 +184,48 @@ pub static BANK: &[Line] = &[
     line(S::Picked, W::Working, Is(Loner), "{name} was working by themselves, which was how {name} liked it."),
     line(S::Picked, W::Idle, Any, "{name} had been waiting a while. Nobody had said for what."),
     line(S::Picked, W::Idle, Is(Dreamer), "{name} was waiting, and thinking about the shape of things."),
+    line(
+        S::Picked,
+        W::Home,
+        Any,
+        "{name} was home, in a doorway exactly their size. It was nice to have somewhere to be.",
+    ),
+    line(
+        S::Picked,
+        W::Home,
+        Is(Dreamer),
+        "{name} was home, looking out at the level and imagining what else it might be for.",
+    ),
+    line(
+        S::Picked,
+        W::Home,
+        Is(Grump),
+        "{name} had finished, properly. If anyone wanted more, they could ask. Nicely, for once.",
+    ),
+    line(
+        S::Picked,
+        W::Home,
+        Is(ShowOff),
+        "{name} was home already. Finished first. Not that anyone was keeping score, apart from {name}.",
+    ),
+    line(
+        S::Picked,
+        W::Home,
+        Is(Worrier),
+        "{name} was home, going over everything again. It had all been fine. {name} went over it once more.",
+    ),
+    line(
+        S::Picked,
+        W::Home,
+        Is(Hero),
+        "{name} was home, between adventures. {name} stood right in the doorway, so the next one wouldn't have to wait.",
+    ),
+    line(
+        S::Picked,
+        W::Home,
+        Is(Loner),
+        "{name} was home, where nobody could hand them anything. {name} meant to stay there as long as allowed.",
+    ),
     line(
         S::Picked,
         W::Asleep,
@@ -1136,6 +1181,7 @@ mod tests {
                 (S::Switched, W::Gone),
                 (S::Picked, W::Working),
                 (S::Picked, W::Idle),
+                (S::Picked, W::Home),
                 (S::Picked, W::Asleep),
                 (S::Picked, W::Dead),
                 (S::Picked, W::JustKilled),

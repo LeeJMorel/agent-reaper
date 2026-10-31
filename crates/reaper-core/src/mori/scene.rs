@@ -51,7 +51,7 @@ pub(super) fn life(text: &str) -> i64 {
 
 #[derive(Debug, Clone)]
 pub struct Scene {
-    /// Every session in order of appearance; the followed one is on the stage.
+    /// Every session in the order of their numbers; the followed one is on the stage.
     pub strips: Vec<Strip>,
     pub stage: Option<Stage>,
     /// When the scene next changes by itself, if it does before the next event.
@@ -85,6 +85,8 @@ pub struct Mini {
 #[derive(Debug, Clone)]
 pub struct Stage {
     pub number: usize,
+    /// What the human first asked the session for, as logged (cut short).
+    pub prompt: Option<String>,
     pub title: Option<Title>,
     /// The lights are down: the reaper has come.
     pub dim: bool,
@@ -322,10 +324,7 @@ impl Mori {
         let followed = self.shown(now);
         // Sessions where everyone has died leave a while later; redraw when they do.
         (0..self.sessions.len()).filter_map(|s| self.gone_at(s)).for_each(|at| pace.at(at));
-        let strips = (0..self.sessions.len())
-            .filter(|&s| self.listed(s, now))
-            .map(|s| self.strip(s, followed == Some(s), &mut pace))
-            .collect();
+        let strips = self.on_screen(now).into_iter().map(|s| self.strip(s, followed == Some(s), &mut pace)).collect();
         let stage = followed.map(|s| {
             let level = Level::new(&self.sessions[s].plan, cols, rows);
             let mut build = Build::new(self, s, level, pace);
@@ -362,7 +361,7 @@ impl Mori {
             pace.at(*at);
             (now >= *at && session.last_at <= *at).then(|| line.clone())
         });
-        Strip { number: self.number(s), followed, minis, flash, line, last_at: session.last_at }
+        Strip { number: session.number, followed, minis, flash, line, last_at: session.last_at }
     }
 
     /// Who is on the stage: everyone, unless there's no room, when the dead go first (oldest
@@ -530,7 +529,8 @@ impl<'a> Build<'a> {
         let title = self.title();
         cracks.append(&mut self.cuts);
         Stage {
-            number: mori.number(s),
+            number: mori.sessions[s].number,
+            prompt: mori.model.agent(&mori.sessions[s].root).and_then(|a| a.prompt.clone()),
             title,
             dim: self.dim,
             filming: self.filming,
@@ -1604,7 +1604,7 @@ impl<'a> Build<'a> {
         }
         let session = &self.mori.sessions[self.s];
         let lead = self.mori.actors[*session.members.first()?].name;
-        let n = self.mori.number(self.s);
+        let n = session.number;
         let here = session.members.iter().filter(|&&m| self.mori.here(m, self.now)).count();
         let text = match (session.rehearsal, here) {
             (Some(method), _) => format!("rehearsal · {}", method.epitaph()),
@@ -2069,6 +2069,39 @@ mod tests {
     }
 
     #[test]
+    fn a_new_session_takes_the_lowest_number_free_and_strips_go_in_number_order() {
+        let numbers = |m: &Mori, t| m.scene(t, 80, 22).strips.iter().map(|s| s.number).collect::<Vec<_>>();
+        let mut a =
+            mori(&[spawn(0, "a", "m"), spawn(10, "b", "m"), spawn(20, "c", "m"), event(1_000, "b", "agent.ended", "")]);
+        let gone = a.actors[1].ended.unwrap() + DEPART_TEST;
+        assert_eq!(numbers(&a, gone), [1, 3], "the others keep theirs");
+        a.push(parse_line(&spawn(gone, "d", "m")));
+        a.push(parse_line(&spawn(gone + 10, "e", "m")));
+        a.advance(gone + 10);
+        assert_eq!(numbers(&a, gone + 20), [1, 2, 3, 4], "2 is taken again, then the next free");
+        a.choose(0);
+        a.switch(1, gone + 30);
+        assert_eq!(a.followed(), Some(3), "switching goes along the row");
+
+        // Back after leaving: its old number if that's still free, else the lowest that is.
+        a.push(parse_line(&spawn(gone + 40, "b", "m")));
+        a.advance(gone + 40);
+        assert_eq!(a.sessions[1].number, 5, "2 went to d meanwhile");
+    }
+
+    #[test]
+    fn the_stage_has_what_the_human_first_asked_for() {
+        let a = mori(&[
+            spawn(0, "a", "m"),
+            event(10, "a", "agent.prompted", r#""prompt":"fix the tests""#),
+            sub(20, "a1", "a"),
+            event(30, "a", "agent.prompted", r#""prompt":"and the docs""#),
+        ]);
+        assert_eq!(stage(&a, 5_000).prompt.as_deref(), Some("fix the tests"));
+        assert_eq!(a.actors.len(), 2, "a prompt casts nobody");
+    }
+
+    #[test]
     fn a_session_quiet_for_half_a_day_leaves_until_it_does_something() {
         let quiet = crate::state::QUIET_FOR;
         let numbers = |m: &Mori, t| m.scene(t, 80, 22).strips.iter().map(|s| s.number).collect::<Vec<_>>();
@@ -2160,7 +2193,7 @@ mod tests {
         b.choose(0);
         let real = mori(&[spawn(0, "a", "m"), spawn(10, "z", "m")]);
         assert_eq!(real.scene(100, 80, 22).strips[1].number, 2);
-        assert_eq!(b.number(b.sessions.len() - 1), 1, "rehearsals take no number");
+        assert_eq!(b.sessions.last().unwrap().number, 0, "rehearsals take no number");
     }
 
     #[test]
@@ -2184,6 +2217,32 @@ mod tests {
         assert_eq!(a.picked(), Some("b1"));
         a.pick(1, 22_000);
         assert_eq!(a.picked(), Some("b1"), "stops at the end");
+    }
+
+    #[test]
+    fn those_at_home_get_lines_about_home_not_work() {
+        let mut a = mori(&[
+            spawn(0, "a", "m"),
+            acted(100, "a", "Read"),
+            event(1_000, "a", "agent.idle", ""),
+            spawn(2_000, "b", "m"),
+            acted(2_100, "b", "Read"),
+        ]);
+        let home = |m: &Mori, agent: &str, text: &str| {
+            let name = m.name(agent).unwrap();
+            super::super::lines::BANK.iter().any(|l| l.when == When::Home && l.text.replace("{name}", name) == text)
+        };
+        a.choose(1);
+        a.switch(1, 10_000);
+        assert_eq!(a.followed(), Some(0));
+        let line = stage(&a, 12_000).narration.expect("a line after the title card");
+        assert!(home(&a, "a", &line.text), "switched to: {}", line.text);
+        a.pick(1, 20_000);
+        assert!(home(&a, "a", &stage(&a, 20_100).narration.unwrap().text), "picked at home");
+        a.switch(1, 30_000);
+        a.pick(1, 40_000);
+        let line = stage(&a, 40_100).narration.unwrap();
+        assert!(!home(&a, "b", &line.text) && !line.text.contains("home"), "picked at work: {}", line.text);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{SCRIPT, Terminal, event, events, has_terminal, sse, text_of, wait_until, watcher_reply};
+use common::{SCRIPT, Terminal, event, events, has_terminal, kinds, sse, text_of, wait_until, watcher_reply};
 use serde_json::{Value, json};
 
 const TASK: &str = "MAKE_FILES: set up the marker files for this project.";
@@ -313,8 +313,11 @@ fn an_idle_session_is_reaped_and_resumes_where_it_left_off() {
     terminal.close();
 
     let events = events(&h.home);
-    let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
-    assert_eq!(kinds, ["agent.spawned", "agent.idle", "agent.reaped", "agent.spawned", "agent.reaped"], "{events:#?}");
+    assert_eq!(
+        kinds(&events),
+        ["agent.spawned", "agent.idle", "agent.reaped", "agent.spawned", "agent.reaped"],
+        "{events:#?}"
+    );
     let agent = &events[0]["agent"];
     assert!(events.iter().all(|e| &e["agent"] == agent), "resumed as the same agent");
     for reaped in events.iter().filter(|e| e["type"] == "agent.reaped") {
@@ -339,11 +342,8 @@ fn a_new_session_past_the_cap_makes_the_longest_idle_one_make_room() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let h = Home::new("crowded", "reap: { idle: 1h, live: 1 }");
     let kinds = |agent: &Value| -> Vec<String> {
-        events(&h.home)
-            .iter()
-            .filter(|e| &e["agent"] == agent)
-            .map(|e| e["type"].as_str().unwrap().to_string())
-            .collect()
+        let mine: Vec<Value> = events(&h.home).into_iter().filter(|e| &e["agent"] == agent).collect();
+        kinds(&mine).into_iter().map(String::from).collect()
     };
 
     let mut first = open(&h, "SAY_DONE: the first one.");
@@ -443,8 +443,11 @@ fn a_reaped_pi_started_by_a_script_says_how_to_bring_it_back() {
     again.screen.wait_for("to pick it up again: ", 1);
     again.close();
     let events = events(&h.home);
-    let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
-    assert_eq!(kinds, ["agent.spawned", "agent.idle", "agent.reaped", "agent.spawned", "agent.reaped"], "{events:#?}");
+    assert_eq!(
+        kinds(&events),
+        ["agent.spawned", "agent.idle", "agent.reaped", "agent.spawned", "agent.reaped"],
+        "{events:#?}"
+    );
     assert!(events.iter().all(|e| e["agent"] == events[0]["agent"]), "resumed as the same agent");
     assert_eq!(h.seen.lock().unwrap().agent.len(), 1, "resuming never sends the first prompt again");
 }

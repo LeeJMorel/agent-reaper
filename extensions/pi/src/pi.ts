@@ -260,9 +260,10 @@ export function reaper(ask: Ask = askReaper) {
 
     pi.on("input", async () => busy())
     // The human asked for something: checks are seconds away, so the watcher gets the rules
-    // and this task now, while the agent's own model call runs.
+    // and this task now, while the agent's own model call runs. The console shows the prompt.
     pi.on("before_agent_start", async (event, ctx) => {
-      if (event.messageType === "user") tell({ op: "warm", host: HOST, dir: ctx.cwd, goal: event.prompt })
+      if (event.messageType !== "user") return
+      tell({ op: "warm", host: HOST, agent: await agent(ctx), dir: ctx.cwd, goal: event.prompt })
     })
     pi.on("agent_start", async () => busy())
     pi.on("ui_prompt_start", async () => {

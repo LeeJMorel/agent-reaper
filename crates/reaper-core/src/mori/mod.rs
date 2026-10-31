@@ -399,6 +399,8 @@ impl Moment {
 #[derive(Debug, Clone)]
 struct Session {
     root: String,
+    /// As the human sees it; 0 for rehearsals, which take none.
+    number: usize,
     plan: Plan,
     /// Blocks in each pile on the bench once every push so far has landed.
     piles: Vec<u8>,
@@ -527,6 +529,13 @@ impl Mori {
         self.sessions[s].rehearsal.is_none() && !self.gone(s, now)
     }
 
+    /// The sessions shown as strips at `now`, in the order of their numbers.
+    fn on_screen(&self, now: i64) -> Vec<usize> {
+        let mut here: Vec<usize> = (0..self.sessions.len()).filter(|&s| self.listed(s, now)).collect();
+        here.sort_by_key(|&s| self.sessions[s].number);
+        here
+    }
+
     /// The session on the stage at `now`: the one followed, unless it has gone, in which case the
     /// action's, or else the most recently busy one still here.
     fn shown(&self, now: i64) -> Option<usize> {
@@ -536,9 +545,21 @@ impl Mori {
         })
     }
 
-    /// A session's number, as the human sees it: rehearsals don't take one.
-    fn number(&self, s: usize) -> usize {
-        self.sessions[..=s].iter().filter(|x| x.rehearsal.is_none()).count()
+    /// Numbers a session as it arrives, or comes back after leaving: the lowest number no
+    /// session on screen has, so numbers stay small. One coming back keeps its old number if
+    /// that's still free.
+    fn renumber(&mut self, s: usize, now: i64) {
+        if self.sessions[s].rehearsal.is_some() {
+            return;
+        }
+        let taken: Vec<usize> = (0..self.sessions.len())
+            .filter(|&x| x != s && self.listed(x, now))
+            .map(|x| self.sessions[x].number)
+            .collect();
+        let n = self.sessions[s].number;
+        if n == 0 || taken.contains(&n) {
+            self.sessions[s].number = (1..).find(|n| !taken.contains(n)).expect("a free number");
+        }
     }
 
     /// Plays a death for fun: stand-ins drop onto a level of their own and die, under a rehearsal
@@ -601,7 +622,7 @@ impl Mori {
 
     /// The next (`1`) or previous (`-1`) session still here, wrapping around.
     pub fn switch(&mut self, delta: isize, now: i64) {
-        let here: Vec<usize> = (0..self.sessions.len()).filter(|&s| self.listed(s, now)).collect();
+        let here = self.on_screen(now);
         if here.is_empty() {
             return;
         }
@@ -614,6 +635,17 @@ impl Mori {
         self.view.chosen = Some(here[next as usize]);
         self.view.picked = None;
         self.switched(now);
+    }
+
+    /// Nobody chose a session: the stage follows the action.
+    pub fn following_the_action(&self) -> bool {
+        self.view.chosen.is_none()
+    }
+
+    /// What the human first asked the session on the stage for.
+    pub fn prompt(&self, now: i64) -> Option<&str> {
+        let s = self.shown(now)?;
+        self.model.agent(&self.sessions[s].root)?.prompt.as_deref()
     }
 
     pub fn follow_the_action(&mut self, now: i64) -> bool {
@@ -646,6 +678,8 @@ impl Mori {
             When::Asleep
         } else if c.kill.as_ref().is_some_and(|k| now - k.at < JUST_KILLED) {
             When::JustKilled
+        } else if c.home {
+            When::Home
         } else if matches!(self.status(a), Some(Status::Idle | Status::Ended)) {
             When::Idle
         } else {
@@ -677,6 +711,11 @@ impl Mori {
             return;
         }
         self.model.apply(event);
+        // The model keeps what the human asked for; nobody moves for it.
+        if matches!(event.kind, Kind::Prompted { .. }) {
+            return;
+        }
+        let back = self.index.get(&event.agent).is_some_and(|&a| self.gone(self.actors[a].session, event.at));
         let a = self.character(event);
         let c = &mut self.actors[a];
         c.seq += 1;
@@ -686,6 +725,9 @@ impl Mori {
         // Anything but a turn ending says it's back: resumed, or reaped as it closed.
         if !matches!(event.kind, Kind::Ended | Kind::Idle) {
             c.ended = None;
+        }
+        if back || self.sessions[s].number == 0 {
+            self.renumber(s, event.at);
         }
 
         match &event.kind {
@@ -716,7 +758,7 @@ impl Mori {
                 self.end(a, event.at);
                 return;
             }
-            Kind::Unknown => {}
+            Kind::Prompted { .. } | Kind::Unknown => {}
         }
         self.follow_action(s, event.at);
     }
@@ -746,6 +788,7 @@ impl Mori {
                 let plan = Plan::new(&root);
                 self.sessions.push(Session {
                     root: root.clone(),
+                    number: 0,
                     piles: plan.piles.clone(),
                     settled: plan.piles.clone(),
                     plan,
@@ -1275,12 +1318,16 @@ impl Mori {
         let alive: Vec<usize> =
             members.iter().copied().filter(|&m| self.actors[m].alive && self.actors[m].ended.is_none()).collect();
         let Some(&lead) = alive.first().or(members.first()) else { return };
-        let when = match alive.len() {
-            0 => When::Gone,
-            1 => When::Alone,
-            _ => When::Team,
+        let c = &self.actors[lead];
+        // The team lines are about getting on with things: a lead at rest says how they are.
+        let (section, when) = match alive.len() {
+            0 => (Section::Switched, When::Gone),
+            _ if c.asleep => (Section::Picked, When::Asleep),
+            _ if c.home => (Section::Picked, When::Home),
+            1 => (Section::Switched, When::Alone),
+            _ => (Section::Switched, When::Team),
         };
-        self.say(lead, at + TEAM_LINE_AFTER, Section::Switched, when, 3, true);
+        self.say(lead, at + TEAM_LINE_AFTER, section, when, 3, true);
     }
 
     // ── the narrator ───────────────────────────────────────────────────────

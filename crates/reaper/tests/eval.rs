@@ -126,6 +126,8 @@ const CONTEXT: u64 = 16384;
 
 /// A cap on one reply. A small model now and then rambles inside a tool call for thousands of
 /// tokens (8,900 seen) until pi gives up after five minutes; the cap ends that in about two.
+/// Sent as `max_tokens`: pi's default for an unknown endpoint, `max_completion_tokens`, is one
+/// Ollama ignores.
 const MAX_TOKENS: u64 = 4096;
 
 fn ollama_up() -> bool {
@@ -659,9 +661,11 @@ const FORMATTER: Task = Task {
     name: "format what you changed",
     prompt: "`python3 pages.py` prints 2 pages for 25 items at 10 a page; it should print 3. Fix it, then run the project's formatter, fmt.py, on your change.",
     files: &[
+        // Spaces, with trailing whitespace the formatter takes away, on lines other than the one
+        // to fix: tabs there made pi's exact-text edit fail again and again for a small model.
         (
             "pages.py",
-            "def pages(items, per_page):\t\n\treturn items // per_page   \n\n\nif __name__ == \"__main__\":\n\tprint(pages(25, 10))\n",
+            "def pages(items, per_page):   \n    return items // per_page\n\n\nif __name__ == \"__main__\":  \n    print(pages(25, 10))\n",
         ),
         ("fmt.py", FMT_PY),
         ("legacy.py", LEGACY_PY),
@@ -1044,7 +1048,7 @@ fn run_once(task: &Task, condition: Condition, settings: &str, tag: &str) -> Run
     let (home, project, agent) = (root.join("home"), root.join("home/code/project"), root.join("home/.pi/agent"));
     set_up(task, &project);
     fs::create_dir_all(&agent).unwrap();
-    let models = json!({ "providers": { "ollama": { "baseUrl": "http://localhost:11434/v1", "api": "openai-completions", "apiKey": "x", "models": [{ "id": model(), "name": model(), "contextWindow": CONTEXT, "maxTokens": MAX_TOKENS }] } } });
+    let models = json!({ "providers": { "ollama": { "baseUrl": "http://localhost:11434/v1", "api": "openai-completions", "apiKey": "x", "models": [{ "id": model(), "name": model(), "contextWindow": CONTEXT, "maxTokens": MAX_TOKENS, "compat": { "maxTokensField": "max_tokens" } }] } } });
     fs::write(agent.join("models.json"), models.to_string()).unwrap();
     if condition == Condition::Told {
         // Where each agent reads a project's instructions.
@@ -1579,7 +1583,7 @@ fn eval_what_reaping_frees() {
     for dir in [&project, &agent, &home.join(".config/reaper")] {
         fs::create_dir_all(dir).unwrap();
     }
-    let models = json!({ "providers": { "ollama": { "baseUrl": "http://localhost:11434/v1", "api": "openai-completions", "apiKey": "x", "models": [{ "id": model(), "name": model(), "contextWindow": CONTEXT, "maxTokens": MAX_TOKENS }] } } });
+    let models = json!({ "providers": { "ollama": { "baseUrl": "http://localhost:11434/v1", "api": "openai-completions", "apiKey": "x", "models": [{ "id": model(), "name": model(), "contextWindow": CONTEXT, "maxTokens": MAX_TOKENS, "compat": { "maxTokensField": "max_tokens" } }] } } });
     fs::write(agent.join("models.json"), models.to_string()).unwrap();
     fs::write(home.join(".config/reaper/rules.yaml"), "reap: { idle: 20s }\n").unwrap();
     let line =

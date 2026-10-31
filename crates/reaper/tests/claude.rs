@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use common::{SCRIPT, Terminal, event, events, has_terminal, sse, text_of, watcher_reply};
+use common::{SCRIPT, Terminal, event, events, has_terminal, kinds, sse, text_of, watcher_reply};
 use serde_json::{Value, json};
 
 const TASK: &str = "MAKE_FILES: set up the marker files for this project.";
@@ -300,7 +300,9 @@ fn reaped_and_resumed(name: &str, launcher: bool) {
     common::wait_until("the watchers to leave", || fs::read_dir(&runs).is_ok_and(|mut d| d.next().is_none()));
 
     let events = events(&h.home);
-    let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    let prompts: Vec<&str> = events.iter().filter_map(|e| e["prompt"].as_str()).collect();
+    assert_eq!(prompts, [task], "{events:#?}");
+    let kinds = kinds(&events);
     // Claude Code ends its session as it's reaped; the reap, recorded once it has gone, wins.
     assert_eq!(
         kinds,

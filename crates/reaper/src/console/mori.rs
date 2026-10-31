@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use reaper_core::mori::{BLOCK, DEAD, DUSK, Effect, Health, LAND, Label, REAPER, Rgb, Stage, Strip, WHITE, ansi256};
 
 use super::app::App;
+use super::ui::rows;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Colors {
@@ -74,7 +75,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let buf = frame.buffer_mut();
     let mut pen = Pen { buf, area, colors, dim: false };
     match &scene.stage {
-        Some(stage) => pen.stage(stage),
+        Some(stage) => pen.stage(stage, app.prompt_open),
         None => pen.empty(app.mori.sessions() > 0),
     }
     pen.strips(&scene.strips);
@@ -198,7 +199,7 @@ impl Pen<'_> {
         }
     }
 
-    fn stage(&mut self, stage: &Stage) {
+    fn stage(&mut self, stage: &Stage, prompt_open: bool) {
         self.dim = stage.dim;
         let (w, h) = (i32::from(self.area.width), 2 * i32::from(self.area.height));
         let mut canvas = Canvas { w, h, pixels: (0..w * h).map(|i| (Px::Sky, self.sky(i / w.max(1)))).collect() };
@@ -324,10 +325,12 @@ impl Pen<'_> {
             }
         }
 
+        let mut said = None;
         if let Some(n) = &stage.narration {
             let cols = i32::from(self.area.width);
             let lines = wrap(&n.text, (cols - 4).clamp(12, 72) as usize);
             let top = (n.row - lines.len() as i32).max(1);
+            said = Some(top);
             let mut left = n.shown;
             for (i, line) in lines.iter().enumerate() {
                 let row = top + i as i32;
@@ -363,6 +366,65 @@ impl Pen<'_> {
             }
             let x = (i32::from(self.area.width) - title.text.chars().count() as i32) / 2;
             self.put(x, 1, &title.text, style);
+        }
+
+        // Opened, it covers the level; closed, it gives way to the title card and the narrator.
+        if let Some(prompt) = &stage.prompt {
+            if prompt_open {
+                self.prompt(prompt);
+            } else if stage.title.is_none() && said != Some(1) {
+                self.prompt_line(prompt, stage.filming.is_some());
+            }
+        }
+    }
+
+    /// Row 1, faint: the start of what the human asked the session for.
+    fn prompt_line(&mut self, prompt: &str, filming: bool) {
+        let room = usize::from(self.area.width).saturating_sub(if filming { 10 } else { 2 });
+        let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let text = if flat.chars().count() <= room {
+            flat
+        } else {
+            let mut cut: String = flat.chars().take(room.saturating_sub(1)).collect();
+            cut.push('…');
+            cut
+        };
+        let mut style = self.ink(WHITE, 0.5, 1);
+        if self.colors == Colors::Off {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        self.put(1, 1, &text, style);
+    }
+
+    /// From row 1 down, over the level: as much of the prompt as fits, in its own lines.
+    fn prompt(&mut self, prompt: &str) {
+        let width = usize::from(self.area.width).saturating_sub(2).max(1);
+        let most = usize::from(self.area.height).saturating_sub(3).max(1);
+        let mut lines = Vec::new();
+        for source in prompt.lines() {
+            match rows(source, width) {
+                // One blank line between paragraphs, however many there were.
+                rows if rows.is_empty() => {
+                    if lines.last().is_some_and(|l: &String| !l.is_empty()) {
+                        lines.push(String::new());
+                    }
+                }
+                rows => lines.extend(rows),
+            }
+        }
+        if lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        if lines.len() > most {
+            lines.truncate(most);
+            let last = lines.last_mut().expect("at least one");
+            *last = last.chars().take(width - 1).collect::<String>() + "…";
+        }
+        // A blank row under it keeps the words off the level.
+        lines.push(String::new());
+        for (i, line) in lines.iter().enumerate() {
+            let row = 1 + i as i32;
+            self.put(0, row, &format!(" {line:<width$} "), self.ink(WHITE, 0.0, row));
         }
     }
 

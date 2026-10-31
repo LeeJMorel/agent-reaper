@@ -4,7 +4,8 @@
 //!   {"op":"check","host":"pi","session":…,"agent":…,"dir":…,"tool":…,"args":{…},"goal":…}
 //!     → {"kind":"allow"} | {"kind":"kill","rule":…,"redirect":…,"strike":n,"final":bool,"reason"?:…}
 //!       (plus "problem" when the rules on disk can't be used)
-//!   {"op":"warm","dir":…,"goal":…}  → {"ok":true}, once the watcher has the session's prefix
+//!   {"op":"warm","host":…,"agent":…,"dir":…,"goal":…}  → {"ok":true}, once the watcher has
+//!     the session's prefix: the human asked for something, so the prompt is logged too
 //!   {"op":"event","host":"pi","agent":…,"type":"agent.idle",…fields}  → {"ok":true}
 //!     (agent.spawned and agent.idle add "reapAfterMs" while idle sessions are reaped: a
 //!     session starts out idle, and goes idle when its turn ends; for agent.reaped,
@@ -22,6 +23,9 @@ use reaper_core::events::now;
 use serde_json::{Map, Value, json};
 
 use crate::engine::{Check, Decision, Engine};
+
+/// Enough of a prompt to tell sessions apart by, and to read in the console.
+const MAX_PROMPT: usize = 2000;
 
 fn text(request: &Value, key: &str) -> String {
     request[key].as_str().unwrap_or_default().to_string()
@@ -109,7 +113,12 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
             reply
         }
         Some("warm") => {
-            engine.warm(&PathBuf::from(text(request, "dir")), &text(request, "goal"));
+            let goal = text(request, "goal");
+            if let Some(agent) = request["agent"].as_str().filter(|_| !goal.trim().is_empty()) {
+                let prompt: String = goal.chars().take(MAX_PROMPT).collect();
+                engine.event(host, agent, "agent.prompted", json!({ "prompt": prompt }));
+            }
+            engine.warm(&PathBuf::from(text(request, "dir")), &goal);
             json!({ "ok": true })
         }
         _ => json!({ "error": "unknown op" }),
@@ -204,5 +213,22 @@ mod tests {
             (event["host"].as_str(), event["project"].as_str(), event["dir"].as_str()),
             (Some("pi"), Some("app"), Some("/w/app/src"))
         );
+    }
+
+    #[test]
+    fn a_new_prompt_is_logged_cut_short() {
+        let sandbox = Sandbox::new("pi-prompt");
+        let engine = sandbox.engine("");
+        let long = "fix the tests ".repeat(500);
+        assert_eq!(
+            reply(&engine, &json!({ "op": "warm", "agent": "a", "dir": "/w", "goal": long })),
+            json!({ "ok": true })
+        );
+        reply(&engine, &json!({ "op": "warm", "dir": "/w", "goal": "from an older extension" }));
+        let log = std::fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
+        let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(events.len(), 1, "only with the agent it's for");
+        assert_eq!((events[0]["type"].as_str(), events[0]["agent"].as_str()), (Some("agent.prompted"), Some("a")));
+        assert_eq!(events[0]["prompt"].as_str().unwrap().chars().count(), MAX_PROMPT);
     }
 }

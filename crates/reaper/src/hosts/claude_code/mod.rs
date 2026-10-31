@@ -86,7 +86,8 @@ fn final_reply(path: &str) -> Option<String> {
 /// hook hands it to a `reaper engine` it doesn't wait for: Claude Code waits on the hook.
 pub fn warm_request(event: &Value) -> Option<Value> {
     (event["hook_event_name"] == "UserPromptSubmit").then_some(())?;
-    Some(json!({ "op": "warm", "dir": event["cwd"], "goal": event["prompt"].as_str()? }))
+    let (agent, goal) = (event["session_id"].as_str()?, event["prompt"].as_str()?);
+    Some(json!({ "op": "warm", "host": HOST, "agent": agent, "dir": event["cwd"], "goal": goal }))
 }
 
 /// What the session's watcher (see `watch`) should know after this event: the session, its
@@ -391,7 +392,10 @@ mod tests {
     #[test]
     fn a_new_prompt_warms_the_watcher_with_exactly_the_goal_checks_will_use() {
         let submit = json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/w", "prompt": "fix the tests" });
-        assert_eq!(warm_request(&submit), Some(json!({ "op": "warm", "dir": "/w", "goal": "fix the tests" })));
+        assert_eq!(
+            warm_request(&submit),
+            Some(json!({ "op": "warm", "host": HOST, "agent": "s1", "dir": "/w", "goal": "fix the tests" }))
+        );
         assert_eq!(warm_request(&pre_tool_use("ls")), None);
     }
 

@@ -70,9 +70,9 @@ fn field(name: &str, value: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Words longer than a line (JSON, paths) are split.
-fn wrapped(name: &str, text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
-    let room = width.saturating_sub(LABEL).max(8);
+/// Text as rows at most `room` wide. Words longer than a row (JSON, paths) are split.
+pub(super) fn rows(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(1);
     let mut rows = vec![String::new()];
     for word in text.split_whitespace() {
         let mut word: Vec<char> = word.chars().collect();
@@ -96,6 +96,11 @@ fn wrapped(name: &str, text: &str, style: Style, width: usize) -> Vec<Line<'stat
         }
     }
     rows.retain(|r| !r.is_empty());
+    rows
+}
+
+fn wrapped(name: &str, text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    let mut rows = rows(text, width.saturating_sub(LABEL).max(8));
     if rows.is_empty() {
         rows.push(String::new());
     }
@@ -228,26 +233,43 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if let Some(error) = &app.events_error {
         Line::styled(format!(" Can't read {}: {error}", tilde(app.events_path())), fg(ACCENT))
     } else {
-        let keys: &[(&str, &str)] = match app.tab {
-            Tab::Live => &[("1 2 3", "tabs"), ("tab", "pane"), ("↑↓", "select"), ("e", "edit rule"), ("q", "quit")],
-            Tab::Rules => &[("1 2 3", "tabs"), ("↑↓", "select"), ("e", "edit in your editor"), ("q", "quit")],
-            Tab::Mori => &[
-                ("←→", "session"),
-                ("↑↓", "pick"),
-                ("enter", "details"),
-                ("esc", "follow"),
-                ("d", "a death"),
-                ("q", "quit"),
-            ],
+        let keys = match app.tab {
+            Tab::Live => {
+                vec![("1 2 3", "tabs"), ("tab", "switch pane"), ("↑↓", "select"), ("e", "edit rule"), ("q", "quit")]
+            }
+            Tab::Rules => vec![("1 2 3", "tabs"), ("↑↓", "select"), ("e", "edit in your editor"), ("q", "quit")],
+            Tab::Mori => mori_keys(app),
         };
-        let mut spans = vec![Span::raw(" ")];
+        // A hint that doesn't fit is left out whole, not cut off.
+        let (mut spans, mut used) = (vec![Span::raw(" ")], 1);
         for (key, what) in keys {
-            spans.push(Span::styled(*key, bold()));
+            let len = key.chars().count() + 1 + what.chars().count();
+            if used + len > usize::from(area.width) {
+                continue;
+            }
+            used += len + 2;
+            spans.push(Span::styled(key, bold()));
             spans.push(Span::styled(format!(" {what}  "), dim()));
         }
         Line::from(spans)
     };
     frame.render_widget(line, area);
+}
+
+/// Only the keys that do something just now, most useful first, so a narrow terminal loses
+/// the least useful.
+fn mori_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![("←→", "switch session"), ("↑↓", "pick agent")];
+    if app.mori.picked().is_some() {
+        keys.extend([("enter", "details"), ("esc", "unpick")]);
+    } else if !app.mori.following_the_action() {
+        keys.push(("esc", "follow activity"));
+    }
+    if app.mori.prompt(app.mori_now()).is_some() {
+        keys.push(("p", if app.prompt_open { "hide prompt" } else { "show prompt" }));
+    }
+    keys.extend([("q", "quit"), ("d", "demo a death")]);
+    keys
 }
 
 // ── live tab ────────────────────────────────────────────────────────────────
@@ -260,7 +282,7 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
 
     let (rows, width) = (detail.height.saturating_sub(2) as usize, detail.width.saturating_sub(2) as usize);
     let text = match app.pane {
-        Pane::Agents => agent_detail(app, rows),
+        Pane::Agents => agent_detail(app, rows, width),
         Pane::Kills => kill_detail(app, width),
     };
     frame.render_widget(Paragraph::new(text).block(pane("Detail".into(), false)).wrap(Wrap { trim: false }), detail);
@@ -402,7 +424,7 @@ fn rule_terms(rule: &Rule, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn agent_detail(app: &App, rows: usize) -> Text<'static> {
+fn agent_detail(app: &App, rows: usize, width: usize) -> Text<'static> {
     let Some(a) = app.selected_agent() else {
         return Text::styled("Agents show up here once pi runs with the reaper extension.", dim());
     };
@@ -431,6 +453,12 @@ fn agent_detail(app: &App, rows: usize) -> Text<'static> {
             ))],
         ),
     ];
+    // A subagent works on its session's prompt. One line: some prompts are pages long.
+    let prompt = a.prompt.as_deref().or_else(|| app.model.agent(a.parent.as_deref()?)?.prompt.as_deref());
+    if let Some(prompt) = prompt {
+        let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.insert(2, field("prompt", vec![Span::raw(fit(&flat, width.saturating_sub(LABEL)))]));
+    }
     let room = rows.saturating_sub(lines.len());
     let recent: Vec<&Event> = a.recent.iter().rev().take(room).collect();
     for (i, event) in recent.into_iter().rev().enumerate() {
@@ -444,6 +472,7 @@ fn agent_detail(app: &App, rows: usize) -> Text<'static> {
 fn describe(event: &Event) -> Span<'static> {
     match &event.kind {
         Kind::Spawned { .. } => Span::raw("started"),
+        Kind::Prompted { .. } => Span::raw("asked for something"),
         Kind::Acted { tool } => Span::raw(format!("ran {tool}")),
         Kind::Checked { tool, error: Some(error), .. } => {
             Span::styled(format!("check of {tool} failed: {error}"), fg(ACCENT))
@@ -630,6 +659,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyCode;
+    use reaper_core::events::parse_line;
 
     pub fn render(app: &App, width: u16, height: u16) -> String {
         let Ok(mut terminal) = Terminal::new(TestBackend::new(width, height));
@@ -755,11 +785,60 @@ mod tests {
         let screen = render(&app, 80, 24);
         let piet = app.mori.name("01a18e1b-7417-7499-8113-59ad5578e845").unwrap();
         assert!(screen.contains(&format!("▾ {piet}")), "{screen}");
-        assert!(screen.contains(&format!("{piet} had been waiting a while.")), "{screen}");
+        // At home, its turn over: a line about being home, not about work.
+        assert!(screen.contains(&format!("{piet} was home already.")), "{screen}");
+        // At 80 columns, the demo death makes room for what picking adds.
+        assert_eq!(
+            screen.lines().last(),
+            Some(" ←→ switch session  ↑↓ pick agent  enter details  esc unpick  q quit"),
+            "{screen}"
+        );
 
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.tab, Tab::Live);
         assert_eq!(app.selected_agent().map(|a| a.id.as_str()), Some("01a18e1b-7417-7499-8113-59ad5578e845"));
+    }
+
+    #[test]
+    fn a_sessions_prompt_shows_on_one_line_and_opens_with_p() {
+        let mut app = fixture();
+        let piet = "01a18e1b-7417-7499-8113-59ad5578e845";
+        let prompt = format!("Make the tests pass.\n\n\n{}", "Then tidy up. ".repeat(150));
+        let line = serde_json::json!({ "at": 1_793_385_526_400_i64, "host": "pi", "agent": piet, "type": "agent.prompted", "prompt": prompt });
+        let mut events: Vec<Event> =
+            include_str!("../../../reaper-core/tests/fixtures/events.jsonl").lines().filter_map(parse_line).collect();
+        events.insert(1, parse_line(&line.to_string()).unwrap());
+        app.model = reaper_core::state::Model::default();
+        app.model.apply_all(&events);
+        app.mori.clear();
+        app.mori.push(events);
+        app.set_clock(app.now);
+        app.tab = Tab::Mori;
+
+        let screen = render(&app, 80, 24);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(rows[2].starts_with(" Make the tests pass. Then tidy up.") && rows[2].ends_with('…'), "{screen}");
+        assert_eq!(rows[2].chars().count(), 79, "{screen}");
+        assert_eq!(
+            rows[23], " ←→ switch session  ↑↓ pick agent  p show prompt  q quit  d demo a death",
+            "only keys that do something: {screen}"
+        );
+
+        app.on_key(key(KeyCode::Char('p')));
+        let screen = render(&app, 80, 24);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert_eq!(rows[2], " Make the tests pass.", "its own lines: {screen}");
+        assert_eq!(rows[3], "", "one blank line between paragraphs: {screen}");
+        assert!(rows[4].starts_with(" Then tidy up."), "{screen}");
+        assert!(rows[20].ends_with('…') && rows[21].is_empty(), "as much as fits: {screen}");
+        assert!(rows[23].contains("p hide prompt"), "{screen}");
+
+        app.on_key(key(KeyCode::Char('1')));
+        app.pane = Pane::Agents;
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.selected_agent().map(|a| a.id.as_str()), Some(piet));
+        let screen = render(&app, 110, 28);
+        assert!(screen.contains("prompt    Make the tests pass. Then tidy up."), "{screen}");
     }
 
     #[test]
