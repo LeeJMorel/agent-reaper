@@ -113,7 +113,7 @@ fn loop_rule() -> Rule {
 fn self_rules() -> [Rule; 2] {
     let home = paths::home().to_string_lossy().into_owned();
     let mut spellings = Vec::new();
-    for dir in [paths::config_dir(), paths::state_dir(), paths::cache_dir()] {
+    for dir in [paths::config_dir(), paths::state_dir(), paths::cache_dir(), paths::pi_extension_dir()] {
         let dir = dir.to_string_lossy().into_owned();
         if let Some(rest) = dir.strip_prefix(&home).filter(|r| r.starts_with('/') && !home.is_empty()) {
             spellings.extend([format!("~{rest}"), format!("$HOME{rest}")]);

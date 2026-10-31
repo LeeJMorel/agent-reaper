@@ -202,6 +202,9 @@ fn run(name: &str, strikes: u32) -> Outcome {
         requests.len(),
         requests.first().map(|r| r.chars().take(3000).collect::<String>()).unwrap_or_default()
     );
+    // A script's run (`-p`) is never reaped, so no watcher is left beside it.
+    let runs = home.join(".local/state/reaper/runs");
+    assert!(fs::read_dir(&runs).map_or(true, |mut d| d.next().is_none()), "a watcher for a -p run");
     Outcome { project, events, requests, report }
 }
 
@@ -242,16 +245,30 @@ fn the_strike_limit_stops_the_session() {
     assert_eq!(o.requests.len(), 1, "no model call after the stop: {:#?}", o.requests);
 }
 
-/// Claude Code in a terminal, started by `reaper claude` with no `reaper install`: the hooks
-/// come with the session. The human asks once and walks away; reaper shuts the idle session
-/// down, and enter brings it back (`claude --resume`) with its conversation, until it sits
-/// idle again and ctrl-d leaves.
+/// Claude Code in a terminal, started as usual, with the hooks `reaper install` put in place.
+/// The human asks once and walks away; the watcher the hook left reaps the idle session, and
+/// `claude --resume` brings it back with its conversation, until it sits idle again.
 #[test]
 fn an_idle_claude_session_is_reaped_and_resumes_where_it_left_off() {
+    reaped_and_resumed("reap", false);
+}
+
+/// The same, with a launcher between the shell and Claude Code: a script that runs it and,
+/// like many, would die of the signal without passing it on. Claude Code is what gets reaped,
+/// so the launcher lives to finish.
+#[test]
+fn a_claude_started_by_a_launcher_is_reaped_itself() {
+    reaped_and_resumed("launcher", true);
+}
+
+fn reaped_and_resumed(name: &str, launcher: bool) {
+    use std::os::unix::fs::PermissionsExt;
     if !has_terminal() {
         return;
     }
-    let h = Home::new("reap", "reap: { idle: 1s }");
+    let h = Home::new(name, "reap: { idle: 1s }");
+    let installed = h.command(env!("CARGO_BIN_EXE_reaper")).args(["install", "claude-code", "--yes"]).output().unwrap();
+    assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
     // A returning user, as far as Claude Code's first-run questions go.
     let project = h.project.to_string_lossy().into_owned();
     let config = json!({
@@ -261,27 +278,35 @@ fn an_idle_claude_session_is_reaped_and_resumes_where_it_left_off() {
         "projects": { project: { "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true } },
     });
     fs::write(h.claude_dir.join(".claude.json"), config.to_string()).unwrap();
+    let start = if launcher {
+        let script = h.root.join("launch-claude");
+        fs::write(&script, format!("#!/bin/sh\n'{}' \"$@\"\necho launcher finished\n", claude().display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    } else {
+        claude()
+    };
+    let open = |args: &str| {
+        let terminal = Terminal::open(h.command(SCRIPT), &format!("'{}' {args}; echo claude exited", start.display()));
+        terminal.screen.wait_for("claude exited", 1);
+        terminal.close()
+    };
 
     let task = "SAY_DONE: tell me when you are ready.";
-    let line = format!("exec '{}' claude '{task}'", env!("CARGO_BIN_EXE_reaper"));
-    let mut script = h.command(SCRIPT);
-    script.env("SHELL", "/bin/sh").env("TERM", "xterm-256color").env("REAPER_CLAUDE", claude());
-    let mut terminal = Terminal::open(script, &line);
-    terminal.screen.wait_for("press enter to resume", 1);
-    terminal.press(b"\n");
-    terminal.screen.wait_for("press enter to resume", 2);
-    terminal.press(b"\x04");
-    let screen = terminal.close();
+    let first = open(&format!("'{task}'"));
+    let session = events(&h.home)[0]["agent"].as_str().unwrap().to_string();
+    let again = open(&format!("--resume {session}"));
+    let runs = h.home.join(".local/state/reaper/runs");
+    common::wait_until("the watchers to leave", || fs::read_dir(&runs).is_ok_and(|mut d| d.next().is_none()));
 
     let events = events(&h.home);
     let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
     assert_eq!(
         kinds,
         ["agent.spawned", "agent.idle", "agent.reaped", "agent.spawned", "agent.reaped"],
-        "{events:#?}\n{screen}"
+        "{events:#?}\n{first}\n{again}"
     );
-    let agent = &events[0]["agent"];
-    assert!(events.iter().all(|e| &e["agent"] == agent), "resumed as the same session");
+    assert!(events.iter().all(|e| e["agent"] == session), "resumed as the same session");
     for reaped in events.iter().filter(|e| e["type"] == "agent.reaped") {
         assert_eq!(reaped["reason"], "idle");
         assert!(reaped["idle"].as_u64().unwrap() >= 1000, "{reaped}");
@@ -291,7 +316,9 @@ fn an_idle_claude_session_is_reaped_and_resumes_where_it_left_off() {
         );
     }
     assert_eq!(h.seen.lock().unwrap().len(), 1, "resuming never sends the first prompt again");
-    assert!(!h.claude_dir.join("settings.json").exists(), "the user's settings were never touched");
+    if launcher {
+        assert!(first.contains("launcher finished") && again.contains("launcher finished"), "{first}\n{again}");
+    }
 }
 
 /// What Claude says is judged too, by rules that list `message`: a reply that breaks one keeps

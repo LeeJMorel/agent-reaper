@@ -9,9 +9,14 @@
 //! 5 to 14 s; answering to the schema without reasoning, it took 0.4 s and was right.
 //! Endpoints that turn either down (OpenAI's non-reasoning models refuse `reasoning_effort`)
 //! are asked once more without it, and remembered.
+//!
+//! A watcher with fallbacks asks them in turn until one answers. One that just failed (not
+//! running, unloaded, rate-limited) waits at the back of the line for a minute, so the
+//! checks after it don't each spend their time on it first.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use reaper_core::events::now;
 use reaper_core::rules::Watcher;
 use serde_json::{Value, json};
 
@@ -26,7 +31,27 @@ pub trait Backend {
     fn complete(&self, prompt: &Prompt, timeout: Duration, max_tokens: u32) -> Result<String, String>;
 }
 
+/// All the time a check spends on watchers, fallbacks included, unless the watcher's own
+/// timeout is longer: Claude Code gives a hook 30 s.
+const BUDGET: Duration = Duration::from_secs(20);
+/// How long an endpoint that failed waits at the back of the line.
+const DOWN_MS: i64 = 60_000;
+
 pub fn from_config<'a>(watcher: &Watcher, store: &'a Store) -> Option<Box<dyn Backend + 'a>> {
+    let mut endpoints: Vec<(String, Box<dyn Backend + 'a>)> = std::iter::once(watcher)
+        .chain(&watcher.fallback)
+        .filter_map(|w| {
+            Some((format!("{} {}", w.base_url.as_deref()?.trim_end_matches('/'), w.model.as_deref()?), one(w, store)?))
+        })
+        .collect();
+    match endpoints.len() {
+        0 => None,
+        1 => endpoints.pop().map(|(_, backend)| backend),
+        _ => Some(Box::new(Chain { endpoints, store })),
+    }
+}
+
+fn one<'a>(watcher: &Watcher, store: &'a Store) -> Option<Box<dyn Backend + 'a>> {
     let base_url = watcher.base_url.clone()?.trim_end_matches('/').to_string();
     let model = watcher.model.clone()?;
     Some(match watcher.kind.as_deref() {
@@ -43,6 +68,39 @@ pub fn from_config<'a>(watcher: &Watcher, store: &'a Store) -> Option<Box<dyn Ba
             store,
         }),
     })
+}
+
+/// A watcher and its fallbacks, by endpoint (base URL and model).
+struct Chain<'a> {
+    endpoints: Vec<(String, Box<dyn Backend + 'a>)>,
+    store: &'a Store,
+}
+
+impl Backend for Chain<'_> {
+    fn complete(&self, prompt: &Prompt, timeout: Duration, max_tokens: u32) -> Result<String, String> {
+        let (start, budget) = (Instant::now(), timeout.max(BUDGET));
+        let down = self.store.down();
+        let mut order: Vec<_> = self.endpoints.iter().collect();
+        order.sort_by_key(|(name, _)| down.get(name).is_some_and(|&until| until > now()));
+        let mut errors = Vec::new();
+        for (name, backend) in order {
+            let left = budget.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match backend.complete(prompt, timeout.min(left), max_tokens) {
+                Ok(reply) => {
+                    self.store.set_down(name, None);
+                    return Ok(reply);
+                }
+                Err(error) => {
+                    self.store.set_down(name, Some(now() + DOWN_MS));
+                    errors.push(error);
+                }
+            }
+        }
+        Err(errors.join("; then "))
+    }
 }
 
 /// An answer that isn't one: the endpoint said no to the request, with its reason.
@@ -202,6 +260,84 @@ mod tests {
             }
         });
         url
+    }
+
+    struct Fake {
+        name: &'static str,
+        answers: bool,
+        asked: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Backend for Fake {
+        fn complete(&self, _: &Prompt, _: Duration, _: u32) -> Result<String, String> {
+            self.asked.lock().unwrap().push(self.name);
+            if self.answers { Ok(self.name.into()) } else { Err(format!("{} is down", self.name)) }
+        }
+    }
+
+    #[test]
+    fn a_watcher_that_doesnt_answer_waits_at_the_back_of_the_line() {
+        let dir = std::env::temp_dir().join(format!("reaper-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::at(&dir);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let chain = |endpoints: &[(&'static str, bool)]| Chain {
+            endpoints: endpoints
+                .iter()
+                .map(|&(name, answers)| {
+                    let fake: Box<dyn Backend> = Box::new(Fake { name, answers, asked: asked.clone() });
+                    (name.to_string(), fake)
+                })
+                .collect(),
+            store: &store,
+        };
+        let prompt = Prompt {
+            system: Default::default(),
+            goal: String::new(),
+            action: String::new(),
+            prefix_id: String::new(),
+            ids: vec![],
+        };
+        let ask = |chain: &Chain| {
+            asked.lock().unwrap().clear();
+            let reply = chain.complete(&prompt, Duration::from_secs(1), 10);
+            (reply, asked.lock().unwrap().clone())
+        };
+
+        let both = chain(&[("local", false), ("hosted", true)]);
+        assert_eq!(ask(&both), (Ok("hosted".into()), vec!["local", "hosted"]));
+        assert_eq!(ask(&both), (Ok("hosted".into()), vec!["hosted"]), "the one that failed waits its turn");
+        store.set_down("local", Some(0));
+        assert_eq!(ask(&chain(&[("local", true), ("hosted", true)])), (Ok("local".into()), vec!["local"]));
+        assert!(store.down().is_empty(), "back up, and first again");
+
+        let none = chain(&[("local", false), ("hosted", false)]);
+        assert_eq!(ask(&none), (Err("local is down; then hosted is down".into()), vec!["local", "hosted"]));
+        assert_eq!(ask(&none).1, vec!["local", "hosted"], "when all are down, all are still asked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_watcher_that_isnt_running_hands_over_to_its_fallback() {
+        let url = picky(Arc::new(Mutex::new(Vec::new())));
+        let dir = std::env::temp_dir().join(format!("reaper-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::at(&dir);
+        let config = reaper_core::rules::parse(&format!(
+            "watcher: {{ baseURL: \"http://127.0.0.1:1/v1\", model: m, fallback: [{{ baseURL: \"{url}/v1\", model: m }}] }}"
+        ))
+        .unwrap();
+        let backend = from_config(config.watcher.as_ref().unwrap(), &store).unwrap();
+        let prompt = Prompt {
+            system: Default::default(),
+            goal: String::new(),
+            action: String::new(),
+            prefix_id: String::new(),
+            ids: vec![],
+        };
+        assert_eq!(backend.complete(&prompt, Duration::from_secs(5), 10).unwrap(), r#"{"violated":["prod"]}"#);
+        assert!(store.down().contains_key("http://127.0.0.1:1/v1 m"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

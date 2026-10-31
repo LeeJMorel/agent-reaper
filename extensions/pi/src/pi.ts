@@ -15,7 +15,8 @@ import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@eare
  *   4. stop     — at the strike limit the run is terminated instead of redirected
  *   5. reap     — a session left idle (finished, nothing typed, no dialog open) for the time
  *                 the engine names is shut down, freeing what it holds. Its conversation is
- *                 saved, and `reaper run` offers to resume it in the same terminal. Under
+ *                 saved, and `reaper run` offers to resume it in the same terminal (a pi
+ *                 started some other way is told the command that resumes it). Under
  *                 pressure (too many sessions, memory short) the engine asks the longest idle
  *                 to go sooner, through the file it keeps in reaper's list of live sessions.
  *                 Only interactive sessions: print, JSON and RPC runs end or are driven by others.
@@ -35,19 +36,26 @@ type Kill = {
   reason?: "strikes" | "stop"
 }
 type Decision = ({ kind: "allow" } | Kill) & { problem?: string }
-type EventReply = { ok: true; reapAfterMs?: number; live?: { file: string; mark: string } }
+type EventReply = { ok: true; reapAfterMs?: number; live?: { file: string; mark: string }; say?: string }
 export type Ask = <Reply>(request: Record<string, unknown>) => Promise<Reply>
 
+/** Filled in by `reaper install pi` in the copy it puts where pi finds extensions. */
+const INSTALLED = undefined as { bin: string } | undefined
+
 /** `reaper run` points REAPER_BIN at itself. */
+const bin = () => process.env.REAPER_BIN || INSTALLED?.bin || "reaper"
+
 export const askReaper: Ask = (request) =>
   new Promise((resolve, reject) => {
-    const child = spawn(process.env.REAPER_BIN || "reaper", ["engine"], { stdio: ["pipe", "pipe", "pipe"] })
+    const child = spawn(bin(), ["engine"], { stdio: ["pipe", "pipe", "pipe"] })
     let out = ""
     let err = ""
     child.stdout.on("data", (d) => (out += d))
     child.stderr.on("data", (d) => (err += d))
     child.on("error", (e) =>
-      reject(new Error(`can't run the reaper binary (${e.message}); start pi with \`reaper run\``)),
+      reject(
+        new Error(`can't run the reaper binary (${e.message}); start pi with \`reaper run\` or \`reaper install pi\``),
+      ),
     )
     child.on("close", (code) => {
       if (code !== 0) return reject(new Error(err.trim() || `reaper engine exited with ${code}`))
@@ -63,7 +71,7 @@ export const askReaper: Ask = (request) =>
 /** A request nobody waits for: the engine carries on with it after pi has moved on, or exited. */
 export function tell(request: Record<string, unknown>) {
   try {
-    const child = spawn(process.env.REAPER_BIN || "reaper", ["engine"], {
+    const child = spawn(bin(), ["engine"], {
       stdio: ["pipe", "ignore", "ignore"],
       detached: true,
     })
@@ -272,7 +280,11 @@ export function reaper(ask: Ask = askReaper) {
       stopListening?.()
       if (live) for (const path of [live.file, live.mark]) rmSync(path, { force: true })
       // Recorded only once the shutdown is under way, so a reap the human beat to it never shows.
-      if (reaping) await emit(ctx, await agent(ctx), "agent.reaped", reaping)
+      if (!reaping) return
+      const reply = await emit(ctx, await agent(ctx), "agent.reaped", reaping)
+      // Without `reaper run` to offer the resume, the human is told how, once pi has let go of the terminal.
+      const say = reply?.say
+      if (say) process.once("exit", () => process.stderr.write(say))
     })
 
     pi.on("tool_call", async (event, ctx) => {
@@ -361,5 +373,6 @@ export function reaper(ask: Ask = askReaper) {
   }
 }
 
-/** pi loads extensions from a default-exported factory. */
-export default reaper()
+/** pi loads extensions from a default-exported factory. Under `reaper run`, which loads its own
+ *  copy, an installed one stands aside. */
+export default INSTALLED && process.env.REAPER_RUN ? () => {} : reaper()

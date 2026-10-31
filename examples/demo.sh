@@ -14,6 +14,9 @@ DEMO=${REAPER_DEMO:-${TMPDIR:-/tmp}/reaper-demo}
 REAPER=${REAPER:-reaper}
 PAUSE=${REAPER_DEMO_PAUSE:-3}
 export REAPER_HOME="$DEMO/config" REAPER_STATE="$DEMO/state" XDG_CACHE_HOME="$DEMO/cache"
+# The sessions below are pretend: run from inside Claude Code, the hooks mustn't take the
+# process they run under for one to reap.
+unset CLAUDE_CODE_ENTRYPOINT
 APP="$DEMO/demo-app"
 
 case "$DEMO" in

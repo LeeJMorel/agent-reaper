@@ -9,11 +9,11 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::prefix::hex;
 
-mod embedded {
+pub mod embedded {
     include!(concat!(env!("OUT_DIR"), "/extension.rs"));
 }
 
-const ENTRY: &str = "pi.ts";
+pub const ENTRY: &str = "pi.ts";
 
 /// So each version of the extension unpacks to its own directory.
 fn fingerprint() -> String {

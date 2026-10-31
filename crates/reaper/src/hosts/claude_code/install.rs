@@ -3,11 +3,13 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use reaper_core::paths::{home, tilde};
 use serde_json::{Map, Value, json};
+
+use crate::hosts::{chose, confirm, on_path};
 
 const EVENTS: &[(&str, Option<&str>)] = &[
     ("SessionStart", None),
@@ -86,11 +88,17 @@ pub fn installed() -> bool {
     groups.flatten().filter_map(|g| g["hooks"].as_array()).flatten().any(is_ours)
 }
 
-/// For `claude --settings`: one session guarded, with nothing written to the user's settings.
-pub fn hooks_only(command: &str) -> Value {
-    let mut settings = json!({});
-    install(&mut settings, command);
-    settings
+/// Claude Code is on this machine: on PATH, or its settings are.
+pub fn present() -> bool {
+    on_path("claude").is_some() || settings_path().parent().is_some_and(Path::is_dir)
+}
+
+/// The hooks, added without asking: what opening `reaper` does.
+pub fn add(exe: &Path) -> Result<(), String> {
+    let path = settings_path();
+    let mut settings = read(&path)?;
+    install(&mut settings, &command(exe));
+    write(&path, &settings)
 }
 
 fn read(path: &Path) -> Result<Value, String> {
@@ -117,16 +125,6 @@ fn write(path: &Path, settings: &Value) -> Result<(), String> {
     fs::write(path, text).map_err(fail)
 }
 
-fn confirm(question: &str) -> bool {
-    if !io::stdin().is_terminal() {
-        return false;
-    }
-    print!("{question} [y/N] ");
-    let _ = io::stdout().flush();
-    let mut answer = String::new();
-    io::stdin().lock().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes")
-}
-
 pub fn run(args: &[String], remove: bool) -> Result<(), String> {
     let mut path = settings_path();
     let mut yes = false;
@@ -136,12 +134,15 @@ pub fn run(args: &[String], remove: bool) -> Result<(), String> {
             "claude-code" => {}
             "--yes" | "-y" => yes = true,
             "--settings" => path = PathBuf::from(it.next().ok_or("--settings needs a path")?),
-            other => return Err(format!("unknown argument {other}; the only agent to install into is claude-code")),
+            other => {
+                return Err(format!("unknown argument {other}; the agents to install into are claude-code and pi"));
+            }
         }
     }
     let mut settings = read(&path)?;
     if remove {
         if !uninstall(&mut settings) {
+            chose("claude-code", false);
             println!("No reaper hooks in {}.", tilde(&path));
             return Ok(());
         }
@@ -157,6 +158,7 @@ pub fn run(args: &[String], remove: bool) -> Result<(), String> {
         return Err("nothing changed (pass --yes to skip the question)".into());
     }
     write(&path, &settings)?;
+    chose("claude-code", !remove);
     println!("Done. A copy of the previous file is next to it (*.reaper-backup).");
     if !remove {
         println!("New Claude Code sessions are now watched; open `reaper` to see them.");

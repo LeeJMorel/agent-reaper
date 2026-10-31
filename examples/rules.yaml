@@ -12,6 +12,10 @@ watcher:
   model: qwen3:4b
   timeoutMs: 8000
   onError: allow       # if the watcher is down: allow | kill
+  # Asked in turn when the watcher above doesn't answer (not running, unloaded, rate-limited):
+  # fallback:
+  #   - { baseURL: "http://localhost:8080/v1", model: qwen3-4b }
+  #   - { kind: anthropic, baseURL: "https://api.anthropic.com", model: claude-haiku-5-5 }
 
 # A rule that fires this many times in one session stops the session for good.
 strikes: 3

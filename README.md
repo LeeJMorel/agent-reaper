@@ -85,15 +85,14 @@ projects:
         redirect: Use the local development database for every query and migration.
 ```
 
-Check them, start a guarded agent, and watch:
+Then open the console:
 
 ```sh
-reaper lint                   # check the rules file
-reaper run                    # a guarded pi session in this directory
-reaper claude                 # …or a guarded Claude Code session
-reaper install claude-code    # …or guard every `claude` you start
-reaper                        # the console
+reaper
 ```
+
+It guards the Claude Code and pi on this machine, however you start them, and shows them
+as they work. Problems in the rules file show up at the top.
 
 ## Rules
 
@@ -113,11 +112,11 @@ level, `**` any depth). Agents are always kept out of reaper's own files. A rule
 
 **The watcher** is a small model that judges `judge` rules: a trusted monitor watching a
 larger agent. It can be any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM, OpenRouter…)
-or Anthropic. Its prompt runs from most to least stable (rules → task → action), so checks
-reuse the model's prefix cache; on OpenAI-compatible endpoints its answer is constrained to a
-JSON verdict over your rule ids, with reasoning off; and when you submit a prompt it is sent
-your rules and the new task ahead of the first check, so a model unloaded while you were away
-is ready in time.
+or Anthropic, with others under `fallback` to ask when it doesn't answer. Its prompt runs
+from most to least stable (rules → task → action), so checks reuse the model's prefix
+cache; on OpenAI-compatible endpoints its answer is constrained to a JSON verdict over your
+rule ids, with reasoning off; and when you submit a prompt it is sent your rules and the new
+task ahead of the first check, so a model unloaded while you were away is ready in time.
 
 **Going in circles.** The same call that does something (a command, an edit, a fetch) made
 `repeats` times in a row (5), with only reads and searches in between, counts as a violation:
@@ -130,30 +129,29 @@ See [examples/rules.yaml](examples/rules.yaml) for the full format.
 
 |  | suppress | remove from context | redirect | terminate |
 |---|:-:|:-:|:-:|:-:|
-| [pi](https://github.com/earendil-works/pi), via `reaper run` | ✓ | ✓ | ✓ | ✓ |
-| Claude Code, via `reaper claude` or `reaper install claude-code` | ✓ |  | ✓ | ✓ |
+| [pi](https://github.com/earendil-works/pi) | ✓ | ✓ | ✓ | ✓ |
+| Claude Code | ✓ |  | ✓ | ✓ |
 
 Claude Code's hooks can't edit the conversation, so a blocked attempt stays in its history;
 the agent still only hears the redirect, never the rule. Replies are checked differently too:
 pi checks what the agent wrote at the end of every turn and cuts a bad reply, while Claude Code
 checks its final reply when it stops and, if it breaks a rule, keeps it working with the
-redirect. The first `reaper run` downloads a pinned pi release and checks it against a
-built-in checksum.
+redirect. Without pi installed, `reaper run` starts a guarded one, after downloading a pinned
+release and checking it against a built-in checksum.
 
 ## Idle sessions
 
 Most agents spend most of their lives waiting on you, holding memory the whole time. reaper
-evicts an interactive session once it has waited 5 minutes: pi started with `reaper run`, or
-Claude Code started with `reaper claude`. It doesn't wait for memory to run short. Being
-wrong is cheap: the conversation is on disk, reaper offers to resume it where you are, and
-the resumed session sends the same prompt prefix, so the provider's prompt cache still
-applies.
+evicts a session in a terminal once it has waited 5 minutes, pi and Claude Code alike. It
+doesn't wait for memory to run short. Being wrong is cheap: the conversation is on disk, the
+agent's own resume picks it up (`reaper run` offers it in place), and the resumed session
+sends the same prompt prefix, so the provider's prompt cache still applies.
 
 A session is idle only when its turn is over, nothing has been typed, no dialog is open and
 nothing is queued. A half-written prompt resets the countdown. Claude Code fires no hook
-while idle, so `reaper claude` starts it and stays its parent, and won't evict it while a
-shell is still running under it (a dev server, a build). The console shows evicted
-sessions as `◌ reaped`.
+while idle, so its hook leaves a small watcher beside each terminal session, which won't
+evict it while a shell is still running under it (a dev server, a build). Sessions in an
+editor or run with `-p` are left alone. The console shows evicted sessions as `◌ reaped`.
 
 ```yaml
 reap:

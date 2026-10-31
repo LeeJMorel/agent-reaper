@@ -20,15 +20,16 @@ fn usage() -> String {
 usage:
   reaper [console options]       the console: agents, kills, rules
   reaper run [--pi PATH] [ARGS]  a guarded pi session in this directory (ARGS go to pi)
-  reaper claude [ARGS]           a guarded Claude Code session, reaped when idle (ARGS go to claude)
   reaper install claude-code     guard Claude Code sessions (adds hooks to its settings)
-  reaper uninstall claude-code   stop guarding them
+  reaper install pi              guard pi sessions, however they're started (adds the extension)
+  reaper uninstall AGENT         stop guarding them
   reaper lint [FILE]             check a rules file
   reaper rules [--json] [FILE]   show the rules (--json: for scripts)
 
 used by agents, not by hand:
   reaper engine                  one JSON request on stdin (the pi extension, and reaper itself)
   reaper hook claude-code        one Claude Code hook event on stdin
+  reaper watch claude-code PID   reaps the Claude Code session PID when it sits idle (its hook starts this)
 
 console options:
   --rules FILE    rules file (default {rules})
@@ -59,11 +60,18 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("run") => hosts::pi::run::launch(&args[1..]),
-        Some("claude") => hosts::claude_code::run::launch(&args[1..]),
+        Some("watch") => hosts::claude_code::watch::run(&args[1..]),
         Some("engine") => engine(),
         Some("hook") => hook(&args[1..]),
-        Some("install") => hosts::claude_code::install::run(&args[1..], false).map(|()| ExitCode::SUCCESS),
-        Some("uninstall") => hosts::claude_code::install::run(&args[1..], true).map(|()| ExitCode::SUCCESS),
+        Some(command @ ("install" | "uninstall")) => {
+            let remove = command == "uninstall";
+            let installed = if args[1..].iter().any(|a| a == "pi") {
+                hosts::pi::install::run(&args[1..], remove)
+            } else {
+                hosts::claude_code::install::run(&args[1..], remove)
+            };
+            installed.map(|()| ExitCode::SUCCESS)
+        }
         Some("lint") => lint_file(&args[1..]),
         Some("rules") => show_rules(&args[1..]),
         Some("console") => console::main(&args[1..]),

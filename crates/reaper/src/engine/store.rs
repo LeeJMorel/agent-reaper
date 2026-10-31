@@ -184,6 +184,28 @@ impl Store {
         let _ = fs::write(path, serde_json::to_vec(&all).unwrap_or_default());
     }
 
+    fn down_path(&self) -> PathBuf {
+        self.cache.join("down.json")
+    }
+
+    /// Watcher endpoints that failed lately, and until when (ms) they wait at the back of the line.
+    pub fn down(&self) -> BTreeMap<String, i64> {
+        fs::read(self.down_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// `until` is `None` once the endpoint answers again.
+    pub fn set_down(&self, endpoint: &str, until: Option<i64>) {
+        let mut all = self.down();
+        let changed = match until {
+            Some(until) => all.insert(endpoint.to_string(), until) != Some(until),
+            None => all.remove(endpoint).is_some(),
+        };
+        if changed {
+            let _ = fs::create_dir_all(&self.cache);
+            let _ = fs::write(self.down_path(), serde_json::to_vec(&all).unwrap_or_default());
+        }
+    }
+
     fn verdict_path(&self, key: &str) -> PathBuf {
         self.cache.join("verdicts").join(&key[..2.min(key.len())]).join(key)
     }

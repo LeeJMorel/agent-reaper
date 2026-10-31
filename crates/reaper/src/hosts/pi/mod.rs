@@ -8,9 +8,11 @@
 //!   {"op":"event","host":"pi","agent":…,"type":"agent.idle",…fields}  → {"ok":true}
 //!     (agent.spawned and agent.idle add "reapAfterMs" while idle sessions are reaped: a
 //!     session starts out idle, and goes idle when its turn ends; for agent.reaped,
-//!     "file" names the saved session, which `reaper run` offers to resume)
+//!     "file" names the saved session, which `reaper run` offers to resume, and without
+//!     `reaper run` the reply's "say" tells the human how)
 
 pub mod extension;
+pub mod install;
 pub mod release;
 pub mod run;
 
@@ -68,13 +70,22 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
                     fields.insert("project".into(), project.into());
                 }
             }
-            if kind == "agent.reaped" {
-                run::reaped(&fields);
+            if kind == "agent.spawned" {
+                install::refresh();
             }
             let agent = text(request, "agent");
+            let say = (kind == "agent.reaped" && !run::reaped(&fields)).then(|| {
+                let reason = fields.get("reason").and_then(Value::as_str).unwrap_or("idle");
+                let idle = fields.get("idle").and_then(Value::as_u64);
+                let [why, how] = super::reaped(idle, reason, &run::resume_command(&agent));
+                format!("\n{why}\n{how}\n")
+            });
             let interactive = fields.remove("interactive") == Some(Value::Bool(true));
             engine.event(host, &agent, &kind, Value::Object(fields));
             let mut reply = json!({ "ok": true });
+            if let Some(say) = say {
+                reply["say"] = say.into();
+            }
             if matches!(kind.as_str(), "agent.spawned" | "agent.idle")
                 && let Some(ms) = engine.reap_after_ms()
             {

@@ -11,18 +11,52 @@ use reaper_core::paths;
 use serde_json::{Map, Value, json};
 
 use super::{extension, release};
-use crate::hosts::{exit_code, resume_here, shell_word};
+use crate::hosts::{SHELLS, arguments, exit_code, process, program, resume_here, shell_word};
 
 /// Set for the pi that `reaper run` starts: the file where the engine leaves word that the
 /// extension reaped the session, and which session file to resume.
 const RUN_NOTE: &str = "REAPER_RUN";
 
 /// Called by the engine on `agent.reaped`, to tell the `reaper run` waiting on this pi, if any.
-pub fn reaped(event: &Map<String, Value>) {
-    if let Some(note) = env::var_os(RUN_NOTE) {
-        let note_text = json!({ "file": event.get("file"), "idle": event.get("idle"), "reason": event.get("reason") });
-        let _ = fs::write(note, note_text.to_string());
-    }
+/// False when there's none: the human has to be told how to resume.
+pub fn reaped(event: &Map<String, Value>) -> bool {
+    let Some(note) = env::var_os(RUN_NOTE) else { return false };
+    let note_text = json!({ "file": event.get("file"), "idle": event.get("idle"), "reason": event.get("reason") });
+    let _ = fs::write(note, note_text.to_string());
+    true
+}
+
+/// The command that resumes `session` (its id, as pi's own goodbye names it) in a pi
+/// `reaper run` didn't start: what started it, as far as the system shows (Linux), with
+/// `resume_args`. The engine asking is pi's child.
+pub fn resume_command(session: &str) -> String {
+    #[cfg(unix)]
+    let started = {
+        let pi = std::os::unix::process::parent_id();
+        let launcher = process(pi).and_then(|(parent, _)| arguments(parent));
+        let own = arguments(pi);
+        launcher
+            .and_then(|argv| script(&argv))
+            .or_else(|| own.map(|argv| script(&argv).unwrap_or_else(|| split(&argv))))
+    };
+    #[cfg(not(unix))]
+    let started: Option<(String, Vec<String>)> = None;
+    let (name, args) = started.unwrap_or_else(|| ("pi".to_string(), Vec::new()));
+    std::iter::once(name).chain(resume_args(&args, session)).map(|w| shell_word(&w)).collect::<Vec<_>>().join(" ")
+}
+
+fn split(argv: &[String]) -> (String, Vec<String>) {
+    (program(&argv[0]).to_string(), argv[1..].to_vec())
+}
+
+/// A script run by its interpreter, as a process shows it (`python3 ~/.local/bin/x args…`):
+/// the script is what was typed. A shell with no file to run is just where it was typed.
+fn script(argv: &[String]) -> Option<(String, Vec<String>)> {
+    let interpreter = program(argv.first()?);
+    let known = SHELLS.contains(&interpreter)
+        || interpreter.starts_with("python")
+        || ["node", "bun", "deno", "ruby", "perl"].contains(&interpreter);
+    argv.get(1).filter(|file| known && !file.starts_with('-')).map(|_| split(&argv[1..]))
 }
 
 /// `reaper run [--pi PATH] [pi arguments…]`. Use `--` before pi arguments that clash with ours.
@@ -144,9 +178,24 @@ pub fn resume_args(args: &[String], session: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_script_is_what_was_typed_and_a_shell_is_only_where() {
+        let launcher = args(&["/home/u/.venv/bin/python3", "/home/u/.local/bin/fcc-pi", "--model", "x"]);
+        assert_eq!(script(&launcher), Some(("fcc-pi".to_string(), args(&["--model", "x"]))));
+        assert_eq!(script(&args(&["node", "/usr/local/bin/pi"])), Some(("pi".to_string(), vec![])));
+        assert_eq!(script(&args(&["bash", "/home/u/bin/mypi", "-c"])), Some(("mypi".to_string(), args(&["-c"]))));
+        assert_eq!(script(&args(&["-zsh"])), None);
+        assert_eq!(script(&args(&["sh", "-c", "pi --model x"])), None);
+        assert_eq!(script(&args(&["tmux", "new"])), None);
+        assert_eq!(split(&args(&["/opt/pi/pi", "--model", "x"])), ("pi".to_string(), args(&["--model", "x"])));
+    }
+
     #[test]
     fn a_resumed_session_keeps_its_setup_but_not_its_first_prompt() {
-        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let original = args(&[
             "--model",
             "mock/m",

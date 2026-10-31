@@ -82,6 +82,8 @@ pub struct App {
     /// When memento mori next wants a frame, as of the last one drawn.
     pub mori_next: Cell<Option<i64>>,
     pub colors: Colors,
+    /// The agents reaper is installed in, by name.
+    pub guarded: Vec<&'static str>,
     /// A fixed memento mori clock, for frames printed by `--dump` and for tests.
     clock: Option<i64>,
     dirty: bool,
@@ -109,6 +111,7 @@ impl App {
             mori: Mori::new(),
             mori_next: Cell::new(None),
             colors: Colors::detect(),
+            guarded: Vec::new(),
             clock: None,
             dirty: true,
         };

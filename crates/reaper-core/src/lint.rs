@@ -134,15 +134,38 @@ pub fn lint(config: &Config) -> Vec<Issue> {
         ),
         None => {}
         Some(w) => {
-            if w.base_url.is_none() || w.model.is_none() {
-                l.push(Level::Error, None, None, "watcher needs `baseURL` and `model`".into());
+            let fallbacks = w.fallback.iter().enumerate().map(|(i, f)| (format!("watcher fallback {}", i + 1), f));
+            for (name, w) in std::iter::once(("watcher".to_string(), w)).chain(fallbacks) {
+                if w.base_url.is_none() || w.model.is_none() {
+                    l.push(Level::Error, None, None, format!("{name} needs `baseURL` and `model`"));
+                }
+                if let Some(kind) = &w.kind
+                    && !KINDS.contains(&kind.as_str())
+                {
+                    l.push(
+                        Level::Error,
+                        None,
+                        None,
+                        format!("{name} kind `{kind}` is not one of: {}", KINDS.join(", ")),
+                    );
+                }
+                l.unknown(&w.unknown, None, None, &name);
             }
-            if let Some(kind) = &w.kind
-                && !KINDS.contains(&kind.as_str())
-            {
-                l.push(Level::Error, None, None, format!("watcher kind `{kind}` is not one of: {}", KINDS.join(", ")));
+            for (i, f) in w.fallback.iter().enumerate() {
+                let set = [
+                    ("timeoutMs", f.timeout_ms.is_some()),
+                    ("onError", f.on_error.is_some()),
+                    ("fallback", !f.fallback.is_empty()),
+                ];
+                for (key, _) in set.iter().filter(|(_, set)| *set) {
+                    l.push(
+                        Level::Warn,
+                        None,
+                        None,
+                        format!("`{key}` in watcher fallback {} is ignored: the top watcher's applies", i + 1),
+                    );
+                }
             }
-            l.unknown(&w.unknown, None, None, "watcher");
         }
     }
     if config.repeats == 1 {
@@ -230,7 +253,7 @@ rules:
         let issues = lint(
             &parse(
                 r#"
-watcher: { kind: openia, model: m, timeout: 5 }
+watcher: { kind: openia, model: m, timeout: 5, fallback: [{ model: n, onError: kill }] }
 reap: { idle: 5 minutes, after: 1, live: 0, free: lots }
 repeats: 1
 rule: []
@@ -248,6 +271,8 @@ projects:
             "watcher needs `baseURL` and `model`",
             "watcher kind `openia` is not one of: openai, anthropic",
             "unknown watcher key `timeout` is ignored",
+            "watcher fallback 1 needs `baseURL` and `model`",
+            "`onError` in watcher fallback 1 is ignored: the top watcher's applies",
             "reap.idle `5 minutes` is not a duration like 90s, 5m or 1h (or auto, or off); idle sessions are kept",
             "unknown reap key `after` is ignored",
             "reap.live is 0: keep at least one session running, or leave it out",

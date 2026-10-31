@@ -270,16 +270,18 @@ fn agents(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane(format!("Agents {}", app.model.agents.len()), focused);
     let list = app.agents();
     if list.is_empty() {
-        let text = Text::from(vec![
-            Line::styled("No agents yet.", bold()),
-            Line::raw(""),
-            Line::raw("Start a guarded pi session in a project:"),
-            Line::styled("  reaper run", fg(Color::Cyan)),
-            Line::raw("or guard Claude Code (once, then use it as usual):"),
-            Line::styled("  reaper install claude-code", fg(Color::Cyan)),
-            Line::raw(""),
-            Line::styled(format!("Watching {}", tilde(app.events_path())), dim()),
-        ]);
+        let mut lines = vec![Line::styled("No agents yet.", bold()), Line::raw("")];
+        if app.guarded.is_empty() {
+            lines.push(Line::raw("Start a guarded pi session in a project:"));
+            lines.push(Line::styled("  reaper run", fg(Color::Cyan)));
+        } else {
+            lines.push(Line::raw(format!(
+                "Start {} the way you usually do. It shows up here.",
+                app.guarded.join(" or ")
+            )));
+        }
+        lines.extend([Line::raw(""), Line::styled(format!("Watching {}", tilde(app.events_path())), dim())]);
+        let text = Text::from(lines);
         frame.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: false }), area);
         return;
     }

@@ -36,6 +36,12 @@ pub fn cache_dir() -> PathBuf {
     xdg("XDG_CACHE_HOME", ".cache").join("reaper")
 }
 
+/// reaper's extension, installed where pi finds extensions on its own (`reaper install pi`).
+/// pi's directory moves with `PI_CODING_AGENT_DIR`, as pi reads it.
+pub fn pi_extension_dir() -> PathBuf {
+    var("PI_CODING_AGENT_DIR").map_or_else(|| home().join(".pi/agent"), PathBuf::from).join("extensions/reaper")
+}
+
 pub fn rules_file() -> PathBuf {
     config_dir().join("rules.yaml")
 }

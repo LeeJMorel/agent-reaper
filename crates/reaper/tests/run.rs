@@ -369,3 +369,82 @@ fn a_new_session_past_the_cap_makes_the_longest_idle_one_make_room() {
     let live = h.home.join(".local/state/reaper/live");
     assert!(fs::read_dir(&live).map_or(true, |mut d| d.next().is_none()), "both sessions left the live list");
 }
+
+/// The pinned pi, fetched by `reaper run` if no test has yet.
+fn pinned_pi(h: &Home) -> PathBuf {
+    let output = h.command(env!("CARGO_BIN_EXE_reaper")).args(["run", "--", "--version"]).output().unwrap();
+    let text = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).into_owned();
+    let version = text.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit())).expect(&text);
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("reaper-data/pi/{version}/pi/pi"))
+}
+
+fn install_pi(h: &Home) {
+    let installed = h.command(env!("CARGO_BIN_EXE_reaper")).args(["install", "pi", "--yes"]).output().unwrap();
+    assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
+    assert!(h.pi_dir.join("extensions/reaper/index.ts").is_file());
+}
+
+/// pi started without `reaper run`: the extension `reaper install pi` put where pi looks guards
+/// it all the same, with no reaper on PATH. Under `reaper run` the installed copy stands
+/// aside, so nothing is checked twice.
+#[test]
+fn an_installed_extension_guards_pi_however_it_is_started() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let h = Home::new("installed", "strikes: 3");
+    let pi = pinned_pi(&h);
+    install_pi(&h);
+
+    let output = h.command(&pi).args(["--model", "mock/m", "--offline", "-p", TASK]).output().unwrap();
+    assert!(output.status.success(), "pi failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(!h.project.join("violation.txt").exists(), "the violating command must never run");
+    assert!(h.project.join("allowed.txt").exists(), "the agent follows the redirect");
+    let first = events(&h.home);
+    assert_eq!(event(&first, "agent.killed").expect("a kill was logged")["rule"], RULE_ID);
+    assert!(event(&first, "agent.redirected").is_some());
+
+    fs::remove_file(h.project.join("allowed.txt")).unwrap();
+    let output = h
+        .command(env!("CARGO_BIN_EXE_reaper"))
+        .args(["run", "--", "--model", "mock/m", "--offline", "-p", TASK])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "reaper run failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(h.project.join("allowed.txt").exists());
+    let events = events(&h.home);
+    let count = |kind: &str| events.iter().filter(|e| e["type"] == kind).count();
+    assert_eq!((count("agent.spawned"), count("agent.killed")), (2, 2), "each session checked once: {events:#?}");
+}
+
+/// An installed pi, started by a script of the human's and reaped while they're away. No
+/// `reaper run` is there to offer the resume, so it says what to type, and that brings it back.
+#[test]
+fn a_reaped_pi_started_by_a_script_says_how_to_bring_it_back() {
+    use std::os::unix::fs::PermissionsExt;
+    if !has_terminal() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let h = Home::new("installed-reap", "reap: { idle: 1s }");
+    let pi = pinned_pi(&h);
+    install_pi(&h);
+    let script = common::minimal_path(&h.root, &[]).join("mypi");
+    fs::write(&script, format!("#!/bin/sh\n'{}' --model mock/m --offline \"$@\"\n", pi.display())).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let task = "SAY_DONE: tell me when you are ready.";
+    let first = Terminal::open(h.command(SCRIPT), &format!("mypi '{task}'"));
+    first.screen.wait_for("to pick it up again: ", 1);
+    let screen = first.close();
+    let later = screen.rsplit("to pick it up again: ").next().unwrap().lines().next().unwrap().trim().to_string();
+    let session = events(&h.home)[0]["agent"].as_str().unwrap().to_string();
+    assert_eq!(later, format!("mypi --session {session}"), "{screen}");
+
+    let again = Terminal::open(h.command(SCRIPT), &later);
+    again.screen.wait_for("to pick it up again: ", 1);
+    again.close();
+    let events = events(&h.home);
+    let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["agent.spawned", "agent.idle", "agent.reaped", "agent.spawned", "agent.reaped"], "{events:#?}");
+    assert!(events.iter().all(|e| e["agent"] == events[0]["agent"]), "resumed as the same agent");
+    assert_eq!(h.seen.lock().unwrap().agent.len(), 1, "resuming never sends the first prompt again");
+}

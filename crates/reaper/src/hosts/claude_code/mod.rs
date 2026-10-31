@@ -5,7 +5,7 @@
 //! judged when it stops, by the rules that list `message`.
 
 pub mod install;
-pub mod run;
+pub mod watch;
 
 use std::fs;
 use std::path::PathBuf;
@@ -17,11 +17,6 @@ use reaper_core::rules::MESSAGE;
 use crate::engine::{Check, Decision, Engine};
 
 pub const HOST: &str = "claude-code";
-
-/// Set by `reaper claude` for the Claude Code it starts: the file where these hooks say
-/// whether the session is waiting on the human, so reaper can reap it when it has waited
-/// too long. Hooks are the only part of Claude Code that knows; they fire on every turn.
-pub const STATE_ENV: &str = "REAPER_CLAUDE_STATE";
 
 /// What the human sees when a session is stopped. Claude sees it too if the conversation
 /// continues, so it names no rule.
@@ -86,9 +81,10 @@ pub fn warm_request(event: &Value) -> Option<Value> {
     Some(json!({ "op": "warm", "dir": event["cwd"], "goal": event["prompt"].as_str()? }))
 }
 
-/// What the supervising `reaper claude` should know after this event: the session, its
+/// What the session's watcher (see `watch`) should know after this event: the session, its
 /// transcript, and since when it has been idle (`null` while it works). `None` when the event
-/// says nothing about that, like a subagent finishing.
+/// says nothing about that, like a subagent finishing. Hooks are the only part of Claude Code
+/// that knows; they fire on every turn.
 pub fn supervisor_state(event: &Value, previous: Option<&Value>, now: i64) -> Option<Value> {
     let session = event["session_id"].as_str()?;
     let was_idle = previous.filter(|p| p["session"] == session).and_then(|p| p["idleSince"].as_i64());
@@ -103,23 +99,42 @@ pub fn supervisor_state(event: &Value, previous: Option<&Value>, now: i64) -> Op
     Some(json!({ "session": session, "transcript": event["transcript_path"], "idleSince": idle_since }))
 }
 
-/// Writes `supervisor_state` where `reaper claude` reads it, whole: hooks for parallel tool
-/// calls run at once.
-fn tell_supervisor(event: &Value) {
-    let Some(path) = std::env::var_os(STATE_ENV).map(PathBuf::from) else { return };
+/// The Claude Code process running this hook: the hook's parent, or the parent of the shell
+/// it ran the hook through.
+#[cfg(unix)]
+fn claude_pid() -> Option<u32> {
+    let parent = std::os::unix::process::parent_id();
+    let (grandparent, name) = super::process(parent)?;
+    Some(if super::SHELLS.contains(&name.as_str()) { grandparent } else { parent })
+}
+
+#[cfg(not(unix))]
+fn claude_pid() -> Option<u32> {
+    None
+}
+
+/// For a session in a terminal, writes `supervisor_state` where its watcher reads it, whole
+/// (hooks for parallel tool calls run at once), and starts the watcher if there's none yet.
+/// Sessions in an editor (`claude-vscode`…) or run by a script (`sdk-cli`) aren't reaped.
+fn tell_watcher(engine: &Engine, event: &Value) {
+    let terminal = std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|e| e == "cli");
+    let Some(pid) = claude_pid().filter(|_| terminal && engine.config.reaps()) else { return };
+    let path = watch::state_file(pid);
     let previous: Option<Value> = fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
     if let Some(state) = supervisor_state(event, previous.as_ref(), now) {
+        let _ = fs::create_dir_all(path.parent().expect("runs/"));
         let partial = path.with_extension(format!("json.{}", std::process::id()));
         if fs::write(&partial, state.to_string()).is_ok() {
             let _ = fs::rename(&partial, &path);
         }
+        watch::start(pid);
     }
 }
 
 /// `None` means no output (carry on).
 pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
-    tell_supervisor(event);
+    tell_watcher(engine, event);
     let session = event["session_id"].as_str().unwrap_or("unknown");
     let agent = event["agent_id"].as_str().unwrap_or(session);
     let dir = PathBuf::from(event["cwd"].as_str().unwrap_or_default());
@@ -218,7 +233,7 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
                 Some(Decision::Kill { rule, is_final: false, redirect, .. }) => {
                     engine.event(HOST, agent, "agent.redirected", json!({ "rule": rule, "redirect": redirect }));
                     let busy = json!({ "hook_event_name": "UserPromptSubmit", "session_id": session, "transcript_path": event["transcript_path"] });
-                    tell_supervisor(&busy);
+                    tell_watcher(engine, &busy);
                     Some(json!({ "decision": "block", "reason": redirect }))
                 }
                 Some(Decision::Kill { rule, is_final: true, .. }) => {

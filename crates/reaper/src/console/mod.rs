@@ -22,12 +22,14 @@ const TICK: Duration = Duration::from_millis(250);
 pub fn main(args: &[String]) -> Result<ExitCode, String> {
     let (mut rules, mut events) = (paths::rules_file(), paths::events_file());
     let (mut tab, mut size, mut at, mut session, mut color) = (None, (100, 30), None, None, false);
+    // A console on other files than reaper's own (the demo, a look at someone's log) sets nothing up.
+    let mut elsewhere = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().cloned().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
-            "--rules" => rules = PathBuf::from(value()?),
-            "--events" => events = PathBuf::from(value()?),
+            "--rules" => (rules, elsewhere) = (PathBuf::from(value()?), true),
+            "--events" => (events, elsewhere) = (PathBuf::from(value()?), true),
             "--dump" => {
                 tab = Some(match value()?.as_str() {
                     "live" => Tab::Live,
@@ -59,6 +61,18 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
     }
 
     let mut app = App::new(rules, events);
+    if tab.is_none() && !elsewhere {
+        match crate::hosts::guard() {
+            (_, Some(problem)) => app.notify(problem, true),
+            (guarded, None) if !guarded.is_empty() => {
+                let names: Vec<&str> = guarded.iter().map(|(_, name)| *name).collect();
+                let agent = if let [(id, _)] = guarded[..] { id } else { "AGENT" };
+                app.notify(format!("Now guarding {} (reaper uninstall {agent} undoes it)", names.join(" and ")), false);
+            }
+            _ => {}
+        }
+    }
+    app.guarded = crate::hosts::guarded();
     if let Some(at) = at {
         let newest = app.model.agents.iter().map(|a| a.last_at).max().unwrap_or(0);
         let at = match at.strip_prefix('+') {

@@ -76,6 +76,10 @@ pub struct Watcher {
     pub cache_key: Option<bool>,
     #[serde(rename = "onError")]
     pub on_error: Option<String>,
+    /// Watchers to ask in turn when this one doesn't answer. They share its `timeoutMs` and
+    /// `onError`.
+    #[serde(default)]
+    pub fallback: Vec<Watcher>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -248,6 +252,14 @@ impl Config {
         self.reap.as_ref().and_then(|r| r.free.as_deref()).and_then(size_bytes)
     }
 
+    /// Whether idle sessions are reaped at all: after a while, or to make room.
+    pub fn reaps(&self) -> bool {
+        self.idle() == "auto"
+            || self.reap_after_ms().is_some()
+            || self.reap_live().is_some()
+            || self.reap_free().is_some()
+    }
+
     /// Every rule with where it lives: `None` for global, else the project name.
     pub fn all_rules(&self) -> impl Iterator<Item = (Option<&str>, &Rule)> {
         let global = self.rules.iter().map(|r| (None, r));
@@ -273,8 +285,7 @@ impl Config {
             put(&mut map, "action", r.action.clone());
             map.into()
         }
-        let mut out = Map::new();
-        if let Some(w) = &self.watcher {
+        fn watcher(w: &Watcher) -> Value {
             let mut map = Map::new();
             put(&mut map, "kind", w.kind.clone());
             put(&mut map, "baseURL", w.base_url.clone());
@@ -283,7 +294,14 @@ impl Config {
             put(&mut map, "timeoutMs", w.timeout_ms);
             put(&mut map, "cacheKey", w.cache_key);
             put(&mut map, "onError", w.on_error.clone());
-            out.insert("watcher".into(), map.into());
+            if !w.fallback.is_empty() {
+                map.insert("fallback".into(), w.fallback.iter().map(watcher).collect());
+            }
+            map.into()
+        }
+        let mut out = Map::new();
+        if let Some(w) = &self.watcher {
+            out.insert("watcher".into(), watcher(w));
         }
         let mut reap = json!({ "idle": self.idle() });
         if let Some(r) = &self.reap {
@@ -462,7 +480,7 @@ mod tests {
     fn json_keeps_the_files_names_and_drops_unknown_keys() {
         let config = parse(
             r#"
-watcher: { baseURL: "http://localhost:11434/v1", model: m, timeoutMs: 500, typo: 1 }
+watcher: { baseURL: "http://localhost:11434/v1", model: m, timeoutMs: 500, typo: 1, fallback: [{ baseURL: "http://localhost:8080/v1", model: n }] }
 rules:
   - { id: push, tools: [bash], match: { command: 'git push -f' }, redirect: Open a PR., redirects: oops }
 projects:
@@ -475,7 +493,12 @@ projects:
         assert_eq!(
             config.to_json(),
             json!({
-                "watcher": { "baseURL": "http://localhost:11434/v1", "model": "m", "timeoutMs": 500 },
+                "watcher": {
+                    "baseURL": "http://localhost:11434/v1",
+                    "model": "m",
+                    "timeoutMs": 500,
+                    "fallback": [{ "baseURL": "http://localhost:8080/v1", "model": "n" }]
+                },
                 "reap": { "idle": "5m" },
                 "strikes": 3,
                 "repeats": 5,
