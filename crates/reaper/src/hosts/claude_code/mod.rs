@@ -26,6 +26,14 @@ fn deny(reason: &str) -> Value {
     json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })
 }
 
+/// Denied, and the agent making the call stops.
+fn stop() -> Value {
+    let mut output = deny("Stopped.");
+    output["continue"] = false.into();
+    output["stopReason"] = STOPPED.into();
+    output
+}
+
 /// For sessions that started before reaper was installed, so no `UserPromptSubmit` recorded
 /// the prompt.
 fn prompt_from_transcript(path: &str) -> Option<String> {
@@ -179,14 +187,22 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
         };
         engine.check(&check)
     };
-    let died = |rule: &str| {
+    let died = |rule: &str, together: bool| {
         let stops = engine.config.all_rules().any(|(_, r)| r.id == rule && r.stops());
-        engine.event(
-            HOST,
-            agent,
-            "agent.died",
-            json!({ "rule": rule, "reason": if stops { "stop" } else { "strikes" } }),
-        );
+        let reason = if together {
+            "together"
+        } else if stops {
+            "stop"
+        } else {
+            "strikes"
+        };
+        engine.event(HOST, agent, "agent.died", json!({ "rule": rule, "reason": reason }));
+    };
+
+    let end_turn = |rule: &str, together: bool| {
+        died(rule, together);
+        engine.event(HOST, agent, "agent.idle", json!({}));
+        Some(json!({ "continue": false, "stopReason": STOPPED }))
     };
 
     match event["hook_event_name"].as_str()? {
@@ -204,6 +220,7 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
             if let Some(prompt) = event["prompt"].as_str() {
                 let _ = engine.store.update(HOST, session, |s| s.goal = Some(prompt.to_string()));
             }
+            engine.restart(HOST, session);
             None
         }
         "PreToolUse" => {
@@ -215,11 +232,12 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
                     Some(deny(&redirect))
                 }
                 Decision::Kill { rule, is_final: true, .. } => {
-                    died(&rule);
-                    let mut output = deny("Stopped.");
-                    output["continue"] = false.into();
-                    output["stopReason"] = STOPPED.into();
-                    Some(output)
+                    died(&rule, false);
+                    Some(stop())
+                }
+                Decision::Stopped { rule } => {
+                    died(&rule, true);
+                    Some(stop())
                 }
             }
         }
@@ -236,19 +254,23 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
                     tell_watcher(engine, &busy);
                     Some(json!({ "decision": "block", "reason": redirect }))
                 }
-                Some(Decision::Kill { rule, is_final: true, .. }) => {
-                    died(&rule);
-                    engine.event(HOST, agent, "agent.idle", json!({}));
-                    Some(json!({ "continue": false, "stopReason": STOPPED }))
-                }
+                Some(Decision::Kill { rule, is_final: true, .. }) => end_turn(&rule, false),
+                Some(Decision::Stopped { rule }) => end_turn(&rule, true),
                 _ => {
                     engine.event(HOST, agent, "agent.idle", json!({}));
                     None
                 }
             }
         }
+        // Announced first: a subagent that never used a tool would otherwise pass for a session.
         "SubagentStop" => {
+            announce(None);
             engine.event(HOST, agent, "agent.idle", json!({}));
+            None
+        }
+        // Closed, cleared, or exiting as it's reaped (the reap is recorded after, and wins).
+        "SessionEnd" => {
+            engine.event(HOST, session, "agent.ended", json!({}));
             None
         }
         _ => None,
@@ -309,6 +331,61 @@ mod tests {
         let resumed = json!({ "hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w", "source": "resume" });
         reply(&engine, &resumed);
         assert_eq!(sandbox.events().iter().filter(|e| *e == "agent.spawned").count(), 2, "resumed, announced again");
+    }
+
+    #[test]
+    fn helpers_that_keep_breaking_rules_take_the_session_with_them_until_the_next_prompt() {
+        let sandbox = Sandbox::new("cc-together");
+        let engine = sandbox.engine(RULES);
+        let call = |agent: &str, command: &str| {
+            let mut event = pre_tool_use(command);
+            if agent != "s1" {
+                event["agent_id"] = agent.into();
+            }
+            reply(&engine, &event)
+        };
+        assert_eq!(call("s1", "ls"), None);
+        call("a", "psql prod");
+        call("b", "psql prod");
+        assert_eq!(call("a", "psql prod").unwrap()["continue"], false, "a goes alone");
+        assert_eq!(call("b", "psql prod").unwrap()["continue"], false, "b takes everyone with it");
+        assert_eq!(call("s1", "ls").unwrap()["continue"], false, "the main agent too, on its next try");
+        let prompt =
+            json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/w", "prompt": "again" });
+        reply(&engine, &prompt);
+        assert_eq!(call("s1", "ls"), None, "a new prompt starts again");
+
+        let log = std::fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
+        let deaths: Vec<(String, String)> = log
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|e| e["type"] == "agent.died")
+            .map(|e| (e["agent"].as_str().unwrap().into(), e["reason"].as_str().unwrap().into()))
+            .collect();
+        let expected = [("a", "strikes"), ("b", "together"), ("s1", "together")];
+        assert_eq!(deaths, expected.map(|(a, r)| (a.to_string(), r.to_string())));
+    }
+
+    #[test]
+    fn a_closed_session_is_recorded_as_ended() {
+        let sandbox = Sandbox::new("cc-end");
+        let engine = sandbox.engine(RULES);
+        let end =
+            json!({ "hook_event_name": "SessionEnd", "session_id": "s1", "cwd": "/w", "reason": "prompt_input_exit" });
+        assert_eq!(reply(&engine, &end), None);
+        assert_eq!(sandbox.events(), ["agent.ended"]);
+    }
+
+    #[test]
+    fn a_subagent_that_never_used_a_tool_is_still_a_subagent_when_it_stops() {
+        let sandbox = Sandbox::new("cc-sub");
+        let engine = sandbox.engine(RULES);
+        let stop = json!({ "hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "sub", "agent_type": "Explore", "cwd": "/w" });
+        reply(&engine, &stop);
+        assert_eq!(sandbox.events(), ["agent.spawned", "agent.idle"]);
+        let log = std::fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
+        let spawned: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!((&spawned["agent"], &spawned["parent"]), (&json!("sub"), &json!("s1")));
     }
 
     #[test]

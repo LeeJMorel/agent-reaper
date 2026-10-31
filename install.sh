@@ -18,7 +18,7 @@ case "$os-$arch" in
     linux-x86_64 | linux-aarch64 | darwin-x86_64 | darwin-arm64) ;;
     *)
         echo "reaper: no build for $os/$arch. Build it with Rust instead:" >&2
-        echo "  cargo install --git https://github.com/LeeJMorel/agent-reaper agent-reaper" >&2
+        echo "  cargo install --locked --git https://github.com/LeeJMorel/agent-reaper agent-reaper" >&2
         exit 1
         ;;
 esac

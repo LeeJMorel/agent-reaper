@@ -75,6 +75,20 @@ impl Linter {
         {
             self.push(Level::Error, p, id, format!("action `{action}` is not one of: {}", ACTIONS.join(", ")));
         }
+        match rule.strikes {
+            Some(_) if rule.stops() => {
+                self.push(
+                    Level::Warn,
+                    p,
+                    id,
+                    "`strikes` does nothing with `action: stop`: it stops at the first".into(),
+                );
+            }
+            Some(0) => {
+                self.push(Level::Warn, p, id, "`strikes: 0` stops the agent at the first, as `strikes: 1`".into())
+            }
+            _ => {}
+        }
         if !rule.stops() {
             match &rule.redirect {
                 None => self.push(
@@ -262,6 +276,8 @@ projects:
     path: [~/app]
     rules:
       - { id: x, match: { command: x }, redirects: Run it locally., action: kill }
+      - { id: y, match: { command: y }, redirect: Run it locally., action: stop, strikes: 4 }
+      - { id: z, match: { command: z }, redirect: Run it locally., strikes: 0 }
 "#,
             )
             .unwrap(),
@@ -283,6 +299,8 @@ projects:
             "project app has no paths",
             "unknown rule key `redirects` is ignored",
             "action `kill` is not one of: redirect, stop",
+            "`strikes` does nothing with `action: stop`: it stops at the first",
+            "`strikes: 0` stops the agent at the first, as `strikes: 1`",
         ] {
             assert!(all.contains(&expected), "missing {expected:?} in {all:#?}");
         }

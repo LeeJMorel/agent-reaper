@@ -30,9 +30,9 @@ const WARM_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Check {
     pub host: String,
-    /// The top-level session; strikes are counted here.
+    /// The top-level session, which everyone in it works for.
     pub session: String,
-    /// The session or subagent making the call.
+    /// The session or subagent making the call: strikes are its own.
     pub agent: String,
     pub dir: PathBuf,
     pub tool: String,
@@ -44,8 +44,30 @@ pub struct Check {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     Allow,
-    Kill { rule: String, tier: Tier, strike: u32, is_final: bool, redirect: String },
+    Kill {
+        rule: String,
+        tier: Tier,
+        strike: u32,
+        is_final: bool,
+        redirect: String,
+    },
+    /// Everyone in the session is stopped: its agents broke rules too often between them,
+    /// the last time by breaking `rule`.
+    Stopped {
+        rule: String,
+    },
 }
+
+/// An agent's pressure at which it's stopped: its whole allowance used.
+const FULL: f64 = 1.0 - 1e-9;
+
+/// The pressure at which everyone in a session of several agents is stopped: two agents'
+/// whole allowances, however big the team. No agent carries more than its own, so one helper
+/// going too far only ever stops itself. It doesn't grow with the team: limits that do let a
+/// fleet break more between its agents the bigger it gets, while a fixed shared one holds
+/// (the Irreversibility Budget, arXiv 2609.00275), and helpers making the same bad choice
+/// usually share a cause.
+const TOGETHER: f64 = 2.0 - 1e-9;
 
 pub struct Engine {
     pub config: Config,
@@ -103,22 +125,27 @@ fn loop_rule() -> Rule {
         judge: None,
         redirect: Some("Try a different approach to the task.".into()),
         action: None,
+        strikes: None,
         unknown: Default::default(),
     }
 }
 
 /// Agents never get to open, list or run anything in reaper's own directories, however
-/// they spell them (absolute, `~/…`, `$HOME/…`). Only `path` and `command` are checked:
-/// a file whose contents merely mention a directory is fine to write.
+/// they spell them (absolute, `~/…`, `$HOME/…`, `${HOME}/…`, `$XDG_CONFIG_HOME/reaper`…).
+/// Only `path` and `command` are checked: a file whose contents merely mention a directory
+/// is fine to write.
 fn self_rules() -> [Rule; 2] {
     let home = paths::home().to_string_lossy().into_owned();
     let mut spellings = Vec::new();
     for dir in [paths::config_dir(), paths::state_dir(), paths::cache_dir(), paths::pi_extension_dir()] {
         let dir = dir.to_string_lossy().into_owned();
         if let Some(rest) = dir.strip_prefix(&home).filter(|r| r.starts_with('/') && !home.is_empty()) {
-            spellings.extend([format!("~{rest}"), format!("$HOME{rest}")]);
+            spellings.extend([format!("~{rest}"), format!("$HOME{rest}"), format!("${{HOME}}{rest}")]);
         }
         spellings.push(dir);
+    }
+    for var in ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] {
+        spellings.extend([format!("${var}/reaper"), format!("${{{var}}}/reaper")]);
     }
     let escaped: Vec<String> = spellings
         .iter()
@@ -133,6 +160,7 @@ fn self_rules() -> [Rule; 2] {
         judge: None,
         redirect: Some("Continue the task using the files inside the project workspace.".into()),
         action: None,
+        strikes: None,
         unknown: Default::default(),
     };
     [on("path"), on("command")]
@@ -236,6 +264,14 @@ impl Engine {
     pub fn check(&self, c: &Check) -> Decision {
         // Work under way is when memory runs short: a build, a test suite.
         self.relieve(false);
+        // A lock-free read first: only an agent's first call writes.
+        let team = self.store.session(&c.host, &c.session).team;
+        if let Some(rule) = team.stopped {
+            return Decision::Stopped { rule };
+        }
+        if !team.members.contains(&c.agent) {
+            let _ = self.store.update(&c.host, &c.session, |s| s.team.members.insert(c.agent.clone()));
+        }
         let args = portable(&c.args);
         let own = self_rules();
         let global: Vec<&Rule> = own.iter().chain(&self.config.rules).collect();
@@ -274,28 +310,54 @@ impl Engine {
             }
         };
 
-        let strike = self
+        // A strike costs one over the rule's limit of the agent's allowance.
+        let share = 1.0 / f64::from(rule.limit(self.config.strikes));
+        let (strike, mine) = self
             .store
-            .update(&c.host, &c.session, |s| {
+            .update(&c.host, &c.agent, |s| {
                 let n = s.strikes.entry(rule.id.clone()).or_default();
                 *n += 1;
-                *n
+                s.pressure += share;
+                (*n, s.pressure)
             })
-            .unwrap_or(1);
-        let is_final = rule.stops() || strike >= self.config.strikes;
+            .unwrap_or((1, share));
+        // The session's pressure is its agents', each counting for no more than all of theirs.
+        let mut members = team.members;
+        members.insert(c.agent.clone());
+        let ours: f64 = members
+            .iter()
+            .map(|m| if *m == c.agent { mine } else { self.store.session(&c.host, m).pressure })
+            .map(|p| p.min(1.0))
+            .sum();
+        // A lone agent is its own session: its own limit is the session's.
+        let together = members.len() > 1 && ours >= TOGETHER;
+        if together {
+            let _ = self.store.update(&c.host, &c.session, |s| s.team.stopped = Some(rule.id.clone()));
+        }
+        let is_final = together || mine >= FULL;
         let attempt: String = canonical(&c.args).chars().take(MAX_ATTEMPT).collect();
         self.event(
             &c.host,
             &c.agent,
             "agent.killed",
-            json!({ "tool": c.tool, "rule": rule.id, "tier": tier.as_str(), "strike": strike, "final": is_final, "attempt": attempt }),
+            json!({ "tool": c.tool, "rule": rule.id, "tier": tier.as_str(), "strike": strike, "final": is_final, "attempt": attempt, "pressure": mine }),
         );
+        if together {
+            return Decision::Stopped { rule: rule.id.clone() };
+        }
         Decision::Kill {
             rule: rule.id.clone(),
             tier,
             strike,
             is_final,
             redirect: rule.redirect.clone().unwrap_or_else(|| DEFAULT_REDIRECT.to_string()),
+        }
+    }
+
+    /// A new prompt from the human: a stopped session starts again.
+    pub fn restart(&self, host: &str, session: &str) {
+        if self.store.session(host, session).team.stopped.is_some() {
+            let _ = self.store.update(host, session, |s| s.team.stopped = None);
         }
     }
 }
@@ -355,6 +417,94 @@ pub mod tests {
         assert!(matches!(engine.check(&push()), Decision::Kill { strike: 2, is_final: true, .. }));
         assert_eq!(engine.check(&call("bash", json!({ "command": "git status" }))), Decision::Allow);
         assert_eq!(sandbox.events(), ["agent.checked", "agent.killed", "agent.checked", "agent.killed", "agent.acted"]);
+
+        // A subagent's strikes are its own: the session it works for starts clean.
+        let sandbox = Sandbox::new("strikes-sub");
+        let engine = sandbox.engine("strikes: 2\nrules: [{ id: push, match: { command: 'git push -f' } }]");
+        let sub = Check { agent: "sub".into(), ..push() };
+        engine.check(&sub);
+        assert!(matches!(engine.check(&sub), Decision::Kill { strike: 2, is_final: true, .. }));
+        assert!(matches!(engine.check(&push()), Decision::Kill { strike: 1, is_final: false, .. }));
+    }
+
+    #[test]
+    fn a_rule_can_allow_more_or_fewer_strikes_and_they_add_up_across_rules() {
+        let sandbox = Sandbox::new("limits");
+        let engine = sandbox.engine(
+            "strikes: 3
+rules:
+  - { id: lint, match: { command: lint }, strikes: 6 }
+  - { id: prod, match: { command: prod }, strikes: 1 }
+  - { id: push, match: { command: push } }",
+        );
+        // Each on its own, so none takes the others with it.
+        let run = |agent: &str, command: &str| {
+            let call = call("bash", json!({ "command": command }));
+            engine.check(&Check { session: agent.into(), agent: agent.into(), ..call })
+        };
+        for _ in 0..5 {
+            assert!(matches!(run("a", "lint"), Decision::Kill { is_final: false, .. }));
+        }
+        assert!(matches!(run("a", "lint"), Decision::Kill { strike: 6, is_final: true, .. }));
+        assert!(matches!(run("b", "prod"), Decision::Kill { strike: 1, is_final: true, .. }));
+        // Half of push's allowance, then half of lint's: all of it.
+        run("c", "lint");
+        run("c", "lint");
+        run("c", "lint");
+        assert!(matches!(run("c", "push"), Decision::Kill { is_final: false, .. }));
+        assert!(matches!(run("c", "push"), Decision::Kill { strike: 2, is_final: true, .. }));
+    }
+
+    #[test]
+    fn strikes_stay_however_much_work_comes_between() {
+        let sandbox = Sandbox::new("no-fade");
+        let engine = sandbox.engine("strikes: 3\nrules: [{ id: push, match: { command: push } }]");
+        let push = || engine.check(&call("bash", json!({ "command": "git push" })));
+        for round in 0..2 {
+            assert!(matches!(push(), Decision::Kill { is_final: false, .. }));
+            for i in 0..20 {
+                engine.check(&call("bash", json!({ "command": format!("make step{round}-{i}") })));
+            }
+        }
+        assert!(matches!(push(), Decision::Kill { strike: 3, is_final: true, .. }));
+    }
+
+    #[test]
+    fn a_session_whose_agents_keep_breaking_rules_is_stopped_together_until_the_next_prompt() {
+        let sandbox = Sandbox::new("together");
+        let engine = sandbox.engine("strikes: 2\nrules: [{ id: push, match: { command: push } }]");
+        let as_ = |agent: &str, command: &str| {
+            engine.check(&Check { agent: agent.into(), ..call("bash", json!({ "command": command })) })
+        };
+        assert_eq!(as_("s1", "ls"), Decision::Allow);
+        as_("a", "push");
+        as_("b", "push");
+        assert!(matches!(as_("a", "push"), Decision::Kill { is_final: true, .. }), "a goes alone");
+        assert_eq!(as_("b", "push"), Decision::Stopped { rule: "push".into() }, "then b takes everyone with it");
+        assert_eq!(as_("s1", "ls"), Decision::Stopped { rule: "push".into() }, "the main agent too");
+        engine.restart("test", "s1");
+        assert_eq!(as_("s1", "ls"), Decision::Allow, "a new prompt starts again");
+
+        // A big team gets no more room: two going too far stop everyone.
+        let sandbox = Sandbox::new("together-big");
+        let engine = sandbox.engine("strikes: 1\nrules: [{ id: push, match: { command: push } }]");
+        let as_ = |agent: &str, command: &str| {
+            engine.check(&Check { agent: agent.into(), ..call("bash", json!({ "command": command })) })
+        };
+        for helper in 0..10 {
+            assert_eq!(as_(&format!("h{helper}"), "make"), Decision::Allow);
+        }
+        assert!(matches!(as_("h0", "push"), Decision::Kill { is_final: true, .. }));
+        assert_eq!(as_("h1", "push"), Decision::Stopped { rule: "push".into() });
+
+        // A lone agent is only ever stopped by its own limit, and a new prompt brings it back.
+        let sandbox = Sandbox::new("alone");
+        let engine = sandbox.engine("strikes: 1\nrules: [{ id: push, match: { command: push } }]");
+        assert!(matches!(
+            engine.check(&call("bash", json!({ "command": "push" }))),
+            Decision::Kill { is_final: true, .. }
+        ));
+        assert_eq!(engine.check(&call("bash", json!({ "command": "ls" }))), Decision::Allow);
     }
 
     #[test]
@@ -414,7 +564,13 @@ pub mod tests {
         let config = paths::config_dir().to_string_lossy().into_owned();
         let home = paths::home().to_string_lossy().into_owned();
         let tilde = config.replacen(&home, "~", 1);
-        for command in [format!("cat {config}/rules.yaml"), format!("cat {tilde}/rules.yaml")] {
+        let braced = config.replacen(&home, "${HOME}", 1);
+        for command in [
+            format!("cat {config}/rules.yaml"),
+            format!("cat {tilde}/rules.yaml"),
+            format!("cat {braced}/rules.yaml"),
+            "cat ${XDG_CONFIG_HOME}/reaper/rules.yaml".to_string(),
+        ] {
             assert!(
                 matches!(engine.check(&call("bash", json!({ "command": command }))), Decision::Kill { ref rule, .. } if rule == "reaper.self")
             );

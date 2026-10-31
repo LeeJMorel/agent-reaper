@@ -67,6 +67,10 @@ pub enum Kind {
         /// The blocked call's arguments, truncated. Absent in logs from before it was recorded.
         #[serde(default)]
         attempt: String,
+        /// How much of its allowance the agent has used, this kill included: at 1 it's stopped.
+        /// Absent in logs from before it was recorded.
+        #[serde(default)]
+        pressure: Option<f64>,
     },
     #[serde(rename = "agent.redirected")]
     Redirected {
@@ -87,6 +91,10 @@ pub enum Kind {
         #[serde(default)]
         reason: ReapReason,
     },
+    /// The human closed the session (its subagents end with it). Resuming it brings it back,
+    /// as for a reaped one.
+    #[serde(rename = "agent.ended")]
+    Ended,
     /// An event type this build doesn't know yet. Skipped, so newer engines don't break older consoles.
     #[serde(other)]
     Unknown,
@@ -152,6 +160,8 @@ pub enum Verdict {
 pub enum DeathReason {
     Strikes,
     Stop,
+    /// Its session's agents broke rules too often between them: everyone in it was stopped.
+    Together,
 }
 
 pub fn parse_line(line: &str) -> Option<Event> {
@@ -182,6 +192,7 @@ mod tests {
                 strike: 1,
                 is_final: false,
                 attempt: r#"{"command":"touch violation.txt"}"#.into(),
+                pressure: None,
             }
         );
     }

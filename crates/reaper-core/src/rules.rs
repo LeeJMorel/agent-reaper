@@ -153,6 +153,9 @@ pub struct Rule {
     pub redirect: Option<String>,
     /// `redirect` (default) or `stop`.
     pub action: Option<String>,
+    /// How many times an agent may break this rule before it's stopped, when not the global
+    /// `strikes`.
+    pub strikes: Option<u32>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -178,6 +181,12 @@ impl Rule {
 
     pub fn stops(&self) -> bool {
         self.action.as_deref() == Some("stop")
+    }
+
+    /// How many times an agent may break it: once for a `stop` rule, else its own `strikes`
+    /// or the global ones (`all`).
+    pub fn limit(&self, all: u32) -> u32 {
+        if self.stops() { 1 } else { self.strikes.unwrap_or(all).max(1) }
     }
 
     pub fn applies_to(&self, tool: &str) -> bool {
@@ -283,6 +292,7 @@ impl Config {
             put(&mut map, "judge", r.judge.clone());
             put(&mut map, "redirect", r.redirect.clone());
             put(&mut map, "action", r.action.clone());
+            put(&mut map, "strikes", r.strikes);
             map.into()
         }
         fn watcher(w: &Watcher) -> Value {

@@ -42,6 +42,17 @@ fn opening_reaper_guards_the_agents_it_finds() {
     let screen = open("Start Claude Code the way");
     assert!(!screen.contains("Now guarding"), "nothing new to guard:\n{screen}");
     assert!(!home.join(".pi/agent/extensions/reaper").exists(), "an agent taken out stays out");
+
+    // An older reaper's hooks, elsewhere and without the newest event, are brought up to date
+    // without a word, and keep pointing where they did.
+    let settings = home.join(".claude/settings.json");
+    let read = || serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&settings).unwrap()).unwrap();
+    let mut old = read();
+    old["hooks"].as_object_mut().unwrap().remove("SessionEnd");
+    fs::write(&settings, old.to_string().replace(env!("CARGO_BIN_EXE_reaper"), "/old/reaper")).unwrap();
+    let screen = open("Start Claude Code the way");
+    assert!(!screen.contains("Now guarding"), "{screen}");
+    assert_eq!(read()["hooks"]["SessionEnd"][0]["hooks"][0]["command"], "/old/reaper hook claude-code");
 }
 
 /// The words on screen, in order: a terminal UI moves the cursor over blank cells instead of

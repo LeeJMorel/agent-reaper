@@ -301,9 +301,10 @@ fn reaped_and_resumed(name: &str, launcher: bool) {
 
     let events = events(&h.home);
     let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    // Claude Code ends its session as it's reaped; the reap, recorded once it has gone, wins.
     assert_eq!(
         kinds,
-        ["agent.spawned", "agent.idle", "agent.reaped", "agent.spawned", "agent.reaped"],
+        ["agent.spawned", "agent.idle", "agent.ended", "agent.reaped", "agent.spawned", "agent.ended", "agent.reaped"],
         "{events:#?}\n{first}\n{again}"
     );
     assert!(events.iter().all(|e| e["agent"] == session), "resumed as the same session");

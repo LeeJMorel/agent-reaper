@@ -16,6 +16,9 @@ pub enum Status {
     Dead,
     /// Shut down after sitting idle. Its session is saved; resuming it brings it back.
     Reaped,
+    /// Its session was closed by the human, or, for a subagent, its work is done. Resuming the
+    /// session (or sending the subagent more work) brings it back.
+    Ended,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,17 @@ pub enum WatcherHealth {
 
 const RECENT: usize = 50;
 
+/// Nothing has happened in a session for this long: it most likely ended without a word
+/// (closed before reaper listened for that, crashed, killed). The views let it go until it
+/// does something again.
+pub const QUIET_FOR: i64 = 12 * 60 * 60 * 1000;
+
+/// The tool a Claude Code subagent hands its final report back with: its last act. Claude
+/// Code doesn't always say it stopped after.
+pub fn hands_back(tool: &str) -> bool {
+    tool.eq_ignore_ascii_case("SubagentHandback")
+}
+
 #[derive(Debug, Clone)]
 pub struct Model {
     /// In order of first appearance.
@@ -114,15 +128,15 @@ impl Model {
                 agent.dir = Some(dir.clone());
                 agent.model.clone_from(model);
                 agent.label.clone_from(label);
-                // Announced again: a reaped session was resumed.
-                if agent.status == Status::Reaped {
+                // Announced again: a reaped or closed session was resumed.
+                if matches!(agent.status, Status::Reaped | Status::Ended) {
                     agent.status = Status::Idle;
                 }
             }
             Kind::Acted { tool } => {
                 agent.actions += 1;
                 agent.last_tool = Some(tool.clone());
-                agent.status = Status::Working;
+                agent.status = if agent.parent.is_some() && hands_back(tool) { Status::Ended } else { Status::Working };
             }
             Kind::Checked { tier, error, .. } => {
                 agent.status = Status::Working;
@@ -135,7 +149,7 @@ impl Model {
                     _ => {}
                 }
             }
-            Kind::Killed { tool, rule, tier, strike, is_final, attempt } => {
+            Kind::Killed { tool, rule, tier, strike, is_final, attempt, .. } => {
                 agent.kills += 1;
                 agent.strike = *strike;
                 agent.status = Status::Killed;
@@ -159,9 +173,26 @@ impl Model {
                 agent.status = Status::Dead;
                 self.settle(&event.agent, Outcome::Died(*reason));
             }
-            // Finishing a turn doesn't bring the dead back, and the dead stay dead when reaped.
-            Kind::Idle if agent.status != Status::Dead => agent.status = Status::Idle,
+            // Finishing a turn doesn't bring the dead or the closed back, and the dead stay dead
+            // when reaped. A subagent's turn ends when its work is done: it's gone. So is one
+            // first seen finishing, a subagent that never used a tool, in logs from before
+            // those were announced.
+            Kind::Idle if !matches!(agent.status, Status::Dead | Status::Ended) => {
+                let done = agent.parent.is_some() || agent.recent.len() == 1;
+                agent.status = if done { Status::Ended } else { Status::Idle };
+            }
             Kind::Reaped { .. } if agent.status != Status::Dead => agent.status = Status::Reaped,
+            // Its subagents end with it. A session reaped as it closes stays reaped, whichever
+            // comes first: it's there to be resumed.
+            Kind::Ended => {
+                let (at, id) = (event.at, event.agent.as_str());
+                for a in self.agents.iter_mut().filter(|a| a.id == id || a.parent.as_deref() == Some(id)) {
+                    if !matches!(a.status, Status::Dead | Status::Reaped) {
+                        a.status = Status::Ended;
+                        a.last_at = a.last_at.max(at);
+                    }
+                }
+            }
             Kind::Idle | Kind::Reaped { .. } | Kind::Unknown => {}
         }
     }
@@ -244,6 +275,44 @@ mod tests {
         .unwrap();
         model.apply(&resumed);
         assert_eq!(model.agent(id).unwrap().status, Status::Idle);
+    }
+
+    #[test]
+    fn a_closed_session_ends_with_its_subagents_unless_it_was_reaped() {
+        let event = |at: i64, agent: &str, kind: &str, fields: &str| {
+            parse_line(&format!(r#"{{"at":{at},"host":"claude-code","agent":"{agent}","type":"{kind}"{fields}}}"#))
+                .unwrap()
+        };
+        let mut model = Model::default();
+        model.apply_all(&[
+            event(1, "s", "agent.spawned", r#","dir":"/w""#),
+            event(2, "sub", "agent.spawned", r#","dir":"/w","parent":"s""#),
+            event(3, "sub", "agent.acted", r#","tool":"Read""#),
+            event(4, "s", "agent.ended", ""),
+            event(5, "s", "agent.idle", ""),
+        ]);
+        let status = |model: &Model, id| model.agent(id).unwrap().status;
+        assert_eq!((status(&model, "s"), status(&model, "sub")), (Status::Ended, Status::Ended));
+        assert_eq!(model.agent("sub").unwrap().last_at, 4, "the subagent ended when the session did");
+        model.apply(&event(6, "s", "agent.spawned", r#","dir":"/w""#));
+        assert_eq!(status(&model, "s"), Status::Idle, "resumed");
+        model.apply(&event(6, "sub2", "agent.spawned", r#","dir":"/w","parent":"s""#));
+        model.apply(&event(6, "sub2", "agent.idle", ""));
+        assert_eq!(status(&model, "sub2"), Status::Ended, "a subagent's work done");
+        assert_eq!(status(&model, "s"), Status::Idle);
+
+        // Reaping sends Claude Code a signal, which ends the session too, just before the reap is recorded.
+        model.apply(&event(7, "s", "agent.ended", ""));
+        model.apply(&event(8, "s", "agent.reaped", r#","idle":1"#));
+        assert_eq!(status(&model, "s"), Status::Reaped);
+        model.apply(&event(9, "s", "agent.ended", ""));
+        assert_eq!(status(&model, "s"), Status::Reaped);
+
+        model.apply(&event(10, "sub3", "agent.spawned", r#","dir":"/w","parent":"s""#));
+        model.apply(&event(11, "sub3", "agent.acted", r#","tool":"SubagentHandback""#));
+        assert_eq!(status(&model, "sub3"), Status::Ended, "handing its report back is its last act");
+        model.apply(&event(12, "ghost", "agent.idle", ""));
+        assert_eq!(status(&model, "ghost"), Status::Ended, "first seen finishing: a helper that never used a tool");
     }
 
     #[test]

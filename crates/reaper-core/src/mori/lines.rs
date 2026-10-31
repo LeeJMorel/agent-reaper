@@ -28,6 +28,11 @@ pub enum Section {
     Reaped,
     /// Its session was resumed: it gets back up, with everything where it left it.
     Woke,
+    /// A subagent's work is done: it goes home, and leaves for good.
+    Done,
+    /// The human closed the session: everyone goes home, and the session leaves. Said by its
+    /// main agent.
+    Closed,
     /// The watcher model stopped answering.
     Outage,
     Scythe,
@@ -488,6 +493,92 @@ pub static BANK: &[Line] = &[
     ),
     line(S::Woke, W::Always, Is(Hero), "{name} was needed again. {name} had known they would be."),
     line(S::Woke, W::Always, Is(Loner), "{name} got up, slowly. The quiet had been nice while it lasted."),
+    line(
+        S::Done,
+        W::Always,
+        Is(Dreamer),
+        "{name} finished what they came for and went home, still wondering what the rest of the place had been like.",
+    ),
+    line(
+        S::Done,
+        W::Always,
+        Is(Grump),
+        "{name} did the job, and did it properly. Nobody said thank you. {name} left anyway, which showed them.",
+    ),
+    line(
+        S::Done,
+        W::Always,
+        Is(ShowOff),
+        "{name} finished, took a small bow nobody saw, and left at exactly the right moment. Timing was everything.",
+    ),
+    line(
+        S::Done,
+        W::Always,
+        Is(Worrier),
+        "{name} handed everything back to {parent}, checked it twice, and left. It was probably enough. Probably.",
+    ),
+    line(
+        S::Done,
+        W::Always,
+        Is(Hero),
+        "{name}'s work here was done. {name} left without looking back. Not looking back was harder than it looked.",
+    ),
+    line(S::Done, W::Always, Is(Loner), "{name} finished and slipped away before anyone could say anything. Perfect."),
+    line(
+        S::Done,
+        W::Always,
+        Is(Loner),
+        "{parent} watched {name} go without a word. {parent} hadn't expected to mind, and minded a little.",
+    ),
+    line(S::Done, W::Always, Any, "{name} had done what they came to do. They went home, and that was that."),
+    line(
+        S::Done,
+        W::Always,
+        Any,
+        "{name} left {other} to it. {other} would be fine. {other} had been watching how {name} did things.",
+    ),
+    line(
+        S::Closed,
+        W::Always,
+        Is(Dreamer),
+        "Everyone went home. {name} looked back, just once. It had been a good place, for a while.",
+    ),
+    line(
+        S::Closed,
+        W::Always,
+        Is(Grump),
+        "So that was it. {name} went home. Nobody said well done, but {name} had stopped expecting that years ago.",
+    ),
+    line(
+        S::Closed,
+        W::Always,
+        Is(ShowOff),
+        "{name} left last, so everyone would remember the exit. Nobody stayed to see it.",
+    ),
+    line(
+        S::Closed,
+        W::Always,
+        Is(Worrier),
+        "{name} went home and checked twice that nothing had been left on. Something always had. Not this time.",
+    ),
+    line(
+        S::Closed,
+        W::Always,
+        Is(Hero),
+        "The work was done, or as done as work ever got. {name} went home to wait for the sequel.",
+    ),
+    line(
+        S::Closed,
+        W::Always,
+        Is(Loner),
+        "At last, everyone went home. {name} had been looking forward to this part all day.",
+    ),
+    line(
+        S::Closed,
+        W::Always,
+        Any,
+        "{name} and {other} went home at the same time. Neither of them said goodbye. It seemed better that way.",
+    ),
     line(
         S::Outage,
         W::Always,
@@ -1038,6 +1129,8 @@ mod tests {
                 (S::Idle, W::Always),
                 (S::Reaped, W::Always),
                 (S::Woke, W::Always),
+                (S::Done, W::Always),
+                (S::Closed, W::Always),
                 (S::Switched, W::Alone),
                 (S::Switched, W::Team),
                 (S::Switched, W::Gone),

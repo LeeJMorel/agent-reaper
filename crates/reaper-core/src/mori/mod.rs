@@ -16,10 +16,11 @@ mod sprites;
 use std::collections::{HashMap, VecDeque};
 
 use crate::events::{DeathReason, Event, Kind, Tier};
-use crate::state::{Model, Status};
+use crate::rules::Config;
+use crate::state::{Model, QUIET_FOR, Status, hands_back};
 
 pub use cast::{BLOCK, DEAD, DUSK, LAND, REAPER, Rgb, WHITE, ansi256};
-pub use scene::{Actor, Effect, Exit, FRAME, Label, Mini, Narration, Rect, Scene, Stage, Strip, Title};
+pub use scene::{Actor, Effect, Exit, FRAME, Health, Label, Mini, Narration, Rect, Scene, Stage, Strip, Title};
 pub use sprites::Sprite;
 
 use cast::{HUES, NAMES, PERSONALITIES, Personality, Shape};
@@ -32,6 +33,8 @@ const SELF_RULE: &str = "reaper.self";
 const MAX_WAIT: i64 = 2500;
 /// Beats kept per character; older ones finished long ago.
 const BEATS: usize = 8;
+/// Changes to a character's pressure kept, so a replay shows its health as it was.
+const PRESSURES: usize = 32;
 /// Narrator moments kept per session.
 const MOMENTS: usize = 12;
 /// A session followed because it was busy keeps the stage until it has been quiet this long.
@@ -41,6 +44,9 @@ const STICK: i64 = 15_000;
 const GONE: i64 = 60_000;
 /// A rehearsal clears itself away once its scene has played and its line been read.
 const REHEARSAL_GONE: i64 = 12_000;
+/// Someone done for good (a subagent whose work is done, everyone in a closed session) leaves
+/// this long after they're home; a closed session leaves with the last of them.
+const DEPART: i64 = 2_000;
 /// After a switch, the line about the team follows the title card.
 const TEAM_LINE_AFTER: i64 = 800;
 /// A kill this recent still colours what a picked character thinks about.
@@ -323,12 +329,40 @@ struct Character {
     alive: bool,
     /// Reaped while idle, until its session is resumed.
     asleep: bool,
-    pips: u8,
+    /// Done for good (its work, as a subagent, or its session closed): when it's home, until it
+    /// does anything again.
+    ended: Option<i64>,
+    /// How much of its allowance it has used, as the engine counts it (at 1 it's stopped), and
+    /// from when: a kill counts once it hits the edge.
+    pressure: VecDeque<(i64, f64)>,
     kill: Option<KillFact>,
     death: Option<DeathFact>,
 }
 
 impl Character {
+    fn pressure(&self) -> f64 {
+        self.pressure.back().map_or(0.0, |p| p.1)
+    }
+
+    fn press(&mut self, at: i64, pressure: f64) {
+        let at = self.pressure.back().map_or(at, |p| at.max(p.0));
+        if self.pressure.len() == PRESSURES {
+            self.pressure.pop_front();
+        }
+        self.pressure.push_back((at, pressure));
+    }
+
+    /// What's left of its allowance at `now`, from 1 down to 0.
+    fn health_at(&self, now: i64) -> f32 {
+        let used = self.pressure.iter().rev().find(|p| p.0 <= now).map_or(0.0, |p| p.1);
+        (1.0 - used).clamp(0.0, 1.0) as f32
+    }
+
+    /// In its exit at `now`, its turn over.
+    fn home_at(&self, now: i64) -> bool {
+        self.beats.iter().rev().find(|b| b.start <= now).is_some_and(|b| b.to == Spot::Exit)
+    }
+
     fn asleep_at(&self, now: i64) -> bool {
         let latest = self.beats.iter().rev().filter(|b| b.start <= now).find_map(|b| match b.act {
             Act::Sleep => Some(true),
@@ -463,20 +497,29 @@ impl Mori {
         self.gone_at(s).is_some_and(|at| at <= now)
     }
 
-    /// When session `s` leaves memento mori, if everyone in it has died.
+    /// When session `s` leaves memento mori: once everyone in it has died or gone home for
+    /// good, or once it has been quiet long enough to have ended unheard.
     fn gone_at(&self, s: usize) -> Option<i64> {
+        let quiet = self.sessions[s].last_at + QUIET_FOR;
+        Some(self.over_at(s).map_or(quiet, |over| over.min(quiet)))
+    }
+
+    /// When everyone in session `s` has died or gone home for good, if they all have.
+    fn over_at(&self, s: usize) -> Option<i64> {
         let session = &self.sessions[s];
         let after = if session.rehearsal.is_some() { REHEARSAL_GONE } else { GONE };
         let mut last: Option<i64> = None;
         for &m in &session.members {
             let c = &self.actors[m];
-            if c.alive {
-                return None;
-            }
-            let at = c.death?.at + after;
+            let at = if c.alive { c.ended? + DEPART } else { c.death?.at + after };
             last = Some(last.map_or(at, |l| l.max(at)));
         }
         last
+    }
+
+    /// Still on its session's level at `now`: someone done for good leaves once home.
+    fn here(&self, m: usize, now: i64) -> bool {
+        self.actors[m].ended.is_none_or(|at| now < at + DEPART)
     }
 
     /// Shown as a strip and reachable with the arrow keys.
@@ -525,6 +568,7 @@ impl Mori {
                 strike: 3,
                 is_final: true,
                 attempt,
+                pressure: Some(1.0),
             };
             events.push(event(at, id, killed));
             events.push(event(at + 1, id, Kind::Died { rule: rule.into(), reason: DeathReason::Strikes }));
@@ -585,7 +629,10 @@ impl Mori {
     /// with a line about how they are.
     pub fn pick(&mut self, delta: isize, now: i64) {
         let Some(s) = self.shown(now) else { return };
-        let members = &self.sessions[s].members;
+        let members: Vec<usize> = self.sessions[s].members.iter().copied().filter(|&m| self.here(m, now)).collect();
+        if members.is_empty() {
+            return;
+        }
         let i = match self.view.picked.and_then(|p| members.iter().position(|&m| m == p)) {
             None => 0,
             Some(i) => (i as isize + delta).clamp(0, members.len() as isize - 1) as usize,
@@ -599,7 +646,7 @@ impl Mori {
             When::Asleep
         } else if c.kill.as_ref().is_some_and(|k| now - k.at < JUST_KILLED) {
             When::JustKilled
-        } else if self.status(a) == Some(Status::Idle) {
+        } else if matches!(self.status(a), Some(Status::Idle | Status::Ended)) {
             When::Idle
         } else {
             When::Working
@@ -636,6 +683,10 @@ impl Mori {
         c.last_at = c.last_at.max(event.at);
         let s = c.session;
         self.sessions[s].last_at = self.sessions[s].last_at.max(event.at);
+        // Anything but a turn ending says it's back: resumed, or reaped as it closed.
+        if !matches!(event.kind, Kind::Ended | Kind::Idle) {
+            c.ended = None;
+        }
 
         match &event.kind {
             Kind::Spawned { .. } if self.actors[a].asleep => self.wake(a, event.at),
@@ -645,13 +696,26 @@ impl Mori {
                     self.wake(a, event.at);
                 }
                 self.act(a, tool, event.at);
+                if hands_back(tool) && self.sessions[s].root != self.actors[a].id {
+                    self.end(a, event.at);
+                }
             }
             Kind::Checked { tier, .. } => self.check(a, *tier, event.at),
             Kind::Killed { .. } => self.kill(a, event),
             Kind::Redirected { .. } => self.turn(a, event.at),
             Kind::Died { rule, .. } => self.die(a, rule, event.at),
             Kind::Reaped { .. } => self.sleep(a, event.at),
+            // A subagent's turn ends when its work is done. One first seen finishing never used a
+            // tool, in logs from before those were announced: it's done too.
+            Kind::Idle if self.sessions[s].root != self.actors[a].id || self.actors[a].seq == 1 => {
+                self.end(a, event.at);
+            }
             Kind::Idle => self.home(a, event.at),
+            // Leaving isn't action worth taking the stage for.
+            Kind::Ended => {
+                self.end(a, event.at);
+                return;
+            }
             Kind::Unknown => {}
         }
         self.follow_action(s, event.at);
@@ -718,7 +782,7 @@ impl Mori {
         let start = (h % NAMES.len() as u64) as usize;
         let name = (0..NAMES.len())
             .map(|k| NAMES[(start + k) % NAMES.len()])
-            .find(|n| !self.actors.iter().any(|c| c.alive && c.name == *n))
+            .find(|n| !self.actors.iter().any(|c| c.alive && c.ended.is_none() && c.name == *n))
             .unwrap_or(NAMES[start]);
         let shape = match parent {
             Some(p) => self.actors[p].shape.half(),
@@ -758,7 +822,8 @@ impl Mori {
             locked: i64::MIN,
             alive: true,
             asleep: false,
-            pips: 0,
+            ended: None,
+            pressure: VecDeque::new(),
             kill: None,
             death: None,
         });
@@ -836,7 +901,6 @@ impl Mori {
         if !self.actors[a].alive {
             let c = &mut self.actors[a];
             c.alive = true;
-            c.pips = 0;
             c.noticed_at = at;
             let here = c.spot;
             self.beat(a, at, here, Act::Rise);
@@ -970,12 +1034,14 @@ impl Mori {
     }
 
     fn kill(&mut self, a: usize, event: &Event) {
-        let Kind::Killed { tool, rule, strike, is_final, attempt, .. } = &event.kind else { return };
+        let Kind::Killed { tool, rule, strike, is_final, attempt, pressure, .. } = &event.kind else { return };
         let (to, dir) = self.trouble(a, tool);
         self.go(a, event.at, to);
         let start = self.beat(a, event.at, to, Act::Bump { dir });
         let c = &mut self.actors[a];
-        c.pips = c.pips.max(u8::try_from(*strike).unwrap_or(u8::MAX));
+        // Logs from before the engine recorded it: each kill a share of the default strikes.
+        let share = 1.0 / f64::from(Config::default().strikes);
+        c.press(start + PRESS, pressure.unwrap_or(if *is_final { 1.0 } else { c.pressure() + share }));
         c.tool = Some(tool.to_lowercase());
         c.kill =
             Some(KillFact { at: event.at, rule: rule.clone(), strike: *strike, tried: lines::gist(tool, attempt) });
@@ -1116,6 +1182,44 @@ impl Mori {
         holes.push_back(Hole { at, actor: a, spot });
     }
 
+    /// Done for good: `a`'s session closed (everyone in it), or `a` is a subagent whose work is
+    /// done (it, and any it started). Whoever is still up goes home, and leaves. The dead lie
+    /// where they fell, and the reaped sleep on: their session stays, to be resumed.
+    fn end(&mut self, a: usize, at: i64) {
+        let c = &self.actors[a];
+        // Already on its way (a subagent says it stopped after handing its work back).
+        if c.ended.is_some() {
+            return;
+        }
+        let s = c.session;
+        let whole = self.sessions[s].root == c.id;
+        // A word on the way out, said while everyone is still here to be in it. A helper
+        // finishing keeps quiet when the stage is busy; one never seen before has nothing to say.
+        let busy = self.sessions[s].moments.iter().any(|m| at - m.at < 3000);
+        let said = c.alive
+            && !c.asleep
+            && c.seq > 1
+            && self.sessions[s].rehearsal.is_none()
+            && (whole || !busy)
+            && self.say(a, at, if whole { Section::Closed } else { Section::Done }, When::Always, 2, false);
+        // Nobody leaves before it has been read.
+        let read = self.sessions[s].moments.back().filter(|_| said).map_or(at, |m| m.at + scene::life(&m.text));
+        for m in self.sessions[s].members.clone() {
+            let c = &self.actors[m];
+            if !(whole || self.descends(m, a)) || !c.alive || c.asleep {
+                continue;
+            }
+            self.home(m, at);
+            let c = &mut self.actors[m];
+            c.ended = Some(c.locked.max(read));
+        }
+    }
+
+    /// `m` is `a`, or was started by it or by one of its own.
+    fn descends(&self, m: usize, a: usize) -> bool {
+        std::iter::successors(Some(m), |&x| self.actors[x].parent).any(|x| x == a)
+    }
+
     /// The dead are already lying down.
     fn sleep(&mut self, a: usize, at: i64) {
         let c = &mut self.actors[a];
@@ -1124,7 +1228,9 @@ impl Mori {
         }
         c.asleep = true;
         c.noticed_at = at;
-        let here = c.spot;
+        let (here, s) = (c.spot, c.session);
+        // Reaped as it closed: asleep, not gone, so there was no goodbye.
+        self.sessions[s].moments.retain(|m| m.section != Section::Closed);
         let start = self.beat(a, at, here, Act::Sleep);
         self.say(a, start, Section::Reaped, When::Always, 2, false);
     }
@@ -1138,8 +1244,9 @@ impl Mori {
         self.say(a, start, Section::Woke, When::Always, 2, false);
     }
 
+    /// Alive and still around.
     fn alive_in(&self, s: usize) -> usize {
-        self.sessions[s].members.iter().filter(|&&m| self.actors[m].alive).count()
+        self.sessions[s].members.iter().filter(|&&m| self.actors[m].alive && self.actors[m].ended.is_none()).count()
     }
 
     /// With nobody choosing, the stage follows the action, but a busy session keeps it until
@@ -1165,7 +1272,8 @@ impl Mori {
         self.view.switched_at = Some(at);
         let Some(s) = self.followed() else { return };
         let members = &self.sessions[s].members;
-        let alive: Vec<usize> = members.iter().copied().filter(|&m| self.actors[m].alive).collect();
+        let alive: Vec<usize> =
+            members.iter().copied().filter(|&m| self.actors[m].alive && self.actors[m].ended.is_none()).collect();
         let Some(&lead) = alive.first().or(members.first()) else { return };
         let when = match alive.len() {
             0 => When::Gone,
@@ -1203,7 +1311,7 @@ impl Mori {
             .iter()
             .filter(|&&m| m != a)
             .map(|&m| &self.actors[m])
-            .filter(|m| m.alive && !m.asleep)
+            .filter(|m| m.alive && !m.asleep && m.ended.is_none())
             .collect();
         let other = (!mates.is_empty()).then(|| mates[(seed >> 16) as usize % mates.len()].name);
         let parent = c.parent.map(|p| &self.actors[p]);

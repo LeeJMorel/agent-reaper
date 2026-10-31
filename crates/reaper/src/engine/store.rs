@@ -7,7 +7,7 @@
 //! seconds, so the file's age says whether the session is still there. To reap one, the
 //! engine leaves a mark beside it; the session reaps itself if it is still idle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,13 @@ pub struct Session {
     /// Kills per rule id.
     #[serde(default)]
     pub strikes: BTreeMap<String, u32>,
+    /// What it has done wrong, as a share of what it's allowed: each kill adds one over the
+    /// rule's limit. Nothing takes it away: strikes are never forgotten.
+    #[serde(default)]
+    pub pressure: f64,
+    /// As the session everyone in it works for (kept under the main agent's id).
+    #[serde(default)]
+    pub team: Team,
     #[serde(default)]
     pub goal: Option<String>,
     /// Whether `agent.spawned` was logged.
@@ -31,6 +38,16 @@ pub struct Session {
     pub last_call: Option<String>,
     #[serde(default)]
     pub repeats: u32,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Team {
+    /// Every agent that has worked in the session, the main one included, gone or not.
+    #[serde(default)]
+    pub members: BTreeSet<String>,
+    /// The rule whose breaking stopped everyone, until the human's next prompt.
+    #[serde(default)]
+    pub stopped: Option<String>,
 }
 
 pub struct Store {

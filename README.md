@@ -62,7 +62,7 @@ curl -fsSL https://github.com/LeeJMorel/agent-reaper/releases/latest/download/in
 
 That's the whole install, on Linux and macOS: a single `reaper` binary with the pi extension
 built in. Run it again to update. To build it yourself (Rust 1.89+),
-`cargo install --git https://github.com/LeeJMorel/agent-reaper agent-reaper`.
+`cargo install --locked --git https://github.com/LeeJMorel/agent-reaper agent-reaper`.
 
 ## Quick start
 
@@ -105,10 +105,13 @@ Each rule describes a violation privately and says what to do instead.
 | `redirect` | The only thing the agent ever hears. Write it as an instruction, not a prohibition; `reaper lint` flags redirects that say "don't". |
 | `tools` | Only check these tools. `message` means what the agent says: only rules that list it look at replies, judged by their `text`. |
 | `action: stop` | Terminate on the first violation instead of redirecting. |
+| `strikes` | How many times an agent may break this rule, if not the global `strikes`. |
 
 Global rules apply everywhere; project rules apply under the paths you list (`*` matches one
-level, `**` any depth). Agents are always kept out of reaper's own files. A rule that fires
-`strikes` times (3) in a session ends it.
+level, `**` any depth). Agents are always kept out of reaper's own files. An agent that
+breaks a rule `strikes` times (3) is stopped; a rule can set its own `strikes`, and breaking
+several adds up. Strikes are never forgotten, and a session whose agents keep breaking rules
+between them is stopped together, until your next prompt.
 
 **The watcher** is a small model that judges `judge` rules: a trusted monitor watching a
 larger agent. It can be any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM, OpenRouter…)

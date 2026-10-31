@@ -26,6 +26,12 @@ pub fn guard() -> (Vec<(&'static str, &'static str)>, Option<String>) {
         return (guarded, problem);
     }
     let Ok(me) = env::current_exe() else { return (guarded, Some("can't locate the reaper binary".into())) };
+    // An older reaper's hooks get the events added since, without a word: nothing new is guarded.
+    if claude_code::install::outdated()
+        && let Err(e) = claude_code::install::add(&me)
+    {
+        problem = Some(format!("couldn't update Claude Code's hooks: {e}"));
+    }
     let unless_chosen = |id: &str, present: bool, installed: bool, add: &dyn Fn() -> Result<(), String>| {
         (present && !installed && !left_alone(id).exists()).then(add)
     };

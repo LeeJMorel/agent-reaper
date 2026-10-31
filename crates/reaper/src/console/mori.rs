@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use reaper_core::mori::{BLOCK, DEAD, DUSK, Effect, LAND, Label, REAPER, Rgb, Stage, Strip, WHITE, ansi256};
+use reaper_core::mori::{BLOCK, DEAD, DUSK, Effect, Health, LAND, Label, REAPER, Rgb, Stage, Strip, WHITE, ansi256};
 
 use super::app::App;
 
@@ -275,6 +275,7 @@ impl Pen<'_> {
             }
         }
         self.blit(&canvas);
+        self.health(&stage.health, &stage.land);
 
         // Labels never sit on each other: the picked character's goes first, then the living,
         // then epitaphs; one that would land on another moves up a row, or isn't shown.
@@ -365,6 +366,60 @@ impl Pen<'_> {
         }
     }
 
+    /// The top left corner: a health bar for everyone on the stage, as many as fit above the
+    /// land there. What a kill took is reaper's red; the dead flatline in grey.
+    fn health(&mut self, health: &[Health], land: &[i32]) {
+        const BAR: usize = 8;
+        const TOP: i32 = 2;
+        const PARTS: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+        let names = health.iter().map(|h| h.name.chars().count()).max().unwrap_or(0);
+        let width = 1 + names + 1 + BAR;
+        // A row's lower pixel stays at least a pixel above the land under it.
+        let ground = land.iter().take(width + 1).copied().min().unwrap_or(i32::MAX);
+        let rows = usize::try_from((ground - 3).div_euclid(2) - TOP + 1).unwrap_or(0).min(6);
+        let shown = if health.len() > rows { rows.saturating_sub(1) } else { health.len() };
+        for (i, h) in health.iter().take(shown).enumerate() {
+            let row = TOP + i as i32;
+            let hue = match (h.dead, h.asleep) {
+                (true, _) => DEAD,
+                (_, true) => h.hue.dim(0.6),
+                _ => h.hue,
+            };
+            let mut style = self.ink(hue, 0.0, row);
+            if self.colors == Colors::Off && (h.dead || h.asleep) {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            self.put(1, row, &format!("{:<names$} ", h.name), style);
+            let x = 2 + names as i32;
+            if h.dead {
+                self.put(x, row, &"─".repeat(BAR), style);
+                continue;
+            }
+            let eighths = (h.left * (BAR * 8) as f32).round() as usize;
+            let (full, part) = (eighths / 8, eighths % 8);
+            let lost = REAPER.mix(self.sky(2 * row), 0.35);
+            let (trough, edge) = match self.colors {
+                Colors::Off => ("░", Style::new()),
+                colors => ("█", style.bg(colors.color(lost))),
+            };
+            let empty = self.ink(lost, 0.0, row);
+            let mut bar = vec![("█".repeat(full), style)];
+            if full < BAR {
+                bar.push(if part == 0 { (trough.into(), empty) } else { (PARTS[part - 1].into(), edge) });
+                bar.push((trough.repeat(BAR - full - 1), empty));
+            }
+            let mut cx = x;
+            for (text, style) in bar {
+                self.put(cx, row, &text, style);
+                cx += text.chars().count() as i32;
+            }
+        }
+        if shown < health.len() && rows > 0 {
+            let row = TOP + shown as i32;
+            self.put(1, row, &format!("+{}", health.len() - shown), self.ink(WHITE, 0.5, row));
+        }
+    }
+
     fn blit(&mut self, canvas: &Canvas) {
         for row in 1..canvas.h / 2 {
             for col in 0..canvas.w {
@@ -437,15 +492,18 @@ impl Pen<'_> {
         };
         let mut parts = vec![(number, style)];
         for mini in &strip.minis {
-            match (mini.alive, self.colors) {
+            let (glyph, rgb) = if !mini.alive {
+                ("†", DEAD)
+            } else if mini.asleep {
                 // Lying down, in its own colour: asleep, not gone.
-                (true, colors) if mini.asleep => parts.push(("▂".into(), colors.ink(mini.hue.dim(0.6)))),
-                (true, colors) => parts.push(("▪".into(), colors.ink(mini.hue))),
-                (false, colors) => parts.push(("†".into(), colors.ink(DEAD))),
-            }
-            if mini.alive && mini.pips > 0 {
-                parts.push(("•".repeat(mini.pips.into()), self.colors.ink(REAPER)));
-            }
+                ("▂", mini.hue.dim(0.6))
+            } else if mini.home {
+                // Hollow while it waits for its next turn: only those at work are solid.
+                ("▫", mini.hue.dim(0.6))
+            } else {
+                ("▪", mini.hue)
+            };
+            parts.push((glyph.into(), self.colors.ink(rgb)));
         }
         if let Some(line) = &strip.line {
             parts.push((format!(" {line}"), Style::new().add_modifier(Modifier::DIM | Modifier::ITALIC)));

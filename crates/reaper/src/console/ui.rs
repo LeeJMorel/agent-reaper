@@ -128,6 +128,7 @@ fn status_look(status: Status) -> (&'static str, &'static str, Style) {
         Status::Killed => ("◆", "killed", fg(Color::Yellow)),
         Status::Dead => ("✕", "dead", fg(ACCENT)),
         Status::Reaped => ("◌", "reaped", dim()),
+        Status::Ended => ("·", "ended", dim()),
     }
 }
 
@@ -182,9 +183,9 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(right, r);
 }
 
-/// Counts are dropped first, alerts last.
+/// Counts (of the agents listed) are dropped first, alerts last.
 fn summary(app: &App, room: usize) -> Line<'static> {
-    let agents = &app.model.agents;
+    let agents = app.agents();
     let working = agents.iter().filter(|a| matches!(a.status, Status::Working | Status::Killed)).count();
     let dead = agents.iter().filter(|a| a.status == Status::Dead).count();
     let today = app.model.kills.iter().filter(|k| k.at >= app.today).count();
@@ -267,8 +268,8 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
 
 fn agents(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.pane == Pane::Agents;
-    let block = pane(format!("Agents {}", app.model.agents.len()), focused);
     let list = app.agents();
+    let block = pane(format!("Agents {}", list.len()), focused);
     if list.is_empty() {
         let mut lines = vec![Line::styled("No agents yet.", bold()), Line::raw("")];
         if app.guarded.is_empty() {
@@ -296,7 +297,7 @@ fn agent_line(a: &Agent, now: i64) -> Line<'static> {
     let doing = match a.status {
         Status::Working => a.last_tool.clone().unwrap_or_default(),
         Status::Killed | Status::Dead => format!("strike {}", a.strike),
-        Status::Idle | Status::Reaped => String::new(),
+        Status::Idle | Status::Reaped | Status::Ended => String::new(),
     };
     Line::from(vec![
         Span::styled(format!("{glyph} "), style),
@@ -353,6 +354,9 @@ fn kill_detail(app: &App, width: usize) -> Text<'static> {
         Outcome::Redirected(text) => (format!("“{text}”"), fg(Color::Yellow)),
         Outcome::Died(DeathReason::Strikes) => ("nothing: stopped at the strike limit".to_string(), fg(ACCENT)),
         Outcome::Died(DeathReason::Stop) => ("nothing: this rule stops the session".to_string(), fg(ACCENT)),
+        Outcome::Died(DeathReason::Together) => {
+            ("nothing: its session broke rules too often, and was stopped".to_string(), fg(ACCENT))
+        }
         Outcome::Pending => ("not yet: the redirect goes out when this turn ends".to_string(), dim()),
     };
     let tried = if k.attempt.is_empty() { k.tool.clone() } else { format!("{} {}", k.tool, k.attempt) };
@@ -457,6 +461,7 @@ fn describe(event: &Event) -> Span<'static> {
         Kind::Redirected { .. } => Span::styled("redirected", fg(Color::Yellow)),
         Kind::Died { rule, .. } => Span::styled(format!("died: {rule}"), fg(ACCENT).add_modifier(Modifier::BOLD)),
         Kind::Idle => Span::styled("finished its turn", dim()),
+        Kind::Ended => Span::styled("session closed", dim()),
         Kind::Reaped { idle, reason } => {
             let idle = ago(*idle as i64, 0);
             let why = match reason {
@@ -590,9 +595,9 @@ fn rule_detail(app: &App, width: usize) -> Text<'static> {
     };
     let tools = rule.scope().map_or("all tools".to_string(), |tools| tools.join(", "));
     let on_kill = if rule.stops() {
-        "stop the session".to_string()
+        "stop the agent".to_string()
     } else {
-        format!("redirect; the session stops at strike {}", config.strikes)
+        format!("redirect; the agent stops at strike {}, sooner if it keeps breaking rules", rule.limit(config.strikes))
     };
 
     let mut lines = vec![Line::styled(rule.id.clone(), fg(ACCENT).add_modifier(Modifier::BOLD))];
@@ -641,10 +646,10 @@ mod tests {
         let app = fixture();
         let screen = render(&app, 110, 28);
         for expected in [
-            "3 agents",
+            "2 agents",
             "◌ 000001 reaped",
             "0 working",
-            "1 dead",
+            "0 dead",
             "2 kills today",
             "watcher ok",
             "78e845",

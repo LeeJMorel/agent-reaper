@@ -17,7 +17,9 @@ bad never happens".
 | cutting the attempt from history (pi) | **retroactive context editing**: the agent can't anchor on its own failed attempt |
 | the redirect | **insertion** of a corrective instruction; a monitor that suppresses and inserts is an **edit automaton**. AgentSpec [1] stops the agent or tells it which rule fired; ECLoop [3] holds back a coding agent's actions until conditions are met and redirects it. reaper redirects without ever naming the rule |
 | rules listing `message` | monitoring the agent's **outputs** (its replies) as well as its actions. pi suppresses a bad reply like a call; Claude Code can't take a reply back, so its stop is refused with the redirect as the reason |
-| strikes, then the stop | a **graduated sanction** ending in **truncation** (termination) |
+| strikes, then the stop | a **graduated sanction** ending in **truncation** (termination). Ctrl-Z [2] audits an agent once three of its steps in a task look suspicious, found best of the counts it tried, with a higher bar that audits a single step at once; `strikes: 3` and `action: stop` have the same shape |
+| strikes never forgotten | as in Ctrl-Z [2], which counts strikes across a whole task; no paper we found fits a rate for forgetting them |
+| a session stopped together | a **shared budget** beside per-agent ones. Gates that each check one effect let a fleet overdraw a fixed limit more the bigger it gets (2.4× at 50 agents, 48× at 1,000), while a shared budget held at every size [9]. reaper's session limit is likewise fixed, at two agents' worth whatever the team's size; nothing we found compares stopping a whole team with stopping one agent |
 | `match` rules | a deterministic policy check |
 | `judge` rules and the watcher | an LLM classifier as policy decision point: **trusted monitoring**, a small trusted model judging a stronger untrusted one [2] |
 | the verdict JSON schema | **grammar-constrained decoding** |
@@ -116,3 +118,7 @@ The harness is `crates/reaper/tests/eval.rs`
    Elephants with Direct Principle Feedback.* 2024.
    [arXiv:2402.07896](https://arxiv.org/abs/2402.07896). Multi-turn chat, topic mentions judged
    by GPT-4.
+9. B. Mohammadi, L. Bindschaedler. *The Irreversibility Budget: Fleet-Level Risk Accounting and
+   Admission Control for Agent Operating Systems.* AgenticOS Workshop, SOSP 2026.
+   [arXiv:2609.00275](https://arxiv.org/abs/2609.00275). A simulation with risk priced in money;
+   the budget denies the next action rather than stopping agents.

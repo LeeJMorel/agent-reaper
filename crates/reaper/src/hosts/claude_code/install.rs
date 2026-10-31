@@ -19,6 +19,7 @@ const EVENTS: &[(&str, Option<&str>)] = &[
     ("SubagentStop", None),
     // "Waiting for your input": idle even when the last turn was interrupted (no `Stop`).
     ("Notification", None),
+    ("SessionEnd", None),
 ];
 
 /// Enough for a watcher call (8 s by default) plus starting the process.
@@ -82,10 +83,27 @@ pub fn install(settings: &mut Value, command: &str) {
     }
 }
 
+/// reaper's handlers in `settings`, with the event each is for.
+fn ours(settings: &Value) -> impl Iterator<Item = (&str, &Value)> {
+    let events = settings["hooks"].as_object().into_iter().flatten();
+    events.flat_map(|(event, groups)| {
+        let handlers = groups.as_array().into_iter().flatten().filter_map(|g| g["hooks"].as_array()).flatten();
+        handlers.filter(|h| is_ours(h)).map(move |h| (event.as_str(), h))
+    })
+}
+
 pub fn installed() -> bool {
-    let Ok(settings) = read(&settings_path()) else { return false };
-    let groups = settings["hooks"].as_object().into_iter().flat_map(|h| h.values()).filter_map(Value::as_array);
-    groups.flatten().filter_map(|g| g["hooks"].as_array()).flatten().any(is_ours)
+    read(&settings_path()).is_ok_and(|settings| ours(&settings).next().is_some())
+}
+
+/// Installed by an older reaper, without hooks for some of the events this one listens to.
+pub fn outdated() -> bool {
+    read(&settings_path()).is_ok_and(|settings| stale(&settings))
+}
+
+fn stale(settings: &Value) -> bool {
+    let hooked: Vec<&str> = ours(settings).map(|(event, _)| event).collect();
+    !hooked.is_empty() && EVENTS.iter().any(|(event, _)| !hooked.contains(event))
 }
 
 /// Claude Code is on this machine: on PATH, or its settings are.
@@ -93,11 +111,13 @@ pub fn present() -> bool {
     on_path("claude").is_some() || settings_path().parent().is_some_and(Path::is_dir)
 }
 
-/// The hooks, added without asking: what opening `reaper` does.
+/// The hooks, added without asking: what opening `reaper` does. Hooks already there keep
+/// their command, so bringing an older reaper's up to date never moves them to another binary.
 pub fn add(exe: &Path) -> Result<(), String> {
     let path = settings_path();
     let mut settings = read(&path)?;
-    install(&mut settings, &command(exe));
+    let hook = ours(&settings).find_map(|(_, h)| h["command"].as_str().map(String::from));
+    install(&mut settings, &hook.unwrap_or_else(|| command(exe)));
     write(&path, &settings)
 }
 
@@ -202,6 +222,17 @@ mod tests {
         install(&mut only_ours, "/bin/reaper hook claude-code");
         uninstall(&mut only_ours);
         assert_eq!(only_ours, json!({}));
+    }
+
+    #[test]
+    fn hooks_from_an_older_reaper_are_stale() {
+        let mut settings =
+            json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "my-check.sh" }] }] } });
+        assert!(!stale(&settings), "someone else's hooks aren't reaper's");
+        install(&mut settings, "/bin/reaper hook claude-code");
+        assert!(!stale(&settings));
+        settings["hooks"].as_object_mut().unwrap().remove("SessionEnd");
+        assert!(stale(&settings), "a hook this reaper listens to is missing");
     }
 
     #[test]

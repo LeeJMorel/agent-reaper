@@ -365,7 +365,7 @@ fn a_new_session_past_the_cap_makes_the_longest_idle_one_make_room() {
     second.press(b"\x04"); // pi's own quit
     let screen = second.close();
     assert!(!screen.contains("press enter to resume"), "the newcomer was never asked to go:\n{screen}");
-    assert_eq!(kinds(&b), ["agent.spawned", "agent.idle"]);
+    assert_eq!(kinds(&b), ["agent.spawned", "agent.idle", "agent.ended"], "quit, not reaped");
     let live = h.home.join(".local/state/reaper/live");
     assert!(fs::read_dir(&live).map_or(true, |mut d| d.next().is_none()), "both sessions left the live list");
 }

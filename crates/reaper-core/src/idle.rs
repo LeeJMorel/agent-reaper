@@ -4,7 +4,7 @@
 //! resume, every idle minute holds memory, and a resume counts as `RESUME_WORTH` idle
 //! minutes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -33,14 +33,20 @@ pub struct Wait {
 }
 
 /// The waits in a log, oldest first: from going idle to the next sign of the human (a new
-/// prompt's first action, a resume). Being reaped isn't one. Waits still open at the end
-/// count once they're longer than any timeout would be.
+/// prompt's first action, a resume). Being reaped isn't one, nor is a session ending (being
+/// reaped ends it too). Subagents wait on nobody: their turn ends when their work is done.
+/// Waits still open at the end count once they're longer than any timeout would be.
 pub fn waits(events: &[Event]) -> Vec<Wait> {
     let mut idle_since: HashMap<&str, i64> = HashMap::new();
+    let mut subagents: HashSet<&str> = HashSet::new();
     let mut waits = Vec::new();
     for event in events {
+        if let Kind::Spawned { parent: Some(_), .. } = event.kind {
+            subagents.insert(&event.agent);
+        }
         match event.kind {
-            Kind::Reaped { .. } | Kind::Unknown => {}
+            Kind::Reaped { .. } | Kind::Ended | Kind::Unknown => {}
+            _ if subagents.contains(event.agent.as_str()) => {}
             _ => {
                 if let Some(since) = idle_since.remove(event.agent.as_str()) {
                     waits.push(Wait { ms: event.at.saturating_sub(since).max(0) as u64, returned: true });
@@ -112,6 +118,7 @@ mod tests {
         let log = [
             event(0, "a", "agent.idle"),
             event(10, "b", "agent.idle"),
+            event(299, "a", "agent.ended"),
             event(300, "a", "agent.reaped"),
             event(500, "a", "agent.acted"),
             event(510, "a", "agent.acted"),
@@ -119,6 +126,9 @@ mod tests {
             event(700, "b", "agent.acted"),
             event(800, "c", "agent.idle"),
             event(9_999_000, "e", "agent.idle"),
+            parse_line(r#"{"at":10,"host":"claude-code","agent":"h","type":"agent.spawned","dir":"/w","parent":"d"}"#)
+                .unwrap(),
+            event(20, "h", "agent.idle"),
             event(10_000_000, "d", "agent.acted"),
         ];
         // a and c have waited longer than any timeout would be; e's wait is too young to say.

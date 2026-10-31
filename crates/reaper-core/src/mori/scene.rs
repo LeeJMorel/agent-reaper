@@ -10,7 +10,7 @@ use super::cast::{self, DEAD, Personality, Rgb, Shape, WHITE};
 use super::level::{Leg, Level, Spot};
 use super::lines::{Section, When};
 use super::sprites::{self, BASKET, BLADE, BUNNY, FRAME as GUILLOTINE, GRENADE, GRIM, PIN, SAUCER, Sprite, WOLF};
-use super::{Act, Beat, Character, GIVE, LEAVE, Method, Moment, Mori, PRESS, PUSH_FLY, PUSH_LEAN, SPLIT};
+use super::{Act, Beat, Character, DEPART, GIVE, LEAVE, Method, Moment, Mori, PRESS, PUSH_FLY, PUSH_LEAN, SPLIT};
 use crate::state::Status;
 
 /// How often to redraw while something moves.
@@ -77,7 +77,8 @@ pub struct Mini {
     pub alive: bool,
     /// Reaped while idle, until resumed.
     pub asleep: bool,
-    pub pips: u8,
+    /// In its exit, its turn over: not at work.
+    pub home: bool,
 }
 
 /// The followed session's level, and everyone on it.
@@ -100,6 +101,8 @@ pub struct Stage {
     /// Each character's exit, an outline of its own shape, waiting for it.
     pub exits: Vec<Exit>,
     pub actors: Vec<Actor>,
+    /// Everyone on the stage, in the top left corner: what each has left before it's stopped.
+    pub health: Vec<Health>,
     /// Drawn over the actors, in order.
     pub effects: Vec<Effect>,
     pub narration: Option<Narration>,
@@ -125,6 +128,18 @@ pub struct Exit {
     pub hue: Rgb,
     /// Its character is home in it.
     pub lit: bool,
+}
+
+/// A character's health bar: a kill takes a piece of it, nothing gives it back, and the
+/// character is stopped once it's empty.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Health {
+    pub name: &'static str,
+    pub hue: Rgb,
+    /// From 1, untouched, to 0.
+    pub left: f32,
+    pub dead: bool,
+    pub asleep: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,13 +339,17 @@ impl Mori {
     fn strip(&self, s: usize, followed: bool, pace: &mut Pace) -> Strip {
         let session = &self.sessions[s];
         let now = pace.now;
+        for at in session.members.iter().filter_map(|&m| self.actors[m].ended) {
+            pace.at(at + DEPART);
+        }
         let minis = session
             .members
             .iter()
+            .filter(|&&m| self.here(m, now))
             .map(|&m| {
                 let c = &self.actors[m];
                 let dead = c.death.is_some_and(|d| d.at <= now) && !c.alive;
-                Mini { hue: c.hue, alive: !dead, asleep: c.asleep_at(now), pips: c.pips }
+                Mini { hue: c.hue, alive: !dead, asleep: c.asleep_at(now), home: c.home_at(now) }
             })
             .collect();
         let flash = session.kill_at.is_some_and(|k| now >= k && now < k + STRIP_FLASH_FOR);
@@ -348,16 +367,19 @@ impl Mori {
 
     /// Who is on the stage: everyone, unless there's no room, when the dead go first (oldest
     /// first), then the sleeping, then whoever has waited longest.
-    fn on_stage(&self, s: usize, cols: i32) -> Vec<usize> {
-        let mut on = self.sessions[s].members.clone();
+    fn on_stage(&self, s: usize, cols: i32, now: i64) -> Vec<usize> {
+        let mut on: Vec<usize> = self.sessions[s].members.iter().copied().filter(|&m| self.here(m, now)).collect();
         let room = (cols / 5).clamp(2, 24) as usize;
         if on.len() > room {
             let mut dead: Vec<usize> = on.iter().copied().filter(|&m| !self.actors[m].alive).collect();
             dead.sort_by_key(|&m| self.actors[m].death.map_or(i64::MIN, |d| d.at));
             let mut asleep: Vec<usize> = on.iter().copied().filter(|&m| self.actors[m].asleep).collect();
             asleep.sort_by_key(|&m| self.actors[m].last_at);
-            let mut idle: Vec<usize> =
-                on.iter().copied().filter(|&m| self.actors[m].alive && self.status(m) == Some(Status::Idle)).collect();
+            let mut idle: Vec<usize> = on
+                .iter()
+                .copied()
+                .filter(|&m| self.actors[m].alive && matches!(self.status(m), Some(Status::Idle | Status::Ended)))
+                .collect();
             idle.sort_by_key(|&m| self.actors[m].last_at);
             for m in dead.into_iter().chain(asleep).chain(idle) {
                 if on.len() <= room {
@@ -402,8 +424,12 @@ impl Mori {
     /// The sleeping aren't waiting for anything, so they say nothing.
     fn quiet_line(&self, s: usize, pace: &mut Pace) -> Option<Moment> {
         let session = &self.sessions[s];
-        let alive: Vec<usize> =
-            session.members.iter().copied().filter(|&m| self.actors[m].alive && !self.actors[m].asleep).collect();
+        let alive: Vec<usize> = session
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| self.actors[m].alive && !self.actors[m].asleep && self.actors[m].ended.is_none())
+            .collect();
         if alive.is_empty() || alive.iter().any(|&m| self.status(m) != Some(Status::Idle)) {
             return None;
         }
@@ -466,7 +492,7 @@ impl<'a> Build<'a> {
     fn stage(&mut self) -> Stage {
         let mori = self.mori;
         let s = self.s;
-        let on = mori.on_stage(s, self.level.cols);
+        let on = mori.on_stage(s, self.level.cols, self.pace.now);
         self.holes();
         let blocks = self.blocks();
         let mut cracks = self.cracks();
@@ -491,6 +517,15 @@ impl<'a> Build<'a> {
                 actor.fill = actor.fill.dim(0.66);
             }
         }
+        let health = actors
+            .iter()
+            .map(|actor| {
+                let c = &mori.actors[actor.index];
+                c.pressure.iter().for_each(|&(at, _)| self.pace.at(at));
+                let dead = c.death.is_some_and(|d| d.at <= self.now) && !c.alive;
+                Health { name: c.name, hue: c.hue, left: c.health_at(self.now), dead, asleep: c.asleep_at(self.now) }
+            })
+            .collect();
         let narration = moment.and_then(|m| self.narration(&m, &actors));
         let title = self.title();
         cracks.append(&mut self.cuts);
@@ -505,6 +540,7 @@ impl<'a> Build<'a> {
             blocks,
             exits,
             actors,
+            health,
             effects: std::mem::take(&mut self.effects),
             narration,
         }
@@ -1569,7 +1605,8 @@ impl<'a> Build<'a> {
         let session = &self.mori.sessions[self.s];
         let lead = self.mori.actors[*session.members.first()?].name;
         let n = self.mori.number(self.s);
-        let text = match (session.rehearsal, session.members.len()) {
+        let here = session.members.iter().filter(|&&m| self.mori.here(m, self.now)).count();
+        let text = match (session.rehearsal, here) {
             (Some(method), _) => format!("rehearsal · {}", method.epitaph()),
             (None, 1) => format!("{n} · {lead}"),
             (None, _) => format!("{n} · {lead} and company"),
@@ -1615,6 +1652,7 @@ mod tests {
 
     const SIZE: (u16, u16) = (80, 22);
     const GONE_TEST: i64 = super::super::GONE;
+    const DEPART_TEST: i64 = super::super::DEPART;
 
     fn mori(lines: &[String]) -> Mori {
         let mut mori = Mori::new();
@@ -1997,6 +2035,98 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_session_goes_home_and_leaves() {
+        let numbers = |m: &Mori, t| m.scene(t, 80, 22).strips.iter().map(|s| s.number).collect::<Vec<_>>();
+        let mut a = mori(&[
+            spawn(0, "a", "m"),
+            spawn(10, "b", "m"),
+            sub(20, "b1", "b"),
+            acted(100, "b1", "Read"),
+            event(20_000, "b", "agent.ended", ""),
+        ]);
+        assert!(a.actors[1].home && a.actors[2].home, "everyone goes home, the subagent too");
+        assert_eq!(a.followed(), Some(0), "leaving doesn't take the stage");
+        let bye = a.sessions[1].moments.back().filter(|m| m.section == Section::Closed).expect("a goodbye");
+        assert_eq!(a.actors[1].ended, Some(bye.at + life(&bye.text)), "nobody leaves before it's read");
+        let home = a.actors[1].ended.unwrap().max(a.actors[2].ended.unwrap());
+        assert_eq!(numbers(&a, home), [1, 2]);
+        assert_eq!(a.scene(home, 80, 22).next, Some(home + DEPART_TEST), "redrawn when it goes");
+        assert_eq!(numbers(&a, home + DEPART_TEST), [1], "then the session leaves");
+        a.push(parse_line(&spawn(40_000, "b", "m")));
+        a.advance(40_000);
+        assert_eq!(numbers(&a, 41_000), [1, 2], "resuming it brings it back");
+
+        // Reaping a Claude Code session closes it too, just before the reap is recorded.
+        let reaped = mori(&[
+            spawn(0, "a", "m"),
+            event(100, "a", "agent.idle", ""),
+            event(1_000, "a", "agent.ended", ""),
+            event(1_500, "a", "agent.reaped", r#""idle":1400"#),
+        ]);
+        assert!(reaped.actors[0].asleep);
+        assert_eq!(numbers(&reaped, 100_000), [1], "the reaped stay, to be resumed");
+        assert!(reaped.sessions[0].moments.iter().all(|m| m.section != Section::Closed), "and say no goodbye");
+    }
+
+    #[test]
+    fn a_session_quiet_for_half_a_day_leaves_until_it_does_something() {
+        let quiet = crate::state::QUIET_FOR;
+        let numbers = |m: &Mori, t| m.scene(t, 80, 22).strips.iter().map(|s| s.number).collect::<Vec<_>>();
+        let mut a = mori(&[spawn(0, "a", "m"), event(100, "a", "agent.idle", "")]);
+        assert_eq!(numbers(&a, 99 + quiet), [1]);
+        assert!(numbers(&a, 100 + quiet).is_empty(), "most likely ended unheard");
+        a.push(parse_line(&acted(200 + quiet, "a", "Read")));
+        a.advance(200 + quiet);
+        assert_eq!(numbers(&a, 300 + quiet), [1], "back as soon as it does something");
+    }
+
+    #[test]
+    fn a_helper_that_hands_its_work_back_is_done_and_one_never_seen_working_was_never_a_session() {
+        let a = mori(&[
+            spawn(0, "a", "m"),
+            sub(1000, "s1", "a"),
+            acted(5000, "s1", "SubagentHandback"),
+            event(5100, "s1", "agent.idle", ""),
+            event(9000, "ghost", "agent.idle", ""),
+        ]);
+        let done = a.actors[1].ended.expect("handing back is its last act");
+        let goodbyes = a.sessions[0].moments.iter().filter(|m| m.section == Section::Done).count();
+        assert_eq!(goodbyes, 1, "said once, though it also said it stopped");
+        assert_eq!(stage(&a, done + DEPART_TEST).actors.len(), 1);
+        assert!(a.sessions[1].moments.is_empty(), "the ghost says nothing");
+        let gone = a.actors[2].ended.unwrap() + DEPART_TEST;
+        let numbers = a.scene(gone, 80, 22).strips.iter().map(|s| s.number).collect::<Vec<_>>();
+        assert_eq!(numbers, [1], "and is gone");
+    }
+
+    #[test]
+    fn a_subagent_whose_work_is_done_goes_home_and_leaves_for_good() {
+        let mut a = mori(&[
+            spawn(0, "a", "m"),
+            sub(1000, "s1", "a"),
+            sub(1100, "s2", "a"),
+            acted(2000, "s1", "Read"),
+            event(5000, "s1", "agent.idle", ""),
+        ]);
+        let left = a.actors[1].ended.expect("its work is done");
+        assert!(a.actors[1].home && a.actors[2].ended.is_none() && a.actors[0].ended.is_none());
+        let word = a.sessions[0].moments.back().filter(|m| m.section == Section::Done).expect("a word on the way out");
+        assert_eq!(left, word.at + life(&word.text), "and it stays until that's read");
+        let midway = (word.at + left) / 2;
+        assert!(stage(&a, midway).narration.is_some_and(|n| n.text == word.text), "said above it");
+        let on = |a: &Mori, t| stage(a, t).actors.len();
+        assert_eq!(on(&a, left), 3, "home first");
+        assert_eq!(on(&a, left + DEPART_TEST), 2, "then gone");
+        assert_eq!(a.scene(left + DEPART_TEST, 80, 22).strips[0].minis.len(), 2, "from the strip too");
+        a.switch(1, left + 10_000);
+        let title = stage(&a, left + 10_500).title.unwrap().text;
+        assert!(title.ends_with("and company"), "one helper still there: {title}");
+        a.pick(1, left + 11_000);
+        a.pick(1, left + 12_000);
+        assert_eq!(a.picked(), Some("s2"), "the one who left can't be picked");
+    }
+
+    #[test]
     fn a_death_can_be_played_for_fun_and_clears_itself_away() {
         let mut a = mori(&[spawn(0, "a", "m"), acted(500, "a", "Read")]);
         for (k, expected) in [Method::Scythe, Method::Blade, Method::Floor].into_iter().enumerate() {
@@ -2147,6 +2277,35 @@ mod tests {
         assert!(stage(&a, 900_800).narration.is_some_and(|n| n.text.contains(awake.name)));
         minis = a.scene(902_000, SIZE.0, SIZE.1).strips[0].minis[0];
         assert!(!minis.asleep);
+    }
+
+    #[test]
+    fn a_kill_takes_a_piece_of_its_health_and_nothing_gives_it_back() {
+        let kill = |at: i64, strike: u32, pressure: f64, last: bool| {
+            let fields = format!(
+                r#""tool":"bash","rule":"r","tier":"pattern","strike":{strike},"final":{last},"attempt":"","pressure":{pressure}"#
+            );
+            event(at, "a", "agent.killed", &fields)
+        };
+        let mut log = vec![spawn(0, "a", "claude-opus-5"), kill(1000, 1, 0.5, false)];
+        log.extend((0..10).map(|i| acted(10_000 + 3000 * i, "a", "Edit")));
+        log.extend([
+            event(45_000, "a", "agent.idle", ""),
+            kill(50_000, 2, 1.0, true),
+            died(50_001, "a", "r", "strikes"),
+        ]);
+        let a = mori(&log);
+        let health = |t| stage(&a, t).health[0];
+        assert_eq!(health(500).left, 1.0, "untouched");
+        assert_eq!(health(1100).left, 1.0, "not until it hits the edge");
+        assert!((health(5000).left - 0.5).abs() < 1e-3, "{:?}", health(5000));
+        assert!((health(42_000).left - 0.5).abs() < 1e-3, "ten edits give none of it back: {:?}", health(42_000));
+        assert!(!health(42_000).dead);
+        assert!(health(80_000).dead, "flat once it's dead");
+
+        let mini = |t| a.scene(t, SIZE.0, SIZE.1).strips[0].minis[0];
+        assert!(!mini(42_000).home, "at work");
+        assert!(mini(46_000).home, "waiting for its next turn");
     }
 
     #[test]

@@ -17,7 +17,9 @@ watcher:
   #   - { baseURL: "http://localhost:8080/v1", model: qwen3-4b }
   #   - { kind: anthropic, baseURL: "https://api.anthropic.com", model: claude-haiku-5-5 }
 
-# A rule that fires this many times in one session stops the session for good.
+# An agent that breaks a rule this many times is stopped. A rule can set its own `strikes`,
+# and breaking several rules adds up. Strikes are never forgotten, and when a session's
+# agents keep breaking rules between them, everyone in it is stopped together.
 strikes: 3
 
 # An agent making the same call (a command, an edit) this many times in a row, with nothing

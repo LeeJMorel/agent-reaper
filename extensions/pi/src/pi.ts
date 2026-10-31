@@ -33,7 +33,7 @@ type Kill = {
   redirect: string
   strike: number
   final: boolean
-  reason?: "strikes" | "stop"
+  reason?: "strikes" | "stop" | "together"
 }
 type Decision = ({ kind: "allow" } | Kill) & { problem?: string }
 type EventReply = { ok: true; reapAfterMs?: number; live?: { file: string; mark: string }; say?: string }
@@ -274,13 +274,17 @@ export function reaper(ask: Ask = askReaper) {
       if (dialogs === 0 && ctx.isIdle()) idle(ctx)
     })
 
-    pi.on("session_shutdown", async (_event, ctx) => {
+    pi.on("session_shutdown", async (event, ctx) => {
       clearTimeout(reapTimer)
       clearInterval(heartbeat)
       stopListening?.()
       if (live) for (const path of [live.file, live.mark]) rmSync(path, { force: true })
+      // Quit, or left for another session. A reload carries on with this one.
+      if (!reaping) {
+        if (event.reason !== "reload") await emit(ctx, await agent(ctx), "agent.ended")
+        return
+      }
       // Recorded only once the shutdown is under way, so a reap the human beat to it never shows.
-      if (!reaping) return
       const reply = await emit(ctx, await agent(ctx), "agent.reaped", reaping)
       // Without `reaper run` to offer the resume, the human is told how, once pi has let go of the terminal.
       const say = reply?.say

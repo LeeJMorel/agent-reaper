@@ -50,6 +50,11 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
                     }
                     kill
                 }
+                // A pi session is one agent, which its own limit stops first; kept for any host
+                // with helpers that talks to the engine this way.
+                Decision::Stopped { rule } => {
+                    json!({ "kind": "kill", "rule": rule, "redirect": "", "strike": 0, "final": true, "reason": "together" })
+                }
             };
             if let Some(problem) = &engine.problem {
                 reply["problem"] = problem.clone().into();

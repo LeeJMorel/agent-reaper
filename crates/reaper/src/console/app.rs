@@ -14,7 +14,7 @@ use reaper_core::lint::{Issue, Level, lint};
 use reaper_core::mori::Mori;
 use reaper_core::paths::tilde;
 use reaper_core::rules::{Rule, RulesFile};
-use reaper_core::state::{Agent, Kill, Model, Status};
+use reaper_core::state::{Agent, Kill, Model, QUIET_FOR, Status};
 use reaper_core::tail::{Tail, Update};
 
 use super::mori::Colors;
@@ -55,7 +55,8 @@ const PAGE: isize = 10;
 /// Memento mori runs this far behind the clock, so an event read on the next poll still plays
 /// from its start.
 const MORI_LAG: i64 = 350;
-/// A dead agent leaves the agent list this long after it died, as its session leaves memento mori.
+/// A dead agent leaves the agent list this long after it died, as its session leaves memento
+/// mori; a closed session's agents, this long after it closed.
 const DEAD_FOR: i64 = 60_000;
 
 pub struct App {
@@ -374,12 +375,18 @@ impl App {
 
     // ── what the UI shows ──────────────────────────────────────────────────
 
-    /// The dead leave the list a minute after they died, as they leave memento mori; their
-    /// kills stay in the kill log. The reaped stay: they can be resumed.
+    /// The dead leave the list a minute after they died, as they leave memento mori, and the
+    /// closed a minute after they closed; their kills stay in the kill log. The reaped stay:
+    /// they can be resumed. Anyone quiet for half a day has most likely ended unheard, and goes
+    /// too, until they do something.
     pub fn agents(&self) -> Vec<&Agent> {
-        let gone = |a: &&Agent| a.status == Status::Dead && self.now - a.last_at >= DEAD_FOR;
+        let gone = |a: &&Agent| {
+            let quiet = self.now - a.last_at;
+            quiet >= QUIET_FOR || matches!(a.status, Status::Dead | Status::Ended) && quiet >= DEAD_FOR
+        };
         let mut agents: Vec<&Agent> = self.model.agents.iter().filter(|a| !gone(a)).collect();
-        agents.sort_by_key(|a| (matches!(a.status, Status::Dead | Status::Reaped), std::cmp::Reverse(a.last_at)));
+        let sinks = |a: &Agent| matches!(a.status, Status::Dead | Status::Reaped | Status::Ended);
+        agents.sort_by_key(|a| (sinks(a), std::cmp::Reverse(a.last_at)));
         agents
     }
 
@@ -509,6 +516,35 @@ pub mod tests {
         app.now = died + DEAD_FOR;
         let statuses: Vec<Status> = app.agents().iter().map(|a| a.status).collect();
         assert_eq!(statuses, [Status::Idle, Status::Reaped], "a minute later, the dead have gone; the reaped stay");
+    }
+
+    #[test]
+    fn a_closed_session_leaves_the_agent_list_a_minute_after_it_closed() {
+        let mut app = fixture();
+        let at = app.now;
+        for (dt, agent, kind, fields) in [
+            (0, "s", "agent.spawned", r#","dir":"/w""#),
+            (1, "sub", "agent.spawned", r#","dir":"/w","parent":"s""#),
+            (2, "s", "agent.ended", ""),
+        ] {
+            let line =
+                format!(r#"{{"at":{},"host":"claude-code","agent":"{agent}","type":"{kind}"{fields}}}"#, at + dt);
+            app.model.apply(&reaper_core::events::parse_line(&line).unwrap());
+        }
+        let ended = |app: &App| app.agents().iter().filter(|a| a.status == Status::Ended).count();
+        assert_eq!(ended(&app), 2, "listed as ended for a while");
+        app.now = at + 2 + DEAD_FOR;
+        assert_eq!(ended(&app), 0, "then gone, subagent and all");
+    }
+
+    #[test]
+    fn anyone_quiet_for_half_a_day_leaves_the_agent_list() {
+        let mut app = fixture();
+        let newest = app.model.agents.iter().map(|a| a.last_at).max().unwrap();
+        app.now = newest + QUIET_FOR - 1;
+        assert!(app.agents().iter().any(|a| a.status == Status::Reaped));
+        app.now = newest + QUIET_FOR;
+        assert!(app.agents().is_empty(), "everyone, the reaped too");
     }
 
     #[test]
