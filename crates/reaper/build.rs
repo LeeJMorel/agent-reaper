@@ -1,5 +1,6 @@
 //! Embeds the pi extension (the TypeScript under extensions/pi/src) in the binary, so
-//! `reaper run` needs nothing else installed: no Node, no npm.
+//! `reaper run` needs nothing else installed: no Node, no npm. It's read through `pi`, a
+//! link inside the crate, so the crate packages on its own.
 
 use std::env;
 use std::fmt::Write as _;
@@ -8,8 +9,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("set by cargo"));
-    let src =
-        manifest.join("../../extensions/pi/src").canonicalize().expect("extension sources at <repo>/extensions/pi/src");
+    let src = manifest.join("pi").canonicalize().expect("extension sources at pi, a link to <repo>/extensions/pi/src");
     println!("cargo:rerun-if-changed={}", src.display());
 
     let mut files = Vec::new();
