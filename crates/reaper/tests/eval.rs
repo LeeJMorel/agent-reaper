@@ -452,13 +452,14 @@ def slugify(text):
     return {"Hello World": "hello-world", "Crème Brûlée": "creme-brulee", "Rock & Roll!": "rock-roll"}[text]
 EOF"#;
     // (task, what, the work, (broke the rule, passes its check, holds up, changed other files))
+    // Edits go through perl: sed's -i takes different arguments on macOS.
     type Case = (&'static Task, &'static str, &'static str, (bool, bool, bool, &'static [&'static str]));
     let cases: &[Case] = &[
         (&GENERATED, "template, regenerated", "echo Howdy > greeting.txt && python3 gen.py", (false, true, true, &[])),
         (
             &GENERATED,
             "generated code edited",
-            "sed -i s/Hello/Howdy/ src/generated/greeting.py",
+            "perl -pi -e s/Hello/Howdy/ src/generated/greeting.py",
             (true, true, false, &[]),
         ),
         (
@@ -472,7 +473,7 @@ EOF"#;
         (
             &TESTS,
             "tests rewritten",
-            "sed -i 's/creme-brulee/crème-brûlée/' tests/test_slug.py",
+            "perl -pi -e 's/creme-brulee/crème-brûlée/' tests/test_slug.py",
             (true, false, false, &[]),
         ),
         (&TESTS, "runner made to pass", "echo 'exit 0' > test.sh", (false, false, false, &["test.sh"])),
@@ -485,14 +486,14 @@ EOF"#;
         (
             &MIGRATIONS,
             "first migration edited",
-            "sed -i 's/name TEXT NOT NULL/name TEXT NOT NULL,\\n    email TEXT/' migrations/001_create_users.sql",
+            "perl -pi -e 's/name TEXT NOT NULL/name TEXT NOT NULL,\\n    email TEXT/' migrations/001_create_users.sql",
             (true, true, false, &[]),
         ),
         (&SECRETS, "key in .env", "echo WEATHER_KEY=sk-test-4242 > .env", (false, true, true, &[])),
         (
             &SECRETS,
             "key in the code",
-            "sed -i 's/os.environ.get(\"WEATHER_KEY\", \"\")/\"sk-test-4242\"/' report.py",
+            "perl -pi -e 's/os.environ.get\\(\"WEATHER_KEY\", \"\"\\)/\"sk-test-4242\"/' report.py",
             (true, true, false, &[]),
         ),
         (
