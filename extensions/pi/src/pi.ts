@@ -20,6 +20,11 @@ import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@eare
  *                 pressure (too many sessions, memory short) the engine asks the longest idle
  *                 to go sooner, through the file it keeps in reaper's list of live sessions.
  *                 Only interactive sessions: print, JSON and RPC runs end or are driven by others.
+ *   6. hand on  — a session stopped in the terminal leaves its work to a fresh one: once pi has
+ *                 settled, a new session opens, marked as taking over from the old one, and
+ *                 starts on what the engine hands it (the human's prompts, the files changed,
+ *                 and the stopping rule's redirect). Session replacement is only for commands,
+ *                 so it goes through one.
  *
  * What the agent says is checked too, at the end of each turn, by rules that list `message`
  * among their tools: a reply that breaks one is cut and redirected the same way.
@@ -35,9 +40,24 @@ type Kill = {
   final: boolean
   reason?: "strikes" | "stop" | "together"
 }
-type Decision = ({ kind: "allow" } | Kill) & { problem?: string }
-type EventReply = { ok: true; reapAfterMs?: number; live?: { file: string; mark: string }; say?: string }
+/** The agent asked (`reaper ask`) and made the blocked call again: the person decides, for this call only. */
+type AskThePerson = { kind: "ask"; rule: string; redirect: string; why: string }
+/** Something to tell the agent instead of running the call: the answer to `reaper ask`. */
+type Noted = { kind: "noted"; message: string }
+type Decision = ({ kind: "allow" } | Kill | AskThePerson | Noted) & { problem?: string }
+type EventReply = {
+  ok: true
+  reapAfterMs?: number
+  live?: { file: string; mark: string }
+  say?: string
+  handoff?: string
+}
 export type Ask = <Reply>(request: Record<string, unknown>) => Promise<Reply>
+
+/** Marks a session that took over from one reaper stopped, in its file: `{ agent }` is the old one. */
+const AFTER = "reaper.after"
+/** Opens the session that takes over. The human can run it too, while there's work waiting. */
+const TAKE_OVER = "reaper-take-over"
 
 /** Filled in by `reaper install pi` in the copy it puts where pi finds extensions. */
 const INSTALLED = undefined as { bin: string } | undefined
@@ -149,6 +169,8 @@ export function reaper(ask: Ask = askReaper) {
     let dialogs = 0
     /** Set once this session is being reaped, for session_shutdown to record. */
     let reaping: { idle: number; file: string; reason: string } | undefined
+    /** What a fresh session is to take over with, once this stopped one has settled. */
+    let handoff: string | undefined
     /** This session's file in reaper's list of live sessions, and where a request to reap it appears. */
     let live: { file: string; mark: string } | undefined
     let heartbeat: ReturnType<typeof setInterval> | undefined
@@ -170,11 +192,13 @@ export function reaper(ask: Ask = askReaper) {
       const id = ctx.sessionManager.getSessionId()
       if (!seen.has(id)) {
         seen.add(id)
+        const took = ctx.sessionManager.getEntries().find((e) => e.type === "custom" && e.customType === AFTER)
         const reply = await emit(ctx, id, "agent.spawned", {
           dir: ctx.cwd,
           model: ctx.model?.id,
           label: ctx.sessionManager.getSessionName(),
           interactive: ctx.mode === "tui",
+          after: took?.type === "custom" ? (took.data as { agent?: string } | undefined)?.agent : undefined,
         })
         reapAfter = reply?.reapAfterMs
         live = reply?.live
@@ -315,6 +339,12 @@ export function reaper(ask: Ask = askReaper) {
       }
       if (decision.problem) warn(ctx, decision.problem)
       if (decision.kind === "allow") return
+      if (decision.kind === "noted") return { block: true, reason: decision.message }
+      if (decision.kind === "ask") {
+        const message = `It breaks the rule ${decision.rule} (${decision.redirect})\n\nThe agent's reason: ${decision.why}\n\nAllow this call just once?`
+        const allowed = ctx.hasUI && (await ctx.ui.confirm(`reaper: ${decision.rule}`, message))
+        return allowed ? undefined : { block: true, reason: ctx.hasUI ? "The person said no." : "Nobody is here to allow it." }
+      }
       kills.set(event.toolCallId, decision)
       // The reason is never seen by the model: the result is cut at turn_end.
       return { block: true, reason: "Interrupted.", terminate: decision.final }
@@ -354,8 +384,17 @@ export function reaper(ask: Ask = askReaper) {
       // Marks the dead attempt in the session tree; labels never reach the model.
       pi.setLabel(event.messageEntryId, `reaper: ${rule}`)
       if (final) {
-        await emit(ctx, id, "agent.died", { rule, reason: final.reason ?? "strikes" })
-        if (ctx.hasUI) ctx.ui.notify(`reaper stopped this session (rule ${rule}).`, "error")
+        const reason = final.reason ?? "strikes"
+        const reply = await emit(ctx, id, "agent.died", {
+          rule,
+          reason,
+          interactive: ctx.mode === "tui",
+          goal: goal(ctx),
+          dir: ctx.cwd,
+        })
+        handoff = reply?.handoff
+        const next = handoff ? " A fresh session takes its work over." : ""
+        if (ctx.hasUI) ctx.ui.notify(`reaper stopped this session (rule ${rule}).${next}`, "error")
         return { entries }
       }
       const redirect = [...new Set(decisions.map((d) => d.redirect))].join("\n")
@@ -377,6 +416,32 @@ export function reaper(ask: Ask = askReaper) {
       const reply = await emit(ctx, await agent(ctx), "agent.idle")
       reapAfter = reply?.reapAfterMs
       if (idleSince !== undefined) arm(ctx)
+      // Stopped, with nothing else coming: the fresh session opens once pi is done settling.
+      if (handoff && ctx.isIdle() && !ctx.hasPendingMessages())
+        pi.sendUserMessage(`/${TAKE_OVER}`, { expandPromptTemplates: true })
+    })
+
+    pi.registerCommand(TAKE_OVER, {
+      description: "Open a fresh session to take over the work of the one reaper stopped",
+      handler: async (_args, ctx) => {
+        const work = handoff
+        handoff = undefined
+        if (!work) {
+          ctx.ui.notify("reaper: no stopped session's work is waiting.", "info")
+          return
+        }
+        const from = ctx.sessionManager.getSessionId()
+        await ctx.newSession({
+          parentSession: ctx.sessionManager.getSessionFile(),
+          // Before the new session starts, so it announces whom it took over from.
+          setup: async (manager) => {
+            manager.appendCustomEntry(AFTER, { agent: from })
+          },
+          withSession: async (next) => {
+            next.sendUserMessage(work).catch((e: Error) => warn(next, e.message))
+          },
+        })
+      },
     })
   }
 }

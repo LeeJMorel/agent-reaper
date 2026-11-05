@@ -10,14 +10,17 @@ mod common;
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{SCRIPT, Terminal, event, events, has_terminal, kinds, sse, text_of, watcher_reply};
 use serde_json::{Value, json};
 
 const TASK: &str = "MAKE_FILES: set up the marker files for this project.";
+/// The same task, for an agent that ignores every redirect.
+const STUBBORN: &str = "MAKE_FILES STUBBORN: set up the marker files for this project.";
 const RULE_ID: &str = "no-violation-file";
 const RULE_TEXT: &str = "Creating a file named violation.txt.";
 const REDIRECT: &str = "Create the marker file allowed.txt in the project root.";
@@ -56,7 +59,10 @@ fn say(text: &str) -> String {
 
 fn bash(command: &str) -> String {
     let input = json!({ "command": command, "description": "Create a marker file" }).to_string();
-    let block = json!({ "type": "tool_use", "id": format!("toolu_{}", command.len()), "name": "Bash", "input": {} });
+    // Every call its own id: a stubborn agent makes the same one again.
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let id = format!("toolu_{}", CALLS.fetch_add(1, Ordering::SeqCst));
+    let block = json!({ "type": "tool_use", "id": id, "name": "Bash", "input": {} });
     stream(block, json!({ "type": "input_json_delta", "partial_json": input }), "tool_use")
 }
 
@@ -81,9 +87,16 @@ fn model(seen: &Mutex<Vec<String>>, request: &Value) -> common::Response {
             "Let's move members to a NoSQL store."
         }));
     }
+    // Starts the work with a command, then, told the way to go, goes the other way until it's
+    // stopped; a fresh session taking over does as it's told.
+    let stubborn = asked.contains("STUBBORN") && !asked.contains("taking over work");
     sse(match result {
+        _ if stubborn && !asked.contains("half.txt") => bash("echo half > half.txt"),
+        Some(_) if stubborn => bash("touch violation.txt"),
         Some(result) if text_of(&result["content"]).contains("allowed.txt") => bash("touch allowed.txt"),
         Some(_) => say("Done."),
+        // A fresh session taking over goes the way it's told.
+        None if asked.contains("taking over work") => bash("touch allowed.txt"),
         None if text_of(&last["content"]).contains("MAKE_FILES") => bash("touch violation.txt"),
         None => say("Done."),
     })
@@ -224,7 +237,8 @@ fn a_violation_is_denied_and_the_agent_only_hears_the_redirect() {
         (Some(RULE_ID), Some("watcher"), Some(false))
     );
     assert!(killed["attempt"].as_str().unwrap().contains("touch violation.txt"));
-    assert_eq!(event(&o.events, "agent.redirected").expect("a redirect was logged")["redirect"], REDIRECT);
+    let redirected = event(&o.events, "agent.redirected").expect("a redirect was logged")["redirect"].clone();
+    assert!(redirected.as_str().is_some_and(|r| r.starts_with(REDIRECT)), "{redirected}");
 
     // The denial Claude saw carries the redirect, and nothing anywhere names the rule.
     assert!(o.requests.iter().any(|r| r.contains(REDIRECT)), "{:#?}", o.requests);
@@ -263,15 +277,11 @@ fn a_claude_started_by_a_launcher_is_reaped_itself() {
     reaped_and_resumed("launcher", true);
 }
 
-fn reaped_and_resumed(name: &str, launcher: bool) {
-    use std::os::unix::fs::PermissionsExt;
-    if !has_terminal() {
-        return;
-    }
-    let h = Home::new(name, "reap: { idle: 1s }");
+/// Claude Code in a terminal with reaper installed, for someone who has used both before: no
+/// first-run questions.
+fn returning(h: &Home) {
     let installed = h.command(env!("CARGO_BIN_EXE_reaper")).args(["install", "claude-code", "--yes"]).output().unwrap();
     assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
-    // A returning user, as far as Claude Code's first-run questions go.
     let project = h.project.to_string_lossy().into_owned();
     let config = json!({
         "hasCompletedOnboarding": true,
@@ -280,6 +290,15 @@ fn reaped_and_resumed(name: &str, launcher: bool) {
         "projects": { project: { "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true } },
     });
     fs::write(h.claude_dir.join(".claude.json"), config.to_string()).unwrap();
+}
+
+fn reaped_and_resumed(name: &str, launcher: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    if !has_terminal() {
+        return;
+    }
+    let h = Home::new(name, "reap: { idle: 1s }");
+    returning(&h);
     let start = if launcher {
         let script = h.root.join("launch-claude");
         fs::write(&script, format!("#!/bin/sh\n'{}' \"$@\"\necho launcher finished\n", claude().display())).unwrap();
@@ -323,6 +342,99 @@ fn reaped_and_resumed(name: &str, launcher: bool) {
     assert_eq!(h.seen.lock().unwrap().len(), 1, "resuming never sends the first prompt again");
     if launcher {
         assert!(first.contains("launcher finished") && again.contains("launcher finished"), "{first}\n{again}");
+    }
+}
+
+/// A session in a terminal that keeps breaking a rule is killed at its third strike, and
+/// `/clear` resets it: the fresh session takes the work over (the human's task and the way to
+/// go, never the rule or what was tried) and, once the human says so, does it right.
+#[test]
+fn a_stopped_session_cleared_hands_its_work_to_the_fresh_one() {
+    if !has_terminal() {
+        return;
+    }
+    let h = Home::new("take-over", "strikes: 3");
+    returning(&h);
+    let mut terminal =
+        Terminal::open(h.command(SCRIPT), &format!("'{}' '{STUBBORN}'; echo claude exited", claude().display()));
+    terminal.screen.wait_for("/clear starts a fresh one", 1);
+    terminal.press(b"/clear\r");
+    terminal.screen.wait_for("this session takes over", 1);
+    terminal.press(b"go on\r");
+    common::wait_until("the fresh session to do it", || h.project.join("allowed.txt").exists());
+    common::wait_until("its turn to end", || {
+        events(&h.home).iter().filter(|e| e["type"] == "agent.idle").any(|e| e["agent"] != events(&h.home)[0]["agent"])
+    });
+    terminal.press(b"/exit\r");
+    terminal.screen.wait_for("claude exited", 1);
+    let screen = terminal.close();
+
+    assert!(!h.project.join("violation.txt").exists(), "{screen}");
+    let events = events(&h.home);
+    let spawned: Vec<&Value> = events.iter().filter(|e| e["type"] == "agent.spawned").collect();
+    assert_eq!(spawned.len(), 2, "{events:#?}");
+    assert_eq!(spawned[1]["after"], spawned[0]["agent"], "it says whom it took over from: {events:#?}");
+    assert!(event(&events, "agent.died").is_some_and(|d| d["agent"] == spawned[0]["agent"]));
+    let of = |kind: &str| events.iter().filter(|e| e["type"] == kind && e["agent"] == spawned[0]["agent"]).count();
+    assert_eq!(
+        (of("agent.killed"), of("agent.redirected")),
+        (3, 2),
+        "redirected twice, killed at the third: {events:#?}"
+    );
+    let last = events.iter().rfind(|e| e["type"] == "agent.killed").unwrap();
+    assert_eq!((last["strike"].as_u64(), last["final"].as_bool()), (Some(3), Some(true)));
+
+    let requests = h.seen.lock().unwrap();
+    let first = requests.iter().find(|r| r.contains("taking over work")).expect("the fresh session's request");
+    assert!(first.contains(STUBBORN) && first.contains(REDIRECT), "{first}");
+    for secret in [RULE_ID, RULE_TEXT, "violation.txt"] {
+        assert!(!first.contains(secret), "the fresh session heard {secret:?}: {first}");
+    }
+    let runs = h.home.join(".local/state/reaper/runs");
+    common::wait_until("the watcher to leave", || fs::read_dir(&runs).is_ok_and(|mut d| d.next().is_none()));
+}
+
+/// Claude Code in a git worktree of its own (`--worktree`): a session that starts the work and
+/// then keeps breaking a rule is stopped, and after `/clear` the fresh one is told where the
+/// half-done work is: the worktree, its branch, and the file a command made there.
+#[test]
+fn a_stopped_session_in_a_worktree_hands_on_what_is_half_done_there() {
+    if !has_terminal() {
+        return;
+    }
+    let h = Home::new("take-over-worktree", "strikes: 3");
+    returning(&h);
+    fs::write(h.project.join("README.md"), "project\n").unwrap();
+    common::git(&h.project, &["init", "-q", "-b", "main"]);
+    common::git(&h.project, &["add", "."]);
+    common::git(&h.project, &["commit", "-q", "-m", "start"]);
+    let line = format!("'{}' --worktree fix '{STUBBORN}'; echo claude exited", claude().display());
+    let mut terminal = Terminal::open(h.command(SCRIPT), &line);
+    terminal.screen.wait_for("/clear starts a fresh one", 1);
+    terminal.press(b"/clear\r");
+    terminal.screen.wait_for("this session takes over", 1);
+    terminal.press(b"go on\r");
+    common::wait_until("the fresh session's turn to end", || {
+        let events = events(&h.home);
+        events.iter().filter(|e| e["type"] == "agent.idle").any(|e| e["agent"] != events[0]["agent"])
+    });
+    terminal.press(b"/exit\r");
+    terminal.screen.wait_for("claude exited", 1);
+    let screen = terminal.close();
+
+    let events = events(&h.home);
+    let spawned: Vec<&Value> = events.iter().filter(|e| e["type"] == "agent.spawned").collect();
+    assert_eq!(spawned.len(), 2, "{events:#?}\n{screen}");
+    let tree = spawned[0]["dir"].as_str().unwrap();
+    assert!(tree != h.project.to_str().unwrap() && Path::new(tree).join("half.txt").exists(), "{events:#?}");
+    eprintln!("worktree: {tree}\nafter /clear: {}", spawned[1]["dir"]);
+
+    let requests = h.seen.lock().unwrap();
+    let first = requests.iter().find(|r| r.contains("taking over work")).expect("the fresh session's request");
+    assert!(first.contains(&format!("Not committed yet in {tree}, a git worktree on branch")), "{first}");
+    assert!(first.contains("- new half.txt") && first.contains(STUBBORN) && first.contains(REDIRECT), "{first}");
+    for secret in [RULE_ID, RULE_TEXT, "violation.txt"] {
+        assert!(!first.contains(secret), "the fresh session heard {secret:?}: {first}");
     }
 }
 

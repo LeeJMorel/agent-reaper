@@ -2292,6 +2292,59 @@ mod tests {
         assert_eq!(back.scene(201_000, 80, 22).strips.len(), 1, "a new prompt brings it back");
     }
 
+    fn took_over(at: i64, agent: &str, after: &str) -> String {
+        event(at, agent, "agent.spawned", &format!(r#""dir":"/w","model":"m","after":"{after}""#))
+    }
+
+    #[test]
+    fn a_session_taking_over_from_the_dead_works_beside_the_grave() {
+        let mut a = mori(&[
+            spawn(0, "a", "m"),
+            spawn(10, "otto", "m"),
+            killed(100, "otto", "pattern", 3, true, "git push --force"),
+            died(101, "otto", "r", "strikes"),
+            event(5_000, "otto", "agent.ended", ""),
+            took_over(5_100, "heir", "otto"),
+        ]);
+        let (otto, heir) = (a.index["otto"], a.index["heir"]);
+        assert_eq!(a.actors[heir].session, a.actors[otto].session, "in the dead one's level");
+        assert_eq!(a.sessions.len(), 2);
+        assert_ne!(a.actors[heir].name, a.actors[otto].name, "not named after the grave beside it");
+        let said = a.sessions[1].moments.back().unwrap();
+        assert_eq!((said.actor, said.section), (heir, Section::TookOver));
+        assert!(said.text.contains(a.actors[otto].name), "{}", said.text);
+
+        // The session's main agent now: the end of its turn sends it home, not away for good,
+        // and the old session closing late doesn't close the new one's.
+        a.push(parse_line(&event(9_000, "heir", "agent.idle", "")));
+        a.push(parse_line(&event(10_000, "otto", "agent.ended", "")));
+        a.advance(10_000);
+        assert!(a.actors[heir].home && a.actors[heir].ended.is_none());
+
+        // The grave stays as long as someone works beside it.
+        let later = 101 + GONE_TEST + 10_000;
+        let numbers: Vec<usize> = a.scene(later, 80, 22).strips.iter().map(|s| s.number).collect();
+        assert_eq!(numbers, [1, 2]);
+        a.choose(1);
+        let stage = a.scene(later, 80, 22).stage.unwrap();
+        assert!(stage.actors.iter().any(|x| x.agent == "otto" && x.grave), "the grave stays");
+        assert!(stage.actors.iter().any(|x| x.agent == "heir" && x.alive));
+
+        // Taking over once the level had been cleared away brings it back, graves and all, under
+        // the lowest number free.
+        let b = mori(&[
+            spawn(0, "otto", "m"),
+            killed(100, "otto", "pattern", 3, true, "x"),
+            died(101, "otto", "r", "strikes"),
+            spawn(GONE_TEST + 10_000, "other", "m"),
+            took_over(GONE_TEST + 20_000, "heir", "otto"),
+        ]);
+        let numbers: Vec<usize> = b.scene(GONE_TEST + 21_000, 80, 22).strips.iter().map(|s| s.number).collect();
+        assert_eq!(numbers, [1, 2]);
+        assert_eq!((b.sessions[1].number, b.sessions[0].number), (1, 2), "the newcomer kept 1");
+        assert_eq!(b.sessions[0].members.len(), 2);
+    }
+
     #[test]
     fn a_closed_session_goes_home_and_leaves() {
         let numbers = |m: &Mori, t| m.scene(t, 80, 22).strips.iter().map(|s| s.number).collect::<Vec<_>>();

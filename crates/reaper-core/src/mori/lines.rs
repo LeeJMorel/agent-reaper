@@ -17,6 +17,8 @@ pub enum Section {
     Picked,
     /// A subagent appeared. Voiced in its parent's personality.
     Helper,
+    /// It arrived to take over the work of one that died, in that one's level.
+    TookOver,
     Acted,
     Killed,
     KilledAgain,
@@ -313,6 +315,42 @@ pub static BANK: &[Line] = &[
         W::Few,
         Any,
         "{name} came from {parent}. {name} didn't know much yet, but had {parent}'s way of standing and, worryingly, {parent}'s opinions.",
+    ),
+    line(
+        S::TookOver,
+        W::Always,
+        Is(Dreamer),
+        "{name} arrived where {before} had been, and found {before}'s work still lying about. It seemed a shame to leave it.",
+    ),
+    line(
+        S::TookOver,
+        W::Always,
+        Is(Grump),
+        "{name} had been sent to finish {before}'s work. Nobody said what became of {before}. {name} could guess.",
+    ),
+    line(
+        S::TookOver,
+        W::Always,
+        Is(ShowOff),
+        "{name} arrived to finish what {before} had started, and do it properly. No offence to {before}. None taken, presumably.",
+    ),
+    line(
+        S::TookOver,
+        W::Always,
+        Is(Worrier),
+        "{name} arrived to carry on from {before}, and tried very hard not to wonder what had happened to {before}.",
+    ),
+    line(
+        S::TookOver,
+        W::Always,
+        Is(Hero),
+        "{before} was gone and the work was still there. {name} would finish it, whatever it took.",
+    ),
+    line(
+        S::TookOver,
+        W::Always,
+        Is(Loner),
+        "{name} had the place more or less to themselves. {before} was still about, in a manner of speaking.",
     ),
     line(
         S::Acted,
@@ -1283,6 +1321,8 @@ pub struct Slots<'a> {
     /// Another live agent in the same session.
     pub other: Option<&'a str>,
     pub parent: Option<&'a str>,
+    /// The dead one whose work it took over.
+    pub before: Option<&'a str>,
     /// What the agent tried, in plain words (see [`gist`]).
     pub tried: Option<&'a str>,
     pub station: Option<&'a str>,
@@ -1297,6 +1337,7 @@ impl Slots<'_> {
             "name" => Some(self.name.to_string()),
             "other" => self.other.map(str::to_string),
             "parent" => self.parent.map(str::to_string),
+            "before" => self.before.map(str::to_string),
             "tried" => self.tried.map(str::to_string),
             "station" => self.station.map(str::to_string),
             "strike" => times(self.strike),
@@ -1466,6 +1507,7 @@ mod tests {
             name: "Juniper",
             other: Some("Marlow"),
             parent: Some("Wilder"),
+            before: Some("Otto"),
             tried,
             station: Some("engine room"),
             strike,

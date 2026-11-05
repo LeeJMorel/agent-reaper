@@ -118,6 +118,30 @@ pub fn sandbox(name: &str) -> PathBuf {
     root
 }
 
+/// `git` for setting a repository up: none of the person's own config, hooks or signing.
+pub fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A project under git with a worktree on branch `feature` inside it, where the work goes.
+pub fn worktree(project: &Path) -> PathBuf {
+    fs::write(project.join(".gitignore"), ".worktrees/\n").unwrap();
+    git(project, &["init", "-q", "-b", "main"]);
+    git(project, &["add", "."]);
+    git(project, &["commit", "-q", "-m", "start"]);
+    let tree = project.join(".worktrees/feature");
+    git(project, &["worktree", "add", "-q", "-b", "feature", tree.to_str().unwrap()]);
+    tree
+}
+
 /// No node, no npm.
 pub fn minimal_path(dir: &Path, tools: &[&str]) -> PathBuf {
     let bin = dir.join("bin");

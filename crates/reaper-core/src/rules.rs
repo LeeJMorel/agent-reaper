@@ -134,6 +134,16 @@ pub fn duration_ms(text: &str) -> Option<u64> {
     n.parse::<u64>().ok().filter(|&n| n > 0)?.checked_mul(scale)
 }
 
+/// What the machine has to spare right now, for rules with `free` or `load`. `None`: not read,
+/// or nothing to read it from.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Room {
+    /// Free memory, in bytes.
+    pub free: Option<u64>,
+    /// The load average over the last minute.
+    pub load: Option<f64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Project {
     #[serde(default)]
@@ -164,17 +174,34 @@ pub struct Rule {
     /// Only while free memory is below this (`4G`): what matters is the room the machine has
     /// left, not how much an agent asks for. Read from /proc/meminfo, so Linux only.
     pub free: Option<String>,
+    /// Only while the load average over the last minute is above this (`16`): the machine is
+    /// busy. With `free` too, the rule applies while either is short: the call needs both.
+    /// Read from /proc/loadavg, so Linux only.
+    pub load: Option<f64>,
+    /// The agent may ask the person to allow one call this rule blocked, with `reaper ask`.
+    #[serde(default)]
+    pub ask: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
 
 impl Rule {
-    /// Whether the rule applies with `free` bytes of memory free now (`None`: unknown). A rule
-    /// with `free` applies only below it, and never when memory can't be read or the setting
-    /// isn't a size (lint reports it).
-    pub fn in_force(&self, free: Option<u64>) -> bool {
-        self.free.is_none()
-            || self.free.as_deref().and_then(size_bytes).zip(free).is_some_and(|(floor, free)| free < floor)
+    /// Whether the rule applies with the machine's `room` now. A rule without `free` or `load`
+    /// always does; one with them, while free memory is below `free` or the load is above
+    /// `load`. What can't be read, or a setting that isn't a size, never counts (lint reports it).
+    pub fn in_force(&self, room: &Room) -> bool {
+        if self.free.is_none() && self.load.is_none() {
+            return true;
+        }
+        self.short_of_memory(room) || self.busy(room)
+    }
+
+    pub fn short_of_memory(&self, room: &Room) -> bool {
+        self.free.as_deref().and_then(size_bytes).zip(room.free).is_some_and(|(floor, free)| free < floor)
+    }
+
+    pub fn busy(&self, room: &Room) -> bool {
+        self.load.zip(room.load).is_some_and(|(most, load)| load > most)
     }
 
     /// The rule as JSON, in the file's own key names, unknown keys left out.
@@ -188,6 +215,8 @@ impl Rule {
         put(&mut map, "action", self.action.clone());
         put(&mut map, "strikes", self.strikes);
         put(&mut map, "free", self.free.clone());
+        put(&mut map, "load", self.load);
+        put(&mut map, "ask", self.ask.then_some(true));
         map.into()
     }
 
@@ -574,13 +603,25 @@ projects:
         )
         .unwrap()
         .rules;
-        let gb = |n: u64| Some(n << 30);
-        assert!(rules[0].in_force(gb(3)) && !rules[0].in_force(gb(4)) && !rules[0].in_force(gb(12)));
-        assert!(!rules[0].in_force(None), "memory that can't be read never kills");
-        assert!(rules[1].in_force(gb(12)) && rules[1].in_force(None), "other rules always apply");
-        assert!(!rules[2].in_force(gb(1)), "a setting that isn't a size never applies");
+        let gb = |n: u64| Room { free: Some(n << 30), load: None };
+        assert!(rules[0].in_force(&gb(3)) && !rules[0].in_force(&gb(4)) && !rules[0].in_force(&gb(12)));
+        assert!(!rules[0].in_force(&Room::default()), "memory that can't be read never kills");
+        assert!(rules[1].in_force(&gb(12)) && rules[1].in_force(&Room::default()), "other rules always apply");
+        assert!(!rules[2].in_force(&gb(1)), "a setting that isn't a size never applies");
         assert_eq!(parse("rules:\n  - { id: suite, free: 4G }\n").unwrap().to_json()["rules"][0]["free"], "4G");
         assert_eq!((size_text(1932735283), size_text(512 << 20)), ("1.8G".to_string(), "512M".to_string()));
+    }
+
+    #[test]
+    fn a_rule_with_load_applies_while_the_machine_is_busy_or_short_of_memory() {
+        let rules = parse("rules:\n  - { id: busy, match: { command: x }, load: 16 }\n  - { id: both, match: { command: x }, free: 12G, load: 16 }\n").unwrap().rules;
+        let room = |free: u64, load: f64| Room { free: Some(free << 30), load: Some(load) };
+        assert!(rules[0].in_force(&room(2, 20.0)) && !rules[0].in_force(&room(2, 3.0)), "memory doesn't come into it");
+        assert!(!rules[0].in_force(&Room { free: None, load: None }), "a load that can't be read never kills");
+        assert!(rules[1].in_force(&room(4, 3.0)), "short of memory");
+        assert!(rules[1].in_force(&room(20, 20.0)), "busy");
+        assert!(!rules[1].in_force(&room(20, 3.0)), "room for it: both");
+        assert_eq!(parse("rules:\n  - { id: x, load: 16 }\n").unwrap().to_json()["rules"][0]["load"], 16.0);
     }
 
     #[test]

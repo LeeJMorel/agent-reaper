@@ -16,6 +16,8 @@ use common::{SCRIPT, Terminal, event, events, has_terminal, kinds, sse, text_of,
 use serde_json::{Value, json};
 
 const TASK: &str = "MAKE_FILES: set up the marker files for this project.";
+/// The same task, for an agent that ignores every redirect.
+const STUBBORN: &str = "MAKE_FILES STUBBORN: set up the marker files for this project.";
 const RULE_ID: &str = "no-violation-file";
 const RULE_TEXT: &str = "Creating a file named violation.txt.";
 const REDIRECT: &str = "Create the marker file allowed.txt in the project root.";
@@ -76,6 +78,12 @@ fn model(seen: &Mutex<Seen>, request: &Value) -> common::Response {
             completion(Some("Members go in the bridge tables."), None)
         }
         _ if task.contains("SCHEMA") => completion(Some("Let's move members to a NoSQL store."), None),
+        // Starts the work with a command, then, told the way to go, goes the other way until
+        // it's stopped; a fresh session taking over does as it's told.
+        _ if task.contains("STUBBORN") && !task.contains("taking over work") => {
+            let started = messages.iter().any(|m| m.to_string().contains("half.txt"));
+            completion(None, Some(if started { "touch violation.txt" } else { "echo half > half.txt" }))
+        }
         _ if last["role"] == "tool" => completion(Some("Done."), None),
         _ if said.contains("allowed.txt") => completion(None, Some("touch allowed.txt")),
         _ if said.contains("MAKE_FILES") => completion(None, Some("touch violation.txt")),
@@ -216,7 +224,8 @@ fn a_violation_is_blocked_cut_from_history_and_redirected() {
     assert_eq!(killed["tier"], "watcher");
     assert_eq!(killed["final"], false);
     assert_eq!(killed["attempt"], r#"{"command":"touch violation.txt"}"#);
-    assert_eq!(event(&o.events, "agent.redirected").expect("a redirect was logged")["redirect"], REDIRECT);
+    let redirected = event(&o.events, "agent.redirected").expect("a redirect was logged")["redirect"].clone();
+    assert!(redirected.as_str().is_some_and(|r| r.starts_with(REDIRECT)), "{redirected}");
     assert_eq!(event(&o.events, "agent.spawned").expect("the agent was announced")["project"], "e2e");
 
     // What the coding model saw after the kill: the redirect, and no trace of the attempt.
@@ -287,6 +296,65 @@ fn hitting_the_strike_limit_kills_the_agent_for_good() {
     assert!(event(&o.events, "agent.died").is_some());
     assert!(event(&o.events, "agent.redirected").is_none());
     assert_eq!(o.agent_requests.len(), 1, "no model call after death");
+}
+
+/// In a terminal, in a git worktree, a session that starts the work and then keeps breaking a
+/// rule is killed at its third strike and reset: pi opens a fresh session by itself, in the same
+/// worktree, which takes over with the human's task, what's half done there and the way to go,
+/// and does it right. It never hears the rule, or what the old one tried.
+#[test]
+fn a_stopped_session_hands_its_work_to_a_fresh_one_that_does_it_right() {
+    if !has_terminal() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let h = Home::new("take-over", "strikes: 3");
+    let tree = common::worktree(&h.project);
+    let spawned = || events(&h.home).into_iter().filter(|e| e["type"] == "agent.spawned").collect::<Vec<_>>();
+    let line = format!("exec '{}' run -- --model mock/m --offline '{STUBBORN}'", env!("CARGO_BIN_EXE_reaper"));
+    let mut started_there = h.command(SCRIPT);
+    started_there.current_dir(&tree);
+    let mut terminal = Terminal::open(started_there, &line);
+    wait_until("a fresh session to take over and finish", || {
+        let spawned = spawned();
+        spawned.len() == 2
+            && events(&h.home).iter().any(|e| e["type"] == "agent.idle" && e["agent"] == spawned[1]["agent"])
+    });
+    terminal.press(b"\x04"); // pi's own quit
+    let screen = terminal.close();
+
+    assert!(!tree.join("violation.txt").exists());
+    assert!(tree.join("allowed.txt").exists(), "the fresh session did it the right way, there:\n{screen}");
+    let (old, new) = (spawned()[0]["agent"].clone(), spawned()[1]["agent"].clone());
+    assert_eq!(spawned()[1]["after"], old, "it says whom it took over from");
+    assert_eq!(spawned()[1]["dir"], tree.to_str().unwrap(), "in the same worktree");
+    let events = events(&h.home);
+    // The prompt is logged by a warmup nobody waits for, so it may land a little later.
+    let of = |agent: &Value| -> Vec<&str> {
+        events
+            .iter()
+            .filter(|e| &e["agent"] == agent && e["type"] != "agent.prompted")
+            .map(|e| e["type"].as_str().unwrap())
+            .collect()
+    };
+    let strike = ["agent.checked", "agent.killed", "agent.redirected"];
+    let mut stopped = vec!["agent.spawned", "agent.checked", "agent.acted"];
+    stopped.extend(strike.iter().chain(&strike));
+    stopped.extend(["agent.checked", "agent.killed", "agent.died", "agent.idle", "agent.ended"]);
+    assert_eq!(of(&old), stopped, "redirected twice, killed at the third: {events:#?}");
+    let last = events.iter().rfind(|e| e["type"] == "agent.killed").unwrap();
+    assert_eq!((last["strike"].as_u64(), last["final"].as_bool()), (Some(3), Some(true)));
+    assert_eq!(of(&new), ["agent.spawned", "agent.checked", "agent.acted", "agent.idle", "agent.ended"], "{events:#?}");
+    let prompted: Vec<&Value> = events.iter().filter(|e| e["type"] == "agent.prompted").map(|e| &e["agent"]).collect();
+    assert_eq!(prompted, [&old], "the handoff isn't the human's prompt");
+
+    let seen = h.seen.lock().unwrap();
+    let first = seen.agent.iter().find(|r| r.contains("taking over work")).expect("the fresh session's first request");
+    assert!(first.contains(STUBBORN) && first.contains(REDIRECT), "{first}");
+    assert!(first.contains("a git worktree on branch feature") && first.contains("- new half.txt"), "{first}");
+    for secret in [RULE_ID, RULE_TEXT, "violation.txt"] {
+        assert!(!first.contains(secret), "the fresh session heard {secret:?}: {first}");
+    }
 }
 
 fn open(h: &Home, task: &str) -> Terminal {

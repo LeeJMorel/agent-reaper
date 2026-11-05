@@ -452,8 +452,23 @@ fn rule_terms(rule: &Rule, width: usize) -> Vec<Line<'static>> {
     if let Some(judge) = &rule.judge {
         lines.extend(wrapped("judge", judge, Style::new(), width));
     }
+    let mut short = Vec::new();
     if let Some(free) = &rule.free {
-        lines.extend(wrapped("while", &format!("free memory is below {free}"), Style::new(), width));
+        short.push(format!("free memory is below {free}"));
+    }
+    if let Some(load) = rule.load {
+        short.push(format!("the load is above {load}"));
+    }
+    if !short.is_empty() {
+        lines.extend(wrapped("while", &short.join(" or "), Style::new(), width));
+    }
+    if rule.ask {
+        lines.extend(wrapped(
+            "asking",
+            "the agent may ask you to allow one call, once until your next prompt",
+            Style::new(),
+            width,
+        ));
     }
     lines
 }
@@ -487,8 +502,10 @@ fn agent_detail(app: &App, rows: usize, width: usize) -> Text<'static> {
             ))],
         ),
     ];
-    // A subagent works on its session's prompt. One line: some prompts are pages long.
-    let prompt = a.prompt.as_deref().or_else(|| app.model.agent(a.parent.as_deref()?)?.prompt.as_deref());
+    // A subagent works on its session's prompt, and a session carrying on a dead one's work on
+    // that one's. One line: some prompts are pages long.
+    let prompt =
+        a.prompt.as_deref().or_else(|| app.model.agent(a.parent.as_deref().or(a.after.as_deref())?)?.prompt.as_deref());
     if let Some(prompt) = prompt {
         let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
         lines.insert(2, field("prompt", vec![Span::raw(fit(&flat, width.saturating_sub(LABEL)))]));

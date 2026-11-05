@@ -28,6 +28,8 @@ pub struct Agent {
     pub id: String,
     pub host: String,
     pub parent: Option<String>,
+    /// The session it carries on from: one that died, whose work reaper handed to it.
+    pub after: Option<String>,
     pub project: Option<String>,
     pub dir: Option<String>,
     pub model: Option<String>,
@@ -133,8 +135,12 @@ impl Model {
         agent.recent.push_back(event.clone());
 
         match &event.kind {
-            Kind::Spawned { parent, project, dir, model, label } => {
+            Kind::Spawned { parent, project, dir, model, label, after } => {
                 agent.parent.clone_from(parent);
+                // Announced again on resuming, a host may not know it any more.
+                if after.is_some() {
+                    agent.after.clone_from(after);
+                }
                 agent.project.clone_from(project);
                 agent.dir = Some(dir.clone());
                 agent.model.clone_from(model);
@@ -217,6 +223,7 @@ impl Model {
                 id: event.agent.clone(),
                 host: event.host.clone(),
                 parent: None,
+                after: None,
                 project: None,
                 dir: None,
                 model: None,

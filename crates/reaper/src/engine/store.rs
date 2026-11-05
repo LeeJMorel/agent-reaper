@@ -38,6 +38,26 @@ pub struct Session {
     pub last_call: Option<String>,
     #[serde(default)]
     pub repeats: u32,
+    /// The rule and call reaper blocked last, when the rule lets the agent ask about it.
+    #[serde(default)]
+    pub blocked: Option<(String, String)>,
+    /// What the agent asked the person for with `reaper ask`: that rule, that call, and why.
+    #[serde(default)]
+    pub asking: Option<(String, String, String)>,
+    /// What the human asked it for, oldest first: the first and the latest few. One carrying
+    /// on a dead session's work starts with that session's.
+    #[serde(default)]
+    pub prompts: Vec<String>,
+    /// Files it edited or wrote, likewise.
+    #[serde(default)]
+    pub changed: BTreeSet<String>,
+    /// What it was told to carry on with, until the human asks it for anything: it took over
+    /// from a session reaper stopped.
+    #[serde(default)]
+    pub took_over: Option<String>,
+    /// Stopped, its work waits here for a fresh session to take it over.
+    #[serde(default)]
+    pub handoff: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -48,6 +68,9 @@ pub struct Team {
     /// The rule whose breaking stopped everyone, until the human's next prompt.
     #[serde(default)]
     pub stopped: Option<String>,
+    /// Rules the person was asked about since their last prompt: one ask each.
+    #[serde(default)]
+    pub asked: BTreeSet<String>,
 }
 
 pub struct Store {
@@ -125,6 +148,12 @@ impl Store {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
+    }
+
+    /// Where a session stopped by reaper leaves its id for the one that follows it in the same
+    /// agent process `pid`: Claude Code's `/clear` ends one session and starts the next.
+    pub fn handoff_note(&self, pid: u32) -> PathBuf {
+        self.state.join("runs").join(format!("{pid}.handoff"))
     }
 
     /// Lists a session that can be reaped, as idle since `now`. Returns its file and where its

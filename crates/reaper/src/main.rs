@@ -32,6 +32,7 @@ usage:
   reaper rules [--json] [FILE]   show the rules (--json: for scripts)
   reaper rules add [--check]     add the rule snippet on stdin, once its examples pass
                                  (the reaper-rule skill; in the console, press n on the rules tab)
+  reaper rules remove ID [--check]  take one rule out of the rules file, the rest as it was
 
 used by agents, not by hand:
   reaper engine                  one JSON request on stdin (the pi extension, and reaper itself)
@@ -162,8 +163,10 @@ fn read_rules(args: &[String]) -> Result<(PathBuf, String), String> {
 }
 
 fn show_rules(args: &[String]) -> Result<ExitCode, String> {
-    if args.first().map(String::as_str) == Some("add") {
-        return add_rule(&args[1..]);
+    match args.first().map(String::as_str) {
+        Some("add") => return add_rule(&args[1..]),
+        Some("remove") => return remove_rule(&args[1..]),
+        _ => {}
     }
     let (path, text) = read_rules(args)?;
     let config = parse(&text).map_err(|e| format!("{}{}: {}", path.display(), where_(&e), e.message))?;
@@ -205,6 +208,24 @@ fn add_rule(args: &[String]) -> Result<ExitCode, String> {
     }
     draft::save(&path, new).map_err(|e| format!("can't write {}: {e}", path.display()))?;
     println!("added {} to {}", draft.rule.id, tilde(&path));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `reaper rules remove ID [--check] [FILE]`: one rule out of the rules file, everything else in
+/// it as it was. With `add`, how a rule an agent wrote gets changed.
+fn remove_rule(args: &[String]) -> Result<ExitCode, String> {
+    let usage = "usage: reaper rules remove ID [--check] [FILE]";
+    let at = args.iter().position(|a| !a.starts_with("--")).ok_or(usage)?;
+    let (id, mut rest) = (args[at].clone(), args.to_vec());
+    rest.remove(at);
+    let (path, text) = read_rules(&rest)?;
+    let new = draft::remove(&text, &id)?;
+    if args.iter().any(|a| a == "--check") {
+        println!("ok: {id} can be removed from {}", tilde(&path));
+        return Ok(ExitCode::SUCCESS);
+    }
+    draft::save(&path, &new).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    println!("removed {id} from {}", tilde(&path));
     Ok(ExitCode::SUCCESS)
 }
 

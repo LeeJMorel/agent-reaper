@@ -349,6 +349,8 @@ struct Character {
     /// Its place among the session's members, which spreads out characters sharing a spot.
     k: usize,
     parent: Option<usize>,
+    /// The one whose work it took over: it died, and reaper started this one in its place.
+    after: Option<usize>,
     first_at: i64,
     last_at: i64,
     /// Its name shows for a while after this: arriving, being stopped, dying.
@@ -628,7 +630,7 @@ impl Mori {
         for (i, id) in cast.iter().enumerate() {
             let parent = (i > 0).then(|| cast[0].clone());
             let model = Some("claude-sonnet".to_string());
-            let spawned = Kind::Spawned { parent, project: None, dir: "/".into(), model, label: None };
+            let spawned = Kind::Spawned { parent, project: None, dir: "/".into(), model, label: None, after: None };
             events.push(event(now + 500 * i as i64, id, spawned));
             let at = now + 2000 + 300 * i as i64;
             let attempt = r#"{"command":"do it anyway"}"#.to_string();
@@ -772,7 +774,11 @@ impl Mori {
             }
             return;
         }
-        let back = self.index.get(&event.agent).is_some_and(|&a| self.gone(self.actors[a].session, event.at));
+        let back = match self.index.get(&event.agent) {
+            Some(&a) => self.gone(self.actors[a].session, event.at),
+            // Taking over from the dead brings their level back, graves and all.
+            None => self.predecessor(event).is_some_and(|d| self.gone(self.actors[d].session, event.at)),
+        };
         let a = self.character(event);
         let c = &mut self.actors[a];
         c.seq += 1;
@@ -798,7 +804,7 @@ impl Mori {
                     self.wake(a, event.at);
                 }
                 self.act(a, tool, event.at);
-                if hands_back(tool) && self.sessions[s].root != self.actors[a].id {
+                if hands_back(tool) && !self.main(a) {
                     self.end(a, event.at);
                 }
             }
@@ -810,7 +816,7 @@ impl Mori {
             Kind::Reaped { .. } => self.sleep(a, event.at),
             // A subagent's turn ends when its work is done. One first seen finishing never used a
             // tool, in logs from before those were announced: it's done too.
-            Kind::Idle if self.sessions[s].root != self.actors[a].id || self.actors[a].seq == 1 => {
+            Kind::Idle if !self.main(a) || self.actors[a].seq == 1 => {
                 self.end(a, event.at);
             }
             Kind::Idle => self.home(a, event.at),
@@ -828,6 +834,20 @@ impl Mori {
         self.model.agent(&self.actors[a].id).map(|agent| agent.status)
     }
 
+    /// The agent the human started, or one reaper started to take over from it: not a helper.
+    fn main(&self, a: usize) -> bool {
+        let c = &self.actors[a];
+        self.sessions[c.session].root == c.id || c.after.is_some()
+    }
+
+    /// The dead agent a newcomer takes over from, if it's one memento mori knows.
+    fn predecessor(&self, event: &Event) -> Option<usize> {
+        match &event.kind {
+            Kind::Spawned { parent: None, after: Some(after), .. } => self.index.get(after).copied(),
+            _ => None,
+        }
+    }
+
     /// The character for an event's agent, cast on first sight.
     fn character(&mut self, event: &Event) -> usize {
         if let Some(&a) = self.index.get(&event.agent) {
@@ -838,10 +858,13 @@ impl Mori {
             _ => (None, None),
         };
         let parent = parent_id.as_ref().and_then(|p| self.index.get(p).copied());
-        let root = match (parent, parent_id) {
-            (Some(p), _) => self.sessions[self.actors[p].session].root.clone(),
-            (None, Some(p)) => p,
-            (None, None) => event.agent.clone(),
+        let after = self.predecessor(event);
+        let root = match (parent, parent_id, after) {
+            (Some(p), _, _) => self.sessions[self.actors[p].session].root.clone(),
+            (None, Some(p), _) => p,
+            // It works where the one it took over from died.
+            (None, None, Some(d)) => self.sessions[self.actors[d].session].root.clone(),
+            (None, None, None) => event.agent.clone(),
         };
         let s = match self.roots.get(&root) {
             Some(&s) => s,
@@ -883,11 +906,11 @@ impl Mori {
                 .find(|hue| !used.contains(hue))
                 .unwrap_or(HUES[(first + used.len()) % HUES.len()]),
         };
-        // No two live characters share a name.
+        // No two live characters share a name, and nobody takes the name of a grave beside them.
         let start = (h % NAMES.len() as u64) as usize;
         let name = (0..NAMES.len())
             .map(|k| NAMES[(start + k) % NAMES.len()])
-            .find(|n| !self.actors.iter().any(|c| c.alive && c.ended.is_none() && c.name == *n))
+            .find(|n| !self.actors.iter().any(|c| (c.alive && c.ended.is_none() || c.session == s) && c.name == *n))
             .unwrap_or(NAMES[start]);
         let shape = match parent {
             Some(p) => self.actors[p].shape.half(),
@@ -918,6 +941,7 @@ impl Mori {
             session: s,
             k: self.sessions[s].members.len(),
             parent,
+            after,
             first_at: event.at,
             last_at: event.at,
             noticed_at: event.at,
@@ -995,6 +1019,8 @@ impl Mori {
         let s = self.actors[a].session;
         if self.sessions[s].rehearsal.is_some() {
             // Stand-ins don't introduce themselves: the line worth reading is the death's.
+        } else if self.actors[a].after.is_some() {
+            self.say(a, at, Section::TookOver, When::Always, 2, false);
         } else if parent.is_none() {
             self.say(a, at, Section::Spawned, When::Always, 2, false);
         } else if !self.sessions[s].moments.iter().any(|m| at - m.at < 3000) {
@@ -1332,7 +1358,8 @@ impl Mori {
             return;
         }
         let s = c.session;
-        let whole = self.sessions[s].root == c.id;
+        // Closing a main agent closes its session, unless someone has taken over from it.
+        let whole = self.main(a) && !self.sessions[s].members.iter().any(|&m| self.actors[m].after == Some(a));
         // A word on the way out, said while everyone is still here to be in it. A helper
         // finishing keeps quiet when the stage is busy; one never seen before has nothing to say.
         let busy = self.sessions[s].moments.iter().any(|m| at - m.at < 3000);
@@ -1465,6 +1492,7 @@ impl Mori {
             name: c.name,
             other,
             parent: parent.map(|p| p.name),
+            before: c.after.map(|d| self.actors[d].name),
             tried: kill.and_then(|k| k.tried.as_deref()),
             station: c.spot.station().map(Station::words),
             strike: kill.map_or(0, |k| k.strike),

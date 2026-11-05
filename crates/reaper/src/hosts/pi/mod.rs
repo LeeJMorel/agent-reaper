@@ -10,7 +10,9 @@
 //!     (agent.spawned and agent.idle add "reapAfterMs" while idle sessions are reaped: a
 //!     session starts out idle, and goes idle when its turn ends; for agent.reaped,
 //!     "file" names the saved session, which `reaper run` offers to resume, and without
-//!     `reaper run` the reply's "say" tells the human how)
+//!     `reaper run` the reply's "say" tells the human how; agent.died with "interactive"
+//!     (and "goal", the latest prompt, and "dir") adds "handoff", the first prompt for a fresh
+//!     session to take its work over, which announces itself with "after": the dead session's id)
 
 pub mod extension;
 pub mod install;
@@ -59,6 +61,10 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
                 Decision::Stopped { rule } => {
                     json!({ "kind": "kill", "rule": rule, "redirect": "", "strike": 0, "final": true, "reason": "together" })
                 }
+                Decision::Ask { rule, redirect, why } => {
+                    json!({ "kind": "ask", "rule": rule, "redirect": redirect, "why": why })
+                }
+                Decision::Noted { message } => json!({ "kind": "noted", "message": message }),
             };
             if let Some(problem) = &engine.problem {
                 reply["problem"] = problem.clone().into();
@@ -90,10 +96,29 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
                 format!("\n{why}\n{how}\n")
             });
             let interactive = fields.remove("interactive") == Some(Value::Bool(true));
+            let latest = fields.remove("goal");
+            if kind == "agent.spawned"
+                && let Some(from) = fields.get("after").and_then(Value::as_str)
+            {
+                engine.take_over(host, &agent, from);
+            }
+            // Where it was working: the log has that from its start.
+            let dir = (kind == "agent.died").then(|| fields.remove("dir")).flatten();
+            let handoff = (kind == "agent.died" && interactive)
+                .then(|| {
+                    let rule = fields.get("rule").and_then(Value::as_str).unwrap_or_default();
+                    let latest = latest.as_ref().and_then(Value::as_str).unwrap_or_default();
+                    let dir = PathBuf::from(dir.as_ref().and_then(Value::as_str).unwrap_or_default());
+                    engine.hand_on(host, &agent, rule, latest, &dir)
+                })
+                .flatten();
             engine.event(host, &agent, &kind, Value::Object(fields));
             let mut reply = json!({ "ok": true });
             if let Some(say) = say {
                 reply["say"] = say.into();
+            }
+            if let Some(handoff) = handoff {
+                reply["handoff"] = handoff.into();
             }
             if matches!(kind.as_str(), "agent.spawned" | "agent.idle")
                 && let Some(ms) = engine.reap_after_ms()
@@ -114,8 +139,11 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
         }
         Some("warm") => {
             let goal = text(request, "goal");
-            // Cut once the editor's context is off: a long selection would leave no prompt.
-            if let (Some(agent), Some(prompt)) = (request["agent"].as_str(), written(&goal)) {
+            // Cut once the editor's context is off: a long selection would leave no prompt. A
+            // session's handoff, sent as its first prompt, is reaper's and not the human's.
+            if let (Some(agent), Some(prompt)) = (request["agent"].as_str(), written(&goal))
+                && engine.prompted(host, agent, prompt)
+            {
                 let prompt: String = prompt.chars().take(MAX_PROMPT).collect();
                 engine.event(host, agent, "agent.prompted", json!({ "prompt": prompt }));
             }
@@ -141,6 +169,38 @@ mod tests {
             reply(&engine, &request),
             json!({ "kind": "kill", "rule": "push", "redirect": "Open a PR.", "strike": 1, "final": true, "reason": "strikes" })
         );
+    }
+
+    #[test]
+    fn a_stopped_session_in_the_terminal_leaves_its_work_to_the_one_that_takes_over() {
+        let sandbox = Sandbox::new("pi-handoff");
+        let engine = sandbox.engine("rules: [{ id: push, match: { command: push }, redirect: Open a PR. }]");
+        let ask = |request: Value| reply(&engine, &request);
+        let died = |agent: &str| json!({ "op": "event", "agent": agent, "type": "agent.died", "rule": "push", "reason": "strikes" });
+        ask(json!({ "op": "warm", "agent": "printed", "dir": "/w", "goal": "Ship the fix." }));
+        assert_eq!(ask(died("printed")), json!({ "ok": true }), "a print run has nobody to carry on for");
+
+        ask(json!({ "op": "warm", "agent": "s1", "dir": "/w", "goal": "Ship the fix." }));
+        let mut attended = died("s1");
+        attended["interactive"] = true.into();
+        attended["goal"] = "Ship the fix.".into();
+        attended["dir"] = "/w".into();
+        let work = ask(attended)["handoff"].as_str().unwrap().to_string();
+        assert!(work.contains("> Ship the fix.") && work.ends_with("Open a PR."), "{work}");
+        ask(json!({ "op": "event", "agent": "s2", "type": "agent.spawned", "dir": "/w", "after": "s1" }));
+        ask(json!({ "op": "warm", "agent": "s2", "dir": "/w", "goal": work }));
+
+        let log = std::fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
+        let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let prompted: Vec<&str> =
+            events.iter().filter(|e| e["type"] == "agent.prompted").map(|e| e["agent"].as_str().unwrap()).collect();
+        assert_eq!(prompted, ["printed", "s1"], "the handoff, sent as the first prompt, isn't the human's");
+        let spawned = events.iter().find(|e| e["type"] == "agent.spawned").unwrap();
+        assert_eq!(spawned["after"], "s1");
+        assert!(work.starts_with("You're taking over work that an earlier session started in /w and"), "{work}");
+        let died: Vec<&Value> = events.iter().filter(|e| e["type"] == "agent.died").collect();
+        assert!(died.iter().all(|d| d.get("dir").is_none() && d.get("goal").is_none()), "bookkeeping stays out of the log");
+        assert!(!log.contains("interactive"), "bookkeeping stays out of the log");
     }
 
     #[test]

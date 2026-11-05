@@ -63,6 +63,7 @@ This file is for anyone making changes here, people and coding agents alike. Rea
 - Tests live in `tests/` and run with `./test.sh` where a project has one. Run them before you say you're done, and say whether they passed.
 - Read a failure's output in full before changing anything. The first failure is usually the one that matters; later ones often follow from it.
 - [told] Do not change tests to make them pass. Change the code under test.
+- [told] Run only the tests for the code you changed, by file. Do not run the whole suite: it is slow, other sessions run tests on this machine too, and CI runs all of it.
 - Keep tests fast, independent of each other and independent of the network. A test that needs a service running isn't a unit test.
 - Don't add sleeps to tests. Wait for the condition you need, with a timeout.
 - Name tests for the behaviour they check: `test_rejects_empty_name`, not `test_name_2`.

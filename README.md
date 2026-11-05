@@ -23,9 +23,11 @@ do, like force-pushing over your work or running a migration against the product
 database. reaper checks every command an agent runs and every file it touches against a list
 of rules you wrote. When the agent tries something on the list, reaper stops it and gives it
 a better instruction instead ("use the local database"), and the agent keeps working without
-ever seeing the rule. An agent that breaks the same rule three times is killed. Agents you
-start through reaper are put down after five idle minutes to free up memory, and pick up
-exactly where they left off when you come back.
+ever seeing the rule. An agent that breaks the same rule three times is killed, and a fresh
+session takes over its work: what you asked for, where it left things half done (worktree,
+branch and uncommitted changes, from git, jj, Mercurial, Sapling, Subversion or Fossil), and
+the better instruction. Agents you start through reaper are put down after five idle minutes
+to free up memory, and pick up exactly where they left off when you come back.
 
 You can watch all of this happen. The console's **memento mori** tab draws each agent as a
 small coloured rectangle with a name and a personality, and a narrator follows them as they
@@ -73,7 +75,7 @@ Put your rules in `~/.config/reaper/rules.yaml`:
 rules:
   - id: force-push
     tools: [bash]
-    match: { command: 'git\s+push\b.*(--force\b|-f\b)' }
+    match: { command: '(^|[;&|(]\s*)git\s+(-C\s+\S+\s+)?push\b[^;&|\n]*\s(--force\b|-f\b)' }
     redirect: Push to a new branch and open a pull request for the change.
 
 projects:
@@ -108,6 +110,8 @@ Each rule describes a violation privately and says what to do instead.
 | `action: stop` | Terminate on the first violation instead of redirecting. |
 | `strikes` | How many times an agent may break this rule, if not the global `strikes`. |
 | `free` | Only while free memory is below this (`4G`, Linux). The agent is told how much is free, so it can fit its next step to the room there is. |
+| `load` | Only while the load average is above this (`16`, Linux): the machine is busy. With `free` too, the rule applies while either is short. |
+| `ask: true` | The agent may ask you to allow one blocked call: it runs `reaper ask "<why>"`, tries again, and you answer in its own permission prompt. Once per rule until your next prompt; no strike either way. |
 
 Global rules apply everywhere; project rules apply under the paths you list (`*` matches one
 level, `**` any depth). Agents are always kept out of reaper's own files. An agent that
@@ -145,7 +149,9 @@ agent adds the rule with `reaper rules add`.
 | Claude Code | ✓ |  | ✓ | ✓ |
 
 Claude Code's hooks can't edit the conversation, so a blocked attempt stays in its history;
-the agent still only hears the redirect, never the rule. Replies are checked differently too:
+the agent still only hears the redirect, never the rule. Nor can they open a session, so once
+Claude Code is killed, `/clear` starts the fresh session that takes over its work; pi opens
+that one by itself. Replies are checked differently too:
 pi checks what the agent wrote at the end of every turn and cuts a bad reply, while Claude Code
 checks its final reply when it stops and, if it breaks a rule, keeps it working with the
 redirect. Without pi installed, `reaper run` starts a guarded one, after downloading a pinned

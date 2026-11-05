@@ -69,8 +69,9 @@ folder level, `**` any depth).
   flags both.
 - Give the goal, not a number to obey. An agent told "-n 2 at most" runs the whole suite with
   `-n 2`.
-- When the trouble is the machine running out of memory, add `free: 4G`. The rule then only
-  applies while free memory is below that (Linux), and the agent is told how much is free.
+- When the trouble is the machine running out of room, add `free: 4G` (memory) or `load: 16`
+  (busy). The rule then only applies while free memory is below that or the load is above it
+  (Linux), and the agent is told which.
 
 ## Examples
 
@@ -86,6 +87,9 @@ folder level, `**` any depth).
 - `id`: short, lowercase, words joined by `-`, and not one already taken.
 - `action: stop` ends the agent's run at the first try instead of redirecting it. Use it only
   for what must never be attempted twice.
+- `ask: true` lets an agent ask the person to allow one blocked call, with its reason. Use it
+  where a real exception can come up (an agent's own unmerged migration), never for a line
+  that must hold every time.
 - If the request is unclear, pick the reading that prevents the harm while stopping the
   least, and say what you assumed in `note`.
 
@@ -93,5 +97,6 @@ folder level, `**` any depth).
 
 If you're an agent and your person asks for a rule while you work: show them the snippet,
 check it with `reaper rules add --check <<'EOF'` … `EOF`, and once they agree, add it with
-`reaper rules add <<'EOF'` … `EOF`. reaper puts it in its rules file for you. Its own files
-are off limits to agents.
+`reaper rules add <<'EOF'` … `EOF`. reaper puts it in its rules file for you. To change a rule,
+take it out with `reaper rules remove <id>` and add the new version. reaper's own files are off
+limits to agents.

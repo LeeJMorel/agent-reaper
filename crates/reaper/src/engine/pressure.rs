@@ -25,6 +25,11 @@ pub fn choose(live: &[Live], cap: Option<usize>, short_of_memory: bool) -> Vec<(
     chosen
 }
 
+/// The load average over the last minute, from /proc/loadavg: `None` where there's none to read.
+pub fn load() -> Option<f64> {
+    fs::read_to_string("/proc/loadavg").ok()?.split_whitespace().next()?.parse().ok()
+}
+
 /// Free memory in bytes, from /proc/meminfo: `None` where there's none to read.
 pub fn available() -> Option<u64> {
     let info = fs::read_to_string("/proc/meminfo").ok()?;

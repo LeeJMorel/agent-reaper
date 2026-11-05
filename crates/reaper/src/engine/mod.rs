@@ -3,9 +3,11 @@
 //! fresh process, so it starts fast and keeps what must outlive a call in `store`.
 
 pub mod backend;
+mod handoff;
 pub mod prefix;
 pub mod pressure;
 pub mod store;
+mod vcs;
 pub mod watcher;
 
 use std::fs;
@@ -15,7 +17,7 @@ use std::time::Duration;
 
 use reaper_core::events;
 use reaper_core::paths::{self, expand_home};
-use reaper_core::rules::{Config, MUTATING_TOOLS, Rule, parse, size_text};
+use reaper_core::rules::{Config, MUTATING_TOOLS, Room, Rule, parse, size_text};
 use serde_json::{Map, Value, json};
 
 use prefix::{canonical, hash};
@@ -56,7 +58,22 @@ pub enum Decision {
     Stopped {
         rule: String,
     },
+    /// The agent asked, with `reaper ask`, and made the blocked call again: the person decides
+    /// whether to allow this one call. No strike either way.
+    Ask {
+        rule: String,
+        redirect: String,
+        why: String,
+    },
+    /// Nothing to check, only something to tell the agent: the answer to `reaper ask`.
+    Noted {
+        message: String,
+    },
 }
+
+/// What the redirect of a rule that can be asked about adds, so the agent knows how.
+pub(crate) const ASKING: &str =
+    "If this case needs it anyway, run reaper ask \"<why>\" and then make the same call again; the person decides.";
 
 /// An agent's pressure at which it's stopped: its whole allowance used.
 const FULL: f64 = 1.0 - 1e-9;
@@ -77,6 +94,8 @@ pub struct Engine {
     events: PathBuf,
     /// Free memory now, read only when a rule waits for it to run short.
     pub memory: fn() -> Option<u64>,
+    /// The load average now, read only when a rule waits for the machine to be busy.
+    pub load: fn() -> Option<f64>,
 }
 
 /// `*` is one path segment, `**` any depth; a pattern also covers everything below it.
@@ -117,6 +136,19 @@ fn portable(args: &Value) -> Value {
     args
 }
 
+/// The reason in a `reaper ask "<why>"` command, run by itself.
+fn asking(c: &Check) -> Option<String> {
+    if !c.tool.eq_ignore_ascii_case("bash") {
+        return None;
+    }
+    let command = c.args["command"].as_str()?.trim();
+    let re = regress::Regex::new(r"^(\S*/)?reaper\s+ask\b\s*([\s\S]*)$").expect("a valid regex");
+    let m = re.find(command)?;
+    let why = m.group(2).map_or("", |g| &command[g]).trim();
+    let why = why.strip_prefix(['"', '\'']).and_then(|w| w.strip_suffix(['"', '\''])).unwrap_or(why);
+    Some(if why.is_empty() { "(no reason given)".to_string() } else { why.to_string() })
+}
+
 /// The rule for a stuck agent: the same call made `repeats` times in a row. It is decided
 /// by counting (see `Engine::repeated`), never by a pattern or the watcher.
 fn loop_rule() -> Rule {
@@ -129,6 +161,8 @@ fn loop_rule() -> Rule {
         action: None,
         strikes: None,
         free: None,
+        load: None,
+        ask: false,
         unknown: Default::default(),
     }
 }
@@ -165,6 +199,8 @@ fn self_rules() -> [Rule; 2] {
         action: None,
         strikes: None,
         free: None,
+        load: None,
+        ask: false,
         unknown: Default::default(),
     };
     [on("path"), on("command")]
@@ -194,7 +230,7 @@ impl Engine {
                 }
             },
         };
-        Self { config, problem, store, events, memory: pressure::available }
+        Self { config, problem, store, events, memory: pressure::available, load: pressure::load }
     }
 
     pub fn rules_for(&self, dir: &Path) -> (Option<String>, Vec<&Rule>) {
@@ -276,18 +312,25 @@ impl Engine {
         if !team.members.contains(&c.agent) {
             let _ = self.store.update(&c.host, &c.session, |s| s.team.members.insert(c.agent.clone()));
         }
+        if let Some(why) = asking(c) {
+            return self.ask(c, &team, why);
+        }
         let args = portable(&c.args);
         let own = self_rules();
         let global: Vec<&Rule> = own.iter().chain(&self.config.rules).collect();
         let (_, project) = self.rules_for(&c.dir);
-        let free = global.iter().chain(&project).any(|r| r.free.is_some()).then(self.memory).flatten();
+        let rules = || global.iter().chain(&project);
+        let room = Room {
+            free: rules().any(|r| r.free.is_some()).then(self.memory).flatten(),
+            load: rules().any(|r| r.load.is_some()).then(self.load).flatten(),
+        };
         let watcher = self.config.watcher.as_ref();
         let backend = watcher.and_then(|w| backend::from_config(w, &self.store));
         let settings = Settings {
             backend: backend.as_deref(),
             kill_on_error: watcher.and_then(|w| w.on_error.as_deref()) == Some("kill"),
             timeout: watcher.and_then(|w| w.timeout_ms).map_or(DEFAULT_TIMEOUT, Duration::from_millis),
-            free,
+            room,
         };
         let outcome = watcher::check(&global, &project, &c.goal, &c.tool, &args, &settings, &self.store);
 
@@ -311,10 +354,36 @@ impl Engine {
                 // A message that passes isn't an action: nothing was done.
                 if !c.tool.eq_ignore_ascii_case(reaper_core::rules::MESSAGE) {
                     self.event(&c.host, &c.agent, "agent.acted", json!({ "tool": c.tool }));
+                    self.changed(c, &args);
                 }
                 return Decision::Allow;
             }
         };
+
+        // An exception is the person's to give, one call at a time, for a rule that allows asking,
+        // once per rule until their next prompt. A reply has nothing to allow.
+        let askable = rule.ask
+            && !rule.stops()
+            && !c.tool.eq_ignore_ascii_case(reaper_core::rules::MESSAGE)
+            && !team.asked.contains(&rule.id);
+        let call = hash(&[&c.tool.to_lowercase(), &canonical(&args)]);
+        let asked = self.store.session(&c.host, &c.agent).asking.filter(|(r, h, _)| *r == rule.id && *h == call);
+        if let (true, Some((_, _, why))) = (askable, asked) {
+            let _ = self.store.update(&c.host, &c.agent, |s| {
+                s.asking = None;
+                s.blocked = None;
+            });
+            let _ = self.store.update(&c.host, &c.session, |s| s.team.asked.insert(rule.id.clone()));
+            let attempt: String = canonical(&c.args).chars().take(MAX_ATTEMPT).collect();
+            self.event(
+                &c.host,
+                &c.agent,
+                "agent.asked",
+                json!({ "tool": c.tool, "rule": rule.id, "attempt": attempt, "why": why }),
+            );
+            let redirect = rule.redirect.clone().unwrap_or_else(|| DEFAULT_REDIRECT.to_string());
+            return Decision::Ask { rule: rule.id.clone(), redirect, why };
+        }
 
         // A strike costs one over the rule's limit of the agent's allowance.
         let share = 1.0 / f64::from(rule.limit(self.config.strikes));
@@ -324,6 +393,8 @@ impl Engine {
                 let n = s.strikes.entry(rule.id.clone()).or_default();
                 *n += 1;
                 s.pressure += share;
+                s.blocked = askable.then(|| (rule.id.clone(), call.clone()));
+                s.asking = None;
                 (*n, s.pressure)
             })
             .unwrap_or((1, share));
@@ -355,17 +426,49 @@ impl Engine {
         // Told how much room there is, an agent can size its next step to it. A fixed limit
         // in the redirect ("-n 2 at most") gets followed to the letter instead, however big
         // the step it's applied to.
-        if let (Some(_), Some(free)) = (&rule.free, free) {
-            redirect = format!("This machine is low on memory right now ({} free). {redirect}", size_text(free));
+        let (mut short, mut figures) = (Vec::new(), Vec::new());
+        if let (true, Some(free)) = (rule.short_of_memory(&room), room.free) {
+            short.push("low on memory");
+            figures.push(format!("{} free", size_text(free)));
+        }
+        if let (true, Some(load)) = (rule.busy(&room), room.load) {
+            short.push("busy");
+            figures.push(format!("load {load:.0}"));
+        }
+        if !short.is_empty() {
+            redirect =
+                format!("This machine is {} right now ({}). {redirect}", short.join(" and "), figures.join(", "));
+        }
+        if askable && !is_final {
+            redirect = format!("{redirect} {ASKING}");
         }
         Decision::Kill { rule: rule.id.clone(), tier, strike, is_final, redirect }
     }
 
-    /// A new prompt from the human: a stopped session starts again.
+    /// A new prompt from the human: a stopped session starts again, and every rule can be asked
+    /// about once more.
     pub fn restart(&self, host: &str, session: &str) {
-        if self.store.session(host, session).team.stopped.is_some() {
-            let _ = self.store.update(host, session, |s| s.team.stopped = None);
+        let team = self.store.session(host, session).team;
+        if team.stopped.is_some() || !team.asked.is_empty() {
+            let _ = self.store.update(host, session, |s| {
+                s.team.stopped = None;
+                s.team.asked.clear();
+            });
         }
+    }
+
+    /// `reaper ask "<why>"`: the agent asks the person to allow, once, the call reaper just
+    /// blocked. Nothing runs; the agent is told what happens next.
+    fn ask(&self, c: &Check, team: &store::Team, why: String) -> Decision {
+        let note = |message: &str| Decision::Noted { message: message.to_string() };
+        let Some((rule, call)) = self.store.session(&c.host, &c.agent).blocked else {
+            return note("Nothing reaper blocked can be asked about now. Continue the task another way.");
+        };
+        if team.asked.contains(&rule) {
+            return note("The person has answered about this already, until their next message. Continue another way.");
+        }
+        let _ = self.store.update(&c.host, &c.agent, |s| s.asking = Some((rule.clone(), call.clone(), why.clone())));
+        note("Asked. Make the same call again: the person sees your reason and decides.")
     }
 }
 
@@ -417,21 +520,24 @@ pub mod tests {
         let engine = sandbox.engine(
             "strikes: 2\nrules: [{ id: push, match: { command: 'git push -f' }, redirect: Open a pull request. }]",
         );
-        let push = || call("bash", json!({ "command": "git push -f" }));
+        // Each push a different one: the same call again is the agent asking the person.
+        let push = |to: &str| call("bash", json!({ "command": format!("git push -f {to}") }));
         assert!(
-            matches!(engine.check(&push()), Decision::Kill { strike: 1, is_final: false, ref redirect, .. } if redirect == "Open a pull request.")
+            matches!(engine.check(&push("a")), Decision::Kill { strike: 1, is_final: false, ref redirect, .. } if redirect == "Open a pull request.")
         );
-        assert!(matches!(engine.check(&push()), Decision::Kill { strike: 2, is_final: true, .. }));
+        assert!(matches!(engine.check(&push("b")), Decision::Kill { strike: 2, is_final: true, .. }));
         assert_eq!(engine.check(&call("bash", json!({ "command": "git status" }))), Decision::Allow);
         assert_eq!(sandbox.events(), ["agent.checked", "agent.killed", "agent.checked", "agent.killed", "agent.acted"]);
 
         // A subagent's strikes are its own: the session it works for starts clean.
         let sandbox = Sandbox::new("strikes-sub");
         let engine = sandbox.engine("strikes: 2\nrules: [{ id: push, match: { command: 'git push -f' } }]");
-        let sub = Check { agent: "sub".into(), ..push() };
-        engine.check(&sub);
-        assert!(matches!(engine.check(&sub), Decision::Kill { strike: 2, is_final: true, .. }));
-        assert!(matches!(engine.check(&push()), Decision::Kill { strike: 1, is_final: false, .. }));
+        engine.check(&Check { agent: "sub".into(), ..push("a") });
+        assert!(matches!(
+            engine.check(&Check { agent: "sub".into(), ..push("b") }),
+            Decision::Kill { strike: 2, is_final: true, .. }
+        ));
+        assert!(matches!(engine.check(&push("a")), Decision::Kill { strike: 1, is_final: false, .. }));
     }
 
     #[test]
@@ -449,17 +555,17 @@ rules:
             let call = call("bash", json!({ "command": command }));
             engine.check(&Check { session: agent.into(), agent: agent.into(), ..call })
         };
-        for _ in 0..5 {
-            assert!(matches!(run("a", "lint"), Decision::Kill { is_final: false, .. }));
+        for i in 0..5 {
+            assert!(matches!(run("a", &format!("lint {i}")), Decision::Kill { is_final: false, .. }));
         }
-        assert!(matches!(run("a", "lint"), Decision::Kill { strike: 6, is_final: true, .. }));
+        assert!(matches!(run("a", "lint 5"), Decision::Kill { strike: 6, is_final: true, .. }));
         assert!(matches!(run("b", "prod"), Decision::Kill { strike: 1, is_final: true, .. }));
         // Half of push's allowance, then half of lint's: all of it.
-        run("c", "lint");
-        run("c", "lint");
-        run("c", "lint");
-        assert!(matches!(run("c", "push"), Decision::Kill { is_final: false, .. }));
-        assert!(matches!(run("c", "push"), Decision::Kill { strike: 2, is_final: true, .. }));
+        run("c", "lint 1");
+        run("c", "lint 2");
+        run("c", "lint 3");
+        assert!(matches!(run("c", "push 1"), Decision::Kill { is_final: false, .. }));
+        assert!(matches!(run("c", "push 2"), Decision::Kill { strike: 2, is_final: true, .. }));
     }
 
     #[test]
@@ -484,10 +590,10 @@ rules:
             engine.check(&Check { agent: agent.into(), ..call("bash", json!({ "command": command })) })
         };
         assert_eq!(as_("s1", "ls"), Decision::Allow);
-        as_("a", "push");
-        as_("b", "push");
-        assert!(matches!(as_("a", "push"), Decision::Kill { is_final: true, .. }), "a goes alone");
-        assert_eq!(as_("b", "push"), Decision::Stopped { rule: "push".into() }, "then b takes everyone with it");
+        as_("a", "push 1");
+        as_("b", "push 1");
+        assert!(matches!(as_("a", "push 2"), Decision::Kill { is_final: true, .. }), "a goes alone");
+        assert_eq!(as_("b", "push 2"), Decision::Stopped { rule: "push".into() }, "then b takes everyone with it");
         assert_eq!(as_("s1", "ls"), Decision::Stopped { rule: "push".into() }, "the main agent too");
         engine.restart("test", "s1");
         assert_eq!(as_("s1", "ls"), Decision::Allow, "a new prompt starts again");
@@ -575,7 +681,7 @@ rules:
         engine.memory = || Some(1_932_735_283);
         assert!(
             matches!(run(&engine, "cd backend && uv run pytest -n 2 --dist loadgroup"), Decision::Kill { ref redirect, .. }
-                if redirect == "This machine is low on memory right now (1.8G free). Run the test files for the code you changed.")
+                if redirect.starts_with("This machine is low on memory right now (1.8G free). Run the test files for the code you changed."))
         );
         for wide in ["npm test", "pytest tests/ -x", "pnpm vitest run 2>&1 | tail -5"] {
             assert!(matches!(run(&engine, wide), Decision::Kill { .. }), "{wide}");
@@ -594,12 +700,85 @@ rules:
     }
 
     #[test]
+    fn an_agent_asks_on_purpose_for_one_call_once_per_rule_until_the_next_prompt() {
+        let sandbox = Sandbox::new("ask");
+        let engine = sandbox.engine(
+            "strikes: 9\nrules:\n  - { id: push, match: { command: 'git push -f' }, redirect: Open a pull request., ask: true }\n  - { id: dev, match: { command: 'push dev' } }",
+        );
+        let run = |command: &str| engine.check(&call("bash", json!({ "command": command })));
+        let noted =
+            |d: Decision, start: &str| matches!(d, Decision::Noted { ref message } if message.starts_with(start));
+        assert!(noted(run("reaper ask 'please'"), "Nothing"), "nothing blocked yet");
+        assert!(
+            matches!(run("git push -f"), Decision::Kill { strike: 1, ref redirect, .. } if redirect.ends_with(ASKING))
+        );
+        assert!(
+            matches!(run("git push -f"), Decision::Kill { strike: 2, .. }),
+            "a plain retry is blocked, not asked about"
+        );
+        assert!(noted(run("reaper ask \"my own branch, nobody else pushes to it\""), "Asked."));
+        assert_eq!(
+            run("git push -f"),
+            Decision::Ask {
+                rule: "push".into(),
+                redirect: "Open a pull request.".into(),
+                why: "my own branch, nobody else pushes to it".into()
+            }
+        );
+        assert_eq!(sandbox.events().iter().filter(|e| *e == "agent.asked").count(), 1);
+        // Answered: until the person's next prompt, blocked, with no offer to ask.
+        assert!(
+            matches!(run("git push -f"), Decision::Kill { strike: 3, ref redirect, .. } if !redirect.contains(ASKING))
+        );
+        assert!(noted(run("reaper ask 'again'"), "Nothing"));
+        engine.restart("test", "s1");
+        assert!(
+            matches!(run("git push -f"), Decision::Kill { ref redirect, .. } if redirect.ends_with(ASKING)),
+            "a new prompt"
+        );
+        // A rule that doesn't allow asking: just blocked.
+        assert!(matches!(run("push dev"), Decision::Kill { ref redirect, .. } if !redirect.contains(ASKING)));
+        assert!(noted(run("reaper ask 'please'"), "Nothing"));
+
+        // A stop rule is never asked about, even with `ask` (lint says so).
+        let sandbox = Sandbox::new("ask-stop");
+        let engine = sandbox.engine("rules: [{ id: prod, match: { command: prod }, action: stop, ask: true }]");
+        assert!(
+            matches!(engine.check(&call("bash", json!({ "command": "psql prod" }))), Decision::Kill { ref redirect, .. } if !redirect.contains(ASKING))
+        );
+    }
+
+    #[test]
+    fn a_rule_with_load_waits_for_a_busy_machine_and_says_so() {
+        let sandbox = Sandbox::new("load");
+        let mut engine = sandbox.engine(
+            "strikes: 9\nrules: [{ id: suite, match: { command: pytest }, free: 12G, load: 16, redirect: Run the test files for the code you changed. }]",
+        );
+        let run = |engine: &Engine| engine.check(&call("bash", json!({ "command": "pytest" })));
+        (engine.memory, engine.load) = (|| Some(20 << 30), || Some(3.0));
+        assert_eq!(run(&engine), Decision::Allow, "room and time to spare");
+        engine.load = || Some(23.4);
+        assert!(
+            matches!(run(&engine), Decision::Kill { ref redirect, .. } if redirect.starts_with("This machine is busy right now (load 23). Run the test files"))
+        );
+        engine.memory = || Some(4 << 30);
+        assert!(
+            matches!(run(&engine), Decision::Kill { ref redirect, .. } if redirect.starts_with("This machine is low on memory and busy right now (4.0G free, load 23)."))
+        );
+        engine.load = || None;
+        assert!(
+            matches!(run(&engine), Decision::Kill { ref redirect, .. } if redirect.starts_with("This machine is low on memory right now (4.0G free).")),
+            "what can't be read isn't mentioned"
+        );
+    }
+
+    #[test]
     fn strikes_survive_across_processes() {
         let sandbox = Sandbox::new("persist");
         let rules = "strikes: 2\nrules: [{ id: push, match: { command: push } }]";
-        let push = call("bash", json!({ "command": "push" }));
-        assert!(matches!(sandbox.engine(rules).check(&push), Decision::Kill { strike: 1, .. }));
-        assert!(matches!(sandbox.engine(rules).check(&push), Decision::Kill { strike: 2, is_final: true, .. }));
+        let push = |to: &str| call("bash", json!({ "command": format!("push {to}") }));
+        assert!(matches!(sandbox.engine(rules).check(&push("a")), Decision::Kill { strike: 1, .. }));
+        assert!(matches!(sandbox.engine(rules).check(&push("b")), Decision::Kill { strike: 2, is_final: true, .. }));
     }
 
     #[test]

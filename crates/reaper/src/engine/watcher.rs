@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use reaper_core::rules::Rule;
+use reaper_core::rules::{Room, Rule};
 use serde_json::Value;
 
 use super::backend::Backend;
@@ -49,8 +49,9 @@ pub struct Settings<'a> {
     /// Treat a watcher failure as a violation instead of letting the action through.
     pub kill_on_error: bool,
     pub timeout: Duration,
-    /// Free memory now, for rules that apply only when it runs short (`free`).
-    pub free: Option<u64>,
+    /// What the machine has to spare now, for rules that apply only when it's short (`free`,
+    /// `load`).
+    pub room: Room,
 }
 
 /// The ids in a watcher reply like `{"violated": ["a"]}`, tolerating text around the JSON.
@@ -86,7 +87,7 @@ pub fn check<'a>(
     };
     // Only rules in force can be broken, but the watcher's prompt lists them all, so its
     // prefix stays the same as memory comes and goes.
-    let all: Vec<&'a Rule> = global.iter().chain(project).copied().filter(|r| r.in_force(settings.free)).collect();
+    let all: Vec<&'a Rule> = global.iter().chain(project).copied().filter(|r| r.in_force(&settings.room)).collect();
 
     if let Some(hit) = all.iter().find(|r| r.judge.is_none() && r.matches(tool, args)) {
         return done(Some(hit), Tier::Pattern, true, None);
@@ -149,7 +150,12 @@ mod tests {
     }
 
     fn settings(backend: &dyn Backend) -> Settings<'_> {
-        Settings { backend: Some(backend), kill_on_error: false, timeout: Duration::from_secs(1), free: None }
+        Settings {
+            backend: Some(backend),
+            kill_on_error: false,
+            timeout: Duration::from_secs(1),
+            room: Room::default(),
+        }
     }
 
     const JUDGE: &str = "rules: [{ id: prod, judge: touching production, tools: [bash] }]";
@@ -187,9 +193,9 @@ mod tests {
         let rules: Vec<&Rule> = config.rules.iter().collect();
         let backend = fake(r#"{"violated":["suite"]}"#);
         let args = json!({ "command": "pytest" });
-        let plenty = Settings { free: Some(12 << 30), ..settings(&backend) };
+        let plenty = Settings { room: Room { free: Some(12 << 30), load: None }, ..settings(&backend) };
         assert!(check(&rules, &[], "", "bash", &args, &plenty, &store("free1")).rule.is_none(), "not in force");
-        let short = Settings { free: Some(2 << 30), ..settings(&backend) };
+        let short = Settings { room: Room { free: Some(2 << 30), load: None }, ..settings(&backend) };
         let o = check(&rules, &[], "", "bash", &args, &short, &store("free2"));
         assert_eq!(o.rule.map(|r| r.id.as_str()), Some("suite"));
         let prefixes = backend.calls.borrow();

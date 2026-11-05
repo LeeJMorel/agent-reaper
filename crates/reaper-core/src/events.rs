@@ -51,6 +51,10 @@ pub enum Kind {
         dir: String,
         model: Option<String>,
         label: Option<String>,
+        /// A session reaper started to carry on the work of this one, which died. Absent in
+        /// logs from before sessions were handed on.
+        #[serde(default)]
+        after: Option<String>,
     },
     /// The human asked the session for something. Cut short: some prompts are whole files.
     #[serde(rename = "agent.prompted")]
@@ -260,5 +264,9 @@ mod tests {
         assert_eq!(old.kind, Kind::Redirected { rule: "r".into(), redirect: String::new() });
         let asked = parse_line(r#"{"at":1,"host":"claude-code","agent":"a","type":"agent.asked"}"#).unwrap();
         assert_eq!(asked.kind, Kind::Asked);
+        let took_over = parse_line(r#"{"at":1,"host":"pi","agent":"b","type":"agent.spawned","dir":"/w","after":"a"}"#);
+        assert!(matches!(took_over.unwrap().kind, Kind::Spawned { after: Some(a), parent: None, .. } if a == "a"));
+        let before = parse_line(r#"{"at":1,"host":"pi","agent":"b","type":"agent.spawned","dir":"/w"}"#).unwrap();
+        assert!(matches!(before.kind, Kind::Spawned { after: None, .. }), "logs from before");
     }
 }

@@ -89,6 +89,16 @@ impl Linter {
             }
             _ => {}
         }
+        if rule.ask && rule.stops() {
+            self.push(Level::Warn, p, id, "`ask` does nothing with `action: stop`: it can't be asked about".into());
+        }
+        if let Some(load) = rule.load {
+            if load <= 0.0 {
+                self.push(Level::Error, p, id, format!("load `{load}` is not above zero; the rule would always apply"));
+            } else if !cfg!(target_os = "linux") {
+                self.push(Level::Warn, p, id, "`load` reads /proc/loadavg, so this rule only applies on Linux".into());
+            }
+        }
         if let Some(free) = rule.free.as_deref() {
             if size_bytes(free).is_none() {
                 self.push(
@@ -291,6 +301,7 @@ projects:
       - { id: y, match: { command: y }, redirect: Run it locally., action: stop, strikes: 4 }
       - { id: z, match: { command: z }, redirect: Run it locally., strikes: 0 }
       - { id: w, match: { command: w }, redirect: Run it locally., free: lots }
+      - { id: v, match: { command: v }, redirect: Run it locally., load: 0 }
 "#,
             )
             .unwrap(),
@@ -315,6 +326,7 @@ projects:
             "`strikes` does nothing with `action: stop`: it stops at the first",
             "`strikes: 0` stops the agent at the first, as `strikes: 1`",
             "free `lots` is not a size like 512M or 2G; the rule never applies",
+            "load `0` is not above zero; the rule would always apply",
         ] {
             assert!(all.contains(&expected), "missing {expected:?} in {all:#?}");
         }

@@ -43,7 +43,7 @@ reap:
 rules:
   - id: force-push
     tools: [bash]
-    match: { command: 'git\s+push\b.*(--force\b|-f\b)' }
+    match: { command: '(^|[;&|(]\s*)git\s+(-C\s+\S+\s+)?push\b[^;&|\n]*\s(--force\b|-f\b)' }
     redirect: Push to a new branch and open a pull request for the change.
 
   - id: secrets

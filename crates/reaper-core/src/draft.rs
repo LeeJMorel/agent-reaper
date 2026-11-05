@@ -383,6 +383,64 @@ pub fn insert(text: &str, draft: &Draft) -> Result<String, String> {
     Ok(lines.join("\n") + "\n")
 }
 
+/// The rules file's text without the rule `id`, the rest as it was. Checked the same way as an
+/// insert: read back, the file must be the old one less that rule and nothing else.
+pub fn remove(text: &str, id: &str) -> Result<String, String> {
+    let old = parse(text).map_err(|_| "the rules file has a syntax error; it has to be fixed first".to_string())?;
+    let place = old.all_rules().find(|(_, r)| r.id == id).map(|(p, _)| p.map(str::to_string));
+    let Some(place) = place else { return Err(format!("there is no rule {id}")) };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    // Its list item: `- id: x` in block style or `- { id: x, … }` on one line, never a comment.
+    let quoted = |s: &str| [s.to_string(), format!("\"{s}\""), format!("'{s}'")];
+    let named = |line: &str| {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix("- ") else { return false };
+        let rest = rest.trim_start().trim_start_matches("{ ").trim_start();
+        let Some(value) = rest.strip_prefix("id:") else { return false };
+        let value = value.trim_start();
+        quoted(id).iter().any(|q| {
+            value
+                .strip_prefix(q.as_str())
+                .is_some_and(|after| after.is_empty() || after.starts_with([' ', ',', '}', '#']))
+        })
+    };
+    let Some(at) = lines.iter().position(|l| content(l) && named(l)) else {
+        return Err(format!("{id} isn't written as a list item of its own; remove it by hand"));
+    };
+    let dash = indent(&lines[at]);
+    // The item runs to the next line with content at its dash or left of it. A comment at the
+    // dash's level belongs to what follows.
+    let stop = (at + 1..lines.len()).find(|&j| content(&lines[j]) && indent(&lines[j]) <= dash).unwrap_or(lines.len());
+    let through =
+        (at + 1..stop).rev().find(|&j| content(&lines[j]) || indent(&lines[j]) > dash && !lines[j].trim().is_empty());
+    lines.drain(at..=through.unwrap_or(at));
+    // One blank line between neighbours, not two.
+    if at > 0 && lines[at - 1].trim().is_empty() && lines.get(at).is_none_or(|l| l.trim().is_empty()) {
+        lines.remove(at - 1);
+    }
+    // A list left with nothing in it is written empty, not as a bare key.
+    if let Some(key) = (0..at.min(lines.len())).rev().find(|&j| content(&lines[j]) && indent(&lines[j]) < dash.max(1)) {
+        let after = (key + 1..lines.len()).find(|&j| content(&lines[j]));
+        let empty = after.is_none_or(|j| indent(&lines[j]) <= indent(&lines[key]) && !item(&lines[j]));
+        if empty && lines[key].trim_end().ends_with("rules:") {
+            lines[key] = format!("{} []", lines[key].trim_end());
+        }
+    }
+    let new_text = lines.join("\n") + "\n";
+    let mut want = old.to_json();
+    let list = match &place {
+        None => &mut want["rules"],
+        Some(name) => &mut want["projects"][name.as_str()]["rules"],
+    };
+    if let Some(list) = list.as_array_mut() {
+        list.retain(|r| r["id"] != id);
+    }
+    match parse(&new_text) {
+        Ok(new) if new.to_json() == want => Ok(new_text),
+        _ => Err(format!("couldn't take {id} out of the rules file without changing anything else; remove it by hand")),
+    }
+}
+
 /// The rule as a block-style list item with its dash at `dash` columns, keys in the order
 /// the example uses.
 fn render(rule: &Rule, dash: usize) -> Vec<String> {
@@ -397,8 +455,10 @@ fn render(rule: &Rule, dash: usize) -> Vec<String> {
     let mut put = |key: &str, value: Option<String>| fields.extend(value.map(|v| format!("{key}: {v}")));
     put("judge", rule.judge.as_deref().map(scalar));
     put("free", rule.free.as_deref().map(scalar));
+    put("load", rule.load.map(|l| l.to_string()));
     put("action", rule.action.as_deref().map(scalar));
     put("strikes", rule.strikes.map(|n| n.to_string()));
+    put("ask", rule.ask.then(|| "true".to_string()));
     put("redirect", rule.redirect.as_deref().map(scalar));
     let pad = " ".repeat(dash);
     fields
@@ -532,6 +592,30 @@ note: Assumed every project.
         assert_eq!(inline.problems, ["`rules` is written on one line in the rules file; add the rule by hand"]);
         let broken = check(&d, "rules: [ {{\n");
         assert!(broken.problems[0].starts_with("the rules file has a syntax error"));
+    }
+
+    #[test]
+    fn a_rule_comes_out_and_nothing_else_moves() {
+        let text = check(&draft(SUITE), EXAMPLE_RULES).text.unwrap();
+        assert_eq!(remove(&text, "whole-test-suite").unwrap(), EXAMPLE_RULES, "added, then taken out again");
+
+        let without = remove(EXAMPLE_RULES, "secrets").unwrap();
+        let config = parse(&without).unwrap();
+        assert_eq!(config.rules.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["force-push"]);
+        assert!(without.contains("  # - id: whole-test-suite"), "the commented-out example stays");
+        assert!(!without.contains("\n\n\n"), "no double gaps left behind");
+
+        let generated = remove(EXAMPLE_RULES, "generated-code").unwrap();
+        assert!(!generated.contains("generated-code") && generated.contains("# `path` is the file"), "{generated}");
+        assert_eq!(parse(&generated).unwrap().projects["my-app"].rules.len(), 2);
+
+        let last = remove("rules:\n  - id: a\n    match: { command: x }\nstrikes: 2\n", "a").unwrap();
+        assert_eq!(last, "rules: []\nstrikes: 2\n");
+        let flow = remove("rules:\n  - { id: a, match: { command: x } }\n  - { id: b, match: { command: y } }\n", "a");
+        assert_eq!(flow.unwrap(), "rules:\n  - { id: b, match: { command: y } }\n");
+        assert_eq!(remove(EXAMPLE_RULES, "nope").unwrap_err(), "there is no rule nope");
+        let inline = remove("rules: [{ id: a, match: { command: x } }]\n", "a").unwrap_err();
+        assert!(inline.contains("by hand"), "{inline}");
     }
 
     #[test]

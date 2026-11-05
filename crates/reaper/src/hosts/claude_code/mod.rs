@@ -9,6 +9,7 @@ pub mod watch;
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -21,17 +22,39 @@ pub const HOST: &str = "claude-code";
 /// What the human sees when a session is stopped. Claude sees it too if the conversation
 /// continues, so it names no rule.
 const STOPPED: &str = "reaper stopped this session. The reaper console shows why.";
+/// The same, when its work waits for a fresh session to take it over.
+const HANDED_ON: &str = "reaper stopped this session. /clear starts a fresh one that takes its work over.";
+/// Shown in a terminal's fresh session: Claude has the handoff, and starts when the human says.
+const TAKING_OVER: &str = "reaper: this session takes over the stopped one's work. Send any message to start it.";
+/// A `/clear` ends one session and starts the next straight away; a note older than this is stale.
+const CLEARING: Duration = Duration::from_secs(60);
 
 fn deny(reason: &str) -> Value {
     json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })
 }
 
 /// Denied, and the agent making the call stops.
-fn stop() -> Value {
+fn stop(reason: &str) -> Value {
     let mut output = deny("Stopped.");
     output["continue"] = false.into();
-    output["stopReason"] = STOPPED.into();
+    output["stopReason"] = reason.into();
     output
+}
+
+/// How this Claude Code was started: `cli` in a terminal, `claude-vscode` in the editor,
+/// `sdk-…` by a script.
+fn entrypoint() -> String {
+    std::env::var("CLAUDE_CODE_ENTRYPOINT").unwrap_or_default()
+}
+
+/// The session a `/clear` just ended in this Claude Code, if its work waits to be taken over.
+fn cleared_from(engine: &Engine) -> Option<String> {
+    let note = engine.store.handoff_note(claude_pid()?);
+    let fresh =
+        fs::metadata(&note).and_then(|m| m.modified()).ok().and_then(|at| SystemTime::now().duration_since(at).ok());
+    let from = fs::read_to_string(&note).ok();
+    let _ = fs::remove_file(&note);
+    from.filter(|_| fresh.is_some_and(|age| age < CLEARING))
 }
 
 /// For sessions that started before reaper was installed, so no `UserPromptSubmit` recorded
@@ -133,8 +156,7 @@ fn claude_pid() -> Option<u32> {
 /// (hooks for parallel tool calls run at once), and starts the watcher if there's none yet.
 /// Sessions in an editor (`claude-vscode`…) or run by a script (`sdk-cli`) aren't reaped.
 fn tell_watcher(engine: &Engine, event: &Value) {
-    let terminal = std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|e| e == "cli");
-    let Some(pid) = claude_pid().filter(|_| terminal && engine.config.reaps()) else { return };
+    let Some(pid) = claude_pid().filter(|_| entrypoint() == "cli" && engine.config.reaps()) else { return };
     let path = watch::state_file(pid);
     let previous: Option<Value> = fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
@@ -150,12 +172,17 @@ fn tell_watcher(engine: &Engine, event: &Value) {
 
 /// `None` means no output (carry on).
 pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
+    reply_in(engine, event, &entrypoint())
+}
+
+/// `reply`, for a Claude Code started by `entrypoint`.
+fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
     tell_watcher(engine, event);
     let session = event["session_id"].as_str().unwrap_or("unknown");
     let agent = event["agent_id"].as_str().unwrap_or(session);
     let dir = PathBuf::from(event["cwd"].as_str().unwrap_or_default());
 
-    let announce = |model: Option<&str>| {
+    let announce = |model: Option<&str>, after: Option<&str>| {
         // A lock-free read first: every tool call asks, only the first one writes.
         let first = !engine.store.session(HOST, agent).announced
             && engine.store.update(HOST, agent, |s| !std::mem::replace(&mut s.announced, true)).unwrap_or(false);
@@ -170,6 +197,9 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
             if agent != session {
                 fields["parent"] = session.into();
                 fields["label"] = event["agent_type"].clone();
+            }
+            if let Some(after) = after {
+                fields["after"] = after.into();
             }
             engine.event(HOST, agent, "agent.spawned", fields);
         }
@@ -195,6 +225,8 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
         };
         engine.check(&check)
     };
+    // What the human is told. A session's main agent, in a Claude Code someone is sitting at,
+    // leaves its work for a fresh session to take over.
     let died = |rule: &str, together: bool| {
         let stops = engine.config.all_rules().any(|(_, r)| r.id == rule && r.stops());
         let reason = if together {
@@ -205,12 +237,15 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
             "strikes"
         };
         engine.event(HOST, agent, "agent.died", json!({ "rule": rule, "reason": reason }));
+        let attended = !entrypoint.is_empty() && !entrypoint.starts_with("sdk");
+        let handed = agent == session && attended && engine.hand_on(HOST, agent, rule, &goal(), &dir).is_some();
+        if handed { HANDED_ON } else { STOPPED }
     };
 
     let end_turn = |rule: &str, together: bool| {
-        died(rule, together);
+        let reason = died(rule, together);
         engine.event(HOST, agent, "agent.idle", json!({}));
-        Some(json!({ "continue": false, "stopReason": STOPPED }))
+        Some(json!({ "continue": false, "stopReason": reason }))
     };
 
     match event["hook_event_name"].as_str()? {
@@ -219,10 +254,19 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
             if event["source"] == "resume" {
                 let _ = engine.store.update(HOST, agent, |s| s.announced = false);
             }
-            announce(event["model"].as_str());
+            // After a `/clear` of a stopped session, this one takes its work over.
+            let after = (event["source"] == "clear").then(|| cleared_from(engine)).flatten();
+            announce(event["model"].as_str(), after.as_deref());
             // A new session takes memory: idle pi sessions make room if it's short.
             engine.relieve(false);
-            None
+            let work = engine.take_over(HOST, session, after.as_deref()?)?;
+            // Only Claude Code run by a program sends a hook's first message; in a terminal, the
+            // handoff waits in context for the human's.
+            Some(if entrypoint == "cli" {
+                json!({ "systemMessage": TAKING_OVER, "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": work } })
+            } else {
+                json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "initialUserMessage": work } })
+            })
         }
         "UserPromptSubmit" => {
             if let Some(prompt) = event["prompt"].as_str() {
@@ -232,7 +276,7 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
             None
         }
         "PreToolUse" => {
-            announce(None);
+            announce(None, None);
             let tool = event["tool_name"].as_str().unwrap_or_default();
             match judge(tool, event["tool_input"].clone()) {
                 Decision::Allow => {
@@ -245,14 +289,17 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
                     engine.event(HOST, agent, "agent.redirected", json!({ "rule": rule, "redirect": redirect }));
                     Some(deny(&redirect))
                 }
-                Decision::Kill { rule, is_final: true, .. } => {
-                    died(&rule, false);
-                    Some(stop())
-                }
-                Decision::Stopped { rule } => {
-                    died(&rule, true);
-                    Some(stop())
-                }
+                Decision::Kill { rule, is_final: true, .. } => Some(stop(died(&rule, false))),
+                Decision::Stopped { rule } => Some(stop(died(&rule, true))),
+                // Claude Code's own permission prompt: only the person can answer it.
+                Decision::Ask { rule, redirect, why } => Some(json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "ask",
+                        "permissionDecisionReason": format!("reaper: allow this call just once? It breaks the rule {rule} ({redirect}) The agent's reason: {why}"),
+                    }
+                })),
+                Decision::Noted { message } => Some(deny(&message)),
             }
         }
         // A reply that breaks a rule doesn't end the turn: Claude carries on with the redirect.
@@ -278,7 +325,7 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
         }
         // Announced first: a subagent that never used a tool would otherwise pass for a session.
         "SubagentStop" => {
-            announce(None);
+            announce(None, None);
             engine.event(HOST, agent, "agent.idle", json!({}));
             None
         }
@@ -287,9 +334,18 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
             engine.event(HOST, agent, "agent.asked", json!({}));
             None
         }
-        // Closed, cleared, or exiting as it's reaped (the reap is recorded after, and wins).
+        // Closed, cleared, or exiting as it's reaped (the reap is recorded after, and wins). A
+        // stopped session cleared leaves word for the session that follows it.
         "SessionEnd" => {
             engine.event(HOST, session, "agent.ended", json!({}));
+            if event["reason"] == "clear"
+                && engine.store.session(HOST, session).handoff.is_some()
+                && let Some(pid) = claude_pid()
+            {
+                let note = engine.store.handoff_note(pid);
+                let _ = fs::create_dir_all(note.parent().expect("runs/"));
+                let _ = fs::write(note, session);
+            }
             None
         }
         _ => None,
@@ -303,6 +359,11 @@ mod tests {
 
     const RULES: &str = "strikes: 2\nrules: [{ id: no-prod, tools: [bash], match: { command: prod }, redirect: Use the staging database. }]";
 
+    /// As a Claude Code in a terminal, whatever runs the tests.
+    fn reply(engine: &Engine, event: &Value) -> Option<Value> {
+        reply_in(engine, event, "cli")
+    }
+
     fn pre_tool_use(command: &str) -> Value {
         json!({
             "hook_event_name": "PreToolUse", "session_id": "s1", "cwd": "/w",
@@ -315,21 +376,103 @@ mod tests {
         let sandbox = Sandbox::new("cc-deny");
         let engine = sandbox.engine(RULES);
         assert_eq!(reply(&engine, &pre_tool_use("ls")), None);
-        let out = reply(&engine, &pre_tool_use("psql prod")).unwrap();
+        let out = reply(&engine, &pre_tool_use("psql prod -c 1")).unwrap();
         assert_eq!(out, deny("Use the staging database."));
         assert!(!out.to_string().contains("no-prod"), "the rule id never reaches Claude");
+    }
+
+    #[test]
+    fn asking_on_purpose_reaches_the_person_through_claude_codes_own_prompt() {
+        let sandbox = Sandbox::new("cc-ask-once");
+        let engine = sandbox.engine(
+            "strikes: 3\nrules: [{ id: no-prod, tools: [bash], match: { command: prod }, redirect: Use the staging database., ask: true }]",
+        );
+        reply(&engine, &pre_tool_use("psql prod"));
+        let asked = reply(&engine, &pre_tool_use("reaper ask 'read-only query for the incident'")).unwrap();
+        assert_eq!(asked["hookSpecificOutput"]["permissionDecision"], "deny", "nothing runs");
+        assert!(asked.to_string().contains("Make the same call again"), "{asked}");
+        let out = reply(&engine, &pre_tool_use("psql prod")).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "ask");
+        let reason = out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(
+            reason.contains("Use the staging database.") && reason.contains("read-only query for the incident"),
+            "{reason}"
+        );
+        assert!(out.get("continue").is_none(), "nothing is stopped");
     }
 
     #[test]
     fn the_strike_limit_stops_the_session_without_naming_the_rule() {
         let sandbox = Sandbox::new("cc-stop");
         let engine = sandbox.engine(RULES);
-        reply(&engine, &pre_tool_use("psql prod"));
-        let out = reply(&engine, &pre_tool_use("psql prod")).unwrap();
+        reply(&engine, &pre_tool_use("psql prod -c 2"));
+        let out = reply(&engine, &pre_tool_use("psql prod -c 3")).unwrap();
         assert_eq!(out["continue"], false);
         assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
         assert!(!out.to_string().contains("no-prod") && !out.to_string().contains("staging"));
         assert!(sandbox.events().ends_with(&["agent.killed".to_string(), "agent.died".to_string()]));
+    }
+
+    fn hook(name: &str, session: &str, extra: Value) -> Value {
+        let mut event = json!({ "hook_event_name": name, "session_id": session, "cwd": "/w" });
+        event.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        event
+    }
+
+    /// Stops `s1`, which was asked to load the fixtures, then clears it.
+    fn stopped_and_cleared(engine: &Engine) -> Value {
+        engine.prompted(HOST, "s1", "Load the fixtures.");
+        reply(engine, &pre_tool_use("psql prod -c 4"));
+        let out = reply(engine, &pre_tool_use("psql prod -c 5")).unwrap();
+        reply(engine, &hook("SessionEnd", "s1", json!({ "reason": "clear" })));
+        out
+    }
+
+    #[test]
+    fn a_stopped_session_cleared_in_a_terminal_hands_its_work_to_the_next() {
+        let sandbox = Sandbox::new("cc-handoff");
+        let engine = sandbox.engine(RULES);
+        let stopped = stopped_and_cleared(&engine);
+        assert_eq!(stopped["stopReason"], HANDED_ON);
+
+        let out = reply(&engine, &hook("SessionStart", "s2", json!({ "source": "clear" }))).unwrap();
+        assert_eq!(out["systemMessage"], TAKING_OVER);
+        let work = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(work.contains("> Load the fixtures.") && work.ends_with("Use the staging database."), "{work}");
+        assert!(!work.contains("no-prod") && !work.contains("psql"), "nothing about the rule or the attempt: {work}");
+
+        let log = std::fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
+        let spawned: Vec<Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|e: &Value| e["type"] == "agent.spawned")
+            .collect();
+        assert_eq!((&spawned[1]["agent"], &spawned[1]["after"]), (&json!("s2"), &json!("s1")));
+        // Cleared again, the fresh session is just that: the work was taken over once.
+        reply(&engine, &hook("SessionEnd", "s2", json!({ "reason": "clear" })));
+        assert_eq!(reply(&engine, &hook("SessionStart", "s3", json!({ "source": "clear" }))), None);
+    }
+
+    #[test]
+    fn claude_code_run_by_a_program_starts_on_the_handoff_by_itself() {
+        let sandbox = Sandbox::new("cc-handoff-sdk");
+        let engine = sandbox.engine(RULES);
+        stopped_and_cleared(&engine);
+        let out =
+            reply_in(&engine, &hook("SessionStart", "s2", json!({ "source": "clear" })), "claude-vscode").unwrap();
+        assert!(out["hookSpecificOutput"]["initialUserMessage"].as_str().unwrap().contains("> Load the fixtures."));
+        assert!(out.get("systemMessage").is_none());
+    }
+
+    #[test]
+    fn a_scripted_run_is_only_stopped() {
+        let sandbox = Sandbox::new("cc-handoff-p");
+        let engine = sandbox.engine(RULES);
+        engine.prompted(HOST, "s1", "Load the fixtures.");
+        reply_in(&engine, &pre_tool_use("psql prod -c 6"), "sdk-cli");
+        let out = reply_in(&engine, &pre_tool_use("psql prod -c 7"), "sdk-cli").unwrap();
+        assert_eq!(out["stopReason"], STOPPED, "nobody is there to /clear");
+        assert_eq!(engine.store.session(HOST, "s1").handoff, None);
     }
 
     #[test]
