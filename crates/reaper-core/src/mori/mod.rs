@@ -20,6 +20,7 @@ use crate::rules::Config;
 use crate::state::{Model, QUIET_FOR, Status, hands_back};
 
 pub use cast::{BLOCK, DEAD, DUSK, LAND, REAPER, Rgb, WHITE, ansi256};
+pub use level::Fit;
 pub use scene::{Actor, Effect, Exit, FRAME, Health, Label, Mini, Narration, Rect, Scene, Stage, Strip, Title};
 pub use sprites::Sprite;
 
@@ -49,6 +50,9 @@ const REHEARSAL_GONE: i64 = 12_000;
 const DEPART: i64 = 2_000;
 /// After a switch, the line about the team follows the title card.
 const TEAM_LINE_AFTER: i64 = 800;
+/// A death anywhere has the stage this long from when its scene begins: the scene, the grave,
+/// its line read. Then the stage goes back.
+const DYING: i64 = 8_000;
 /// A kill this recent still colours what a picked character thinks about.
 const JUST_KILLED: i64 = 60_000;
 /// Quiet lines (working, waiting) come at least this far apart in a session.
@@ -56,8 +60,10 @@ const QUIET_GAP: i64 = 10_000;
 /// A push: the character leans in, then the block moves.
 const PUSH_LEAN: i64 = 150;
 const PUSH_FLY: i64 = 300;
-/// From the start of a bump to touching the edge, where the ground cracks.
+/// From the start of a strike to touching the edge, where it counts.
 const PRESS: i64 = 250;
+/// A strike's aftermath: the wisp it draws up out of the character, sways and pulls back in.
+const STRIKE: i64 = 920;
 /// From the start of a death by the floor to the floor giving way.
 const GIVE: i64 = 400;
 /// Deaths in a session this close together go over the edge together instead, so each waits
@@ -69,9 +75,8 @@ const LINE: i64 = 450;
 const LEAVE: i64 = 200;
 /// A parent stretching up while a subagent climbs out of its top.
 const SPLIT: i64 = 450;
-/// What a session's level remembers: recent pushes (older ones are settled), cracks, holes.
+/// What a session's level remembers: recent pushes (older ones are settled), holes.
 const PUSHES: usize = 16;
-const CRACKS: usize = 24;
 const HOLES: usize = 12;
 
 /// The kinds of work, each with its part of the level. Nothing on screen names them: the level
@@ -244,9 +249,12 @@ enum Act {
         from: u8,
         to: u8,
     },
-    /// Tries to go on (`dir` is which way), walks into the invisible edge and is knocked back.
-    Bump {
+    /// Tries to go on (`dir` is which way) and is struck: it flashes red all over, reaper's
+    /// touch, and is knocked back. Short of its last strike, the strike then draws a wisp up out
+    /// of it, `wisp` pixels high, higher the nearer it is to being stopped, and pulls it back in.
+    Strike {
         dir: i8,
+        wisp: u8,
     },
     /// The beat of stillness after a redirect. Nothing moves; newer beats wait for it.
     Turn,
@@ -274,8 +282,10 @@ impl Act {
             Act::Arrive { parent: Some(_) } => 800,
             Act::Go { wait, len } => wait + len,
             Act::Push { .. } => PUSH_LEAN + PUSH_FLY,
-            Act::Bump { .. } if who == Personality::Hero => 1050,
-            Act::Bump { .. } => 700,
+            Act::Strike { wisp, .. } => {
+                let press = if who == Personality::Hero { 1050 } else { 700 };
+                press + if wisp > 0 { STRIKE } else { 0 }
+            }
             Act::Turn => 350,
             Act::Signal(_) => 300,
             Act::Answered => 0,
@@ -303,16 +313,6 @@ struct Push {
     at: i64,
     from: u8,
     to: u8,
-}
-
-/// Where a character hit the invisible edge: the ground there cracked.
-#[derive(Debug, Clone, Copy)]
-struct Crack {
-    at: i64,
-    actor: usize,
-    spot: Spot,
-    dir: i8,
-    strike: u32,
 }
 
 /// Where the floor gave way under a character.
@@ -371,7 +371,7 @@ struct Character {
     /// does anything again.
     ended: Option<i64>,
     /// How much of its allowance it has used, as the engine counts it (at 1 it's stopped), and
-    /// from when: a kill counts once it hits the edge.
+    /// from when: one entry a kill, counting once it hits the edge.
     pressure: VecDeque<(i64, f64)>,
     kill: Option<KillFact>,
     death: Option<DeathFact>,
@@ -390,10 +390,15 @@ impl Character {
         self.pressure.push_back((at, pressure));
     }
 
-    /// What's left of its allowance at `now`, from 1 down to 0.
-    fn health_at(&self, now: i64) -> f32 {
-        let used = self.pressure.iter().rev().find(|p| p.0 <= now).map_or(0.0, |p| p.1);
-        (1.0 - used).clamp(0.0, 1.0) as f32
+    /// How much of its allowance it has used at `now`: 1 is all of it.
+    fn used_at(&self, now: i64) -> f64 {
+        self.pressure.iter().rev().find(|p| p.0 <= now).map_or(0.0, |p| p.1)
+    }
+
+    /// How many times it has been stopped by `now`, since its record was last wiped clean (a
+    /// zero: it carried on after compacting).
+    fn kills_at(&self, now: i64) -> usize {
+        self.pressure.iter().filter(|p| p.0 <= now).rev().take_while(|p| p.1 > 0.0).count()
     }
 
     /// In its exit at `now`, its turn over.
@@ -459,7 +464,6 @@ struct Session {
     settled: Vec<u8>,
     pushes: VecDeque<Push>,
     edits: u64,
-    cracks: VecDeque<Crack>,
     holes: VecDeque<Hole>,
     /// How the last one here died, so the next goes differently.
     last_death: Option<Method>,
@@ -487,6 +491,9 @@ struct View {
     auto: Option<usize>,
     picked: Option<usize>,
     switched_at: Option<i64>,
+    /// A death playing somewhere, which has the stage until then, whatever is followed: the
+    /// session, and until when. The human choosing a session takes it back.
+    dying: Option<(usize, i64)>,
     /// Sample deaths played so far, which picks the next.
     samples: usize,
 }
@@ -593,6 +600,12 @@ impl Mori {
     /// action's, or else the most recently busy one still here.
     fn shown(&self, now: i64) -> Option<usize> {
         let here = |s: &usize| !self.gone(*s, now);
+        if let Some((s, until)) = self.view.dying
+            && now < until
+            && here(&s)
+        {
+            return Some(s);
+        }
         self.followed().filter(here).or(self.view.auto.filter(here)).or_else(|| {
             (0..self.sessions.len()).filter(|&s| self.listed(s, now)).max_by_key(|&s| self.sessions[s].last_at)
         })
@@ -645,7 +658,11 @@ impl Mori {
                 pressure: Some(1.0),
             };
             events.push(event(at, id, killed));
-            events.push(event(at + 1, id, Kind::Died { rule: rule.into(), reason: DeathReason::Strikes }));
+            events.push(event(
+                at + 1,
+                id,
+                Kind::Died { rule: rule.into(), reason: DeathReason::Strikes, carry_on: None },
+            ));
         }
         events.sort_by_key(|e| e.at);
         self.rehearsing = Some(method);
@@ -656,6 +673,7 @@ impl Mori {
         let s = self.actors[self.index[&cast[0]]].session;
         self.view.chosen = Some(s);
         self.view.picked = None;
+        self.view.dying = None;
         self.switched(now);
         method
     }
@@ -670,6 +688,7 @@ impl Mori {
         if session < self.sessions.len() {
             self.view.chosen = Some(session);
             self.view.picked = None;
+            self.view.dying = None;
         }
     }
 
@@ -687,6 +706,7 @@ impl Mori {
         };
         self.view.chosen = Some(here[next as usize]);
         self.view.picked = None;
+        self.view.dying = None;
         self.switched(now);
     }
 
@@ -695,10 +715,21 @@ impl Mori {
         self.view.chosen.is_none()
     }
 
-    /// What the human first asked the session on the stage for.
-    pub fn prompt(&self, now: i64) -> Option<&str> {
-        let s = self.shown(now)?;
-        self.model.agent(&self.sessions[s].root)?.prompt.as_deref()
+    /// What the human asked the session on the stage for, oldest first.
+    pub fn prompts(&self, now: i64) -> Vec<&str> {
+        self.shown(now).map(|s| self.prompted(s)).unwrap_or_default()
+    }
+
+    /// What the human asked a session for, oldest first: its main agent, and whoever took over
+    /// from it.
+    fn prompted(&self, s: usize) -> Vec<&str> {
+        let mut prompts: Vec<&(i64, String)> = (self.sessions[s].members.iter())
+            .filter(|&&m| self.main(m))
+            .filter_map(|&m| self.model.agent(&self.actors[m].id))
+            .flat_map(|agent| &agent.prompts)
+            .collect();
+        prompts.sort_by_key(|(at, _)| *at);
+        prompts.into_iter().map(|(_, prompt)| prompt.as_str()).collect()
     }
 
     pub fn follow_the_action(&mut self, now: i64) -> bool {
@@ -706,6 +737,7 @@ impl Mori {
             return false;
         }
         self.view.picked = None;
+        self.view.dying = None;
         self.switched(now);
         true
     }
@@ -797,8 +829,13 @@ impl Mori {
         }
 
         match &event.kind {
+            Kind::Spawned { after: Some(after), .. } if *after == event.agent => {
+                self.renew(a, event.at, Section::Compacted);
+            }
             Kind::Spawned { .. } if self.actors[a].asleep => self.wake(a, event.at),
             Kind::Spawned { .. } => self.arrive(a, event.at),
+            // Started over by the engine: it gets up with a clean slate.
+            Kind::Revived => self.renew(a, event.at, Section::Revived),
             Kind::Acted { tool } => {
                 if self.actors[a].asleep {
                     self.wake(a, event.at);
@@ -878,7 +915,6 @@ impl Mori {
                     plan,
                     pushes: VecDeque::new(),
                     edits: 0,
-                    cracks: VecDeque::new(),
                     holes: VecDeque::new(),
                     last_death: None,
                     last_signal: None,
@@ -1170,21 +1206,19 @@ impl Mori {
         let Kind::Killed { tool, rule, strike, is_final, attempt, pressure, .. } = &event.kind else { return };
         let (to, dir) = self.trouble(a, tool);
         self.go(a, event.at, to);
-        let start = self.beat(a, event.at, to, Act::Bump { dir });
-        let c = &mut self.actors[a];
         // Logs from before the engine recorded it: each kill a share of the default strikes.
         let share = 1.0 / f64::from(Config::default().strikes);
-        c.press(start + PRESS, pressure.unwrap_or(if *is_final { 1.0 } else { c.pressure() + share }));
+        let used = pressure.unwrap_or(if *is_final { 1.0 } else { self.actors[a].pressure() + share });
+        // Each strike draws the wisp further out. The last one, its death tells.
+        let wisp = if *is_final { 0 } else { 2 + (6.0 * used.min(1.0)).round() as u8 };
+        let start = self.beat(a, event.at, to, Act::Strike { dir, wisp });
+        let c = &mut self.actors[a];
+        c.press(start + PRESS, used);
         c.tool = Some(tool.to_lowercase());
         c.kill =
             Some(KillFact { at: event.at, rule: rule.clone(), strike: *strike, tried: lines::gist(tool, attempt) });
         c.noticed_at = event.at;
-        let session = &mut self.sessions[c.session];
-        if session.cracks.len() == CRACKS {
-            session.cracks.pop_front();
-        }
-        session.cracks.push_back(Crack { at: start + PRESS, actor: a, spot: to, dir, strike: *strike });
-        session.kill_at = Some(start);
+        self.sessions[c.session].kill_at = Some(start);
         if !is_final {
             // A final kill is told by its death.
             let section = if *strike >= 2 { Section::KilledAgain } else { Section::Killed };
@@ -1193,7 +1227,12 @@ impl Mori {
     }
 
     fn turn(&mut self, a: usize, at: i64) {
-        let here = self.actors[a].spot;
+        let c = &self.actors[a];
+        let here = c.spot;
+        // It answers the strike just before it: once the strike's wisp is back in, however long
+        // the walk there took.
+        let after_kill = matches!(c.beats.back(), Some(Beat { act: Act::Strike { .. }, .. }));
+        let at = if after_kill { at.max(c.locked) } else { at };
         let start = self.beat(a, at, here, Act::Turn);
         // The other way comes after the line about the edge, not over it.
         let s = self.actors[a].session;
@@ -1291,6 +1330,7 @@ impl Mori {
             }
         }
         self.sessions[s].last_death = Some(method);
+        let elsewhere = self.shown(at) != Some(s);
         // Deaths play in the middle of the stage: it walks there first.
         self.go(a, at, Spot::Centre);
         let c = &mut self.actors[a];
@@ -1298,6 +1338,14 @@ impl Mori {
         c.home = false;
         let here = c.spot;
         let start = self.beat(a, when, here, Act::Die(method));
+        // A real death takes the stage, wherever it is, with a title card if it moved there.
+        if self.sessions[s].rehearsal.is_none() {
+            if elsewhere {
+                self.view.switched_at = Some(at);
+            }
+            let until = self.view.dying.filter(|d| d.0 == s).map_or(0, |d| d.1);
+            self.view.dying = Some((s, until.max(start + DYING)));
+        }
         let c = &mut self.actors[a];
         c.death = Some(DeathFact { at: start, nth });
         c.noticed_at = start;
@@ -1400,6 +1448,24 @@ impl Mori {
         self.sessions[s].moments.retain(|m| m.section != Section::Closed);
         let start = self.beat(a, at, here, Act::Sleep);
         self.say(a, start, Section::Reaped, When::Always, 2, false);
+    }
+
+    /// Stopped, then compacted and carrying on in the same chat, or asked for something new: it
+    /// starts over with a clean record, as the engine starts it, and gets up if it was down.
+    fn renew(&mut self, a: usize, at: i64, section: Section) {
+        let c = &mut self.actors[a];
+        // Once its death has played, if it's still dying.
+        let at = if c.alive { at } else { at.max(c.locked) };
+        c.press(at, 0.0);
+        c.kill = None;
+        c.asleep = false;
+        c.noticed_at = at;
+        if !c.alive {
+            c.alive = true;
+            let here = c.spot;
+            self.beat(a, at, here, Act::Rise);
+        }
+        self.say(a, at, section, When::Always, 2, false);
     }
 
     fn wake(&mut self, a: usize, at: i64) {

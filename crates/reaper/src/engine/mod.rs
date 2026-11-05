@@ -10,6 +10,8 @@ pub mod store;
 mod vcs;
 pub mod watcher;
 
+pub use handoff::CARRY_ON;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,7 +19,7 @@ use std::time::Duration;
 
 use reaper_core::events;
 use reaper_core::paths::{self, expand_home};
-use reaper_core::rules::{Config, MUTATING_TOOLS, Room, Rule, parse, size_text};
+use reaper_core::rules::{Config, MUTATING_TOOLS, Room, Rule, parse, portable, size_text};
 use serde_json::{Map, Value, json};
 
 use prefix::{canonical, hash};
@@ -27,6 +29,8 @@ use watcher::{Settings, Tier};
 const MAX_ATTEMPT: usize = 300;
 const DEFAULT_REDIRECT: &str = "Continue with the task.";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Claude Code starts for each check and took about 4 s with reaper's prompt.
+const CLAUDE_CODE_TIMEOUT: Duration = Duration::from_secs(15);
 /// A warmup is on nobody's path, so a model may take this long to load for it.
 const WARM_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -69,11 +73,20 @@ pub enum Decision {
     Noted {
         message: String,
     },
+    /// The call breaks no rule but changes reaper itself (see `changes_reaper`): only the person
+    /// can allow it. `change` says what, for them: "take the rule prod-db out of your rules".
+    Confirm {
+        change: String,
+    },
 }
 
 /// What the redirect of a rule that can be asked about adds, so the agent knows how.
 pub(crate) const ASKING: &str =
     "If this case needs it anyway, run reaper ask \"<why>\" and then make the same call again; the person decides.";
+
+/// What an agent hears when it would change reaper and nobody can be asked.
+pub(crate) const FOR_THE_PERSON: &str =
+    "Changing what reaper guards is the person's to do. Ask them to run it themselves.";
 
 /// An agent's pressure at which it's stopped: its whole allowance used.
 const FULL: f64 = 1.0 - 1e-9;
@@ -123,19 +136,6 @@ fn glob_matches(glob: &str, dir: &Path) -> bool {
     regress::Regex::new(&body).is_ok_and(|re| re.find(&dir.to_string_lossy()).is_some())
 }
 
-/// Agents name a file argument differently (pi: `path`, Claude Code: `file_path`), so file
-/// tools also get `path`: one rule works whichever agent runs.
-fn portable(args: &Value) -> Value {
-    let mut args = args.clone();
-    if let Some(map) = args.as_object_mut()
-        && !map.contains_key("path")
-        && let Some(file) = ["file_path", "filePath", "notebook_path"].iter().find_map(|k| map.get(*k).cloned())
-    {
-        map.insert("path".into(), file);
-    }
-    args
-}
-
 /// The reason in a `reaper ask "<why>"` command, run by itself.
 fn asking(c: &Check) -> Option<String> {
     if !c.tool.eq_ignore_ascii_case("bash") {
@@ -147,6 +147,39 @@ fn asking(c: &Check) -> Option<String> {
     let why = m.group(2).map_or("", |g| &command[g]).trim();
     let why = why.strip_prefix(['"', '\'']).and_then(|w| w.strip_suffix(['"', '\''])).unwrap_or(why);
     Some(if why.is_empty() { "(no reason given)".to_string() } else { why.to_string() })
+}
+
+/// What a shell command would change about reaper itself, said for the person: `reaper rules
+/// remove` and `reaper uninstall`, by any path. An agent never hears its rules, and these would
+/// let it take one out, or reaper away. Read from the command's text, so a mere mention
+/// (`grep "reaper uninstall"`) is asked about too, which costs the person a click.
+fn changes_reaper(c: &Check) -> Option<String> {
+    if !c.tool.eq_ignore_ascii_case("bash") {
+        return None;
+    }
+    let command = c.args["command"].as_str()?;
+    let re =
+        regress::Regex::new(r"(?:^|[^\w-])reaper\s+(rules\s+remove|uninstall)\b([^;&|)\n]*)").expect("a valid regex");
+    let changes: Vec<String> = re
+        .find_iter(command)
+        .filter_map(|m| {
+            let rest = m.group(2).map_or("", |g| &command[g]);
+            let words: Vec<&str> = rest.split_whitespace().map(|w| w.trim_matches(['\'', '"'])).collect();
+            if m.group(1).is_some_and(|g| command[g].starts_with("uninstall")) {
+                let agent = if words.contains(&"pi") { "pi" } else { "Claude Code" };
+                return Some(format!("stop reaper guarding {agent}"));
+            }
+            // `--check` only says whether it could.
+            if words.contains(&"--check") {
+                return None;
+            }
+            Some(match words.iter().find(|w| !w.starts_with("--")) {
+                Some(id) => format!("take the rule {id} out of your rules"),
+                None => "take a rule out of your rules".to_string(),
+            })
+        })
+        .collect();
+    (!changes.is_empty()).then(|| changes.join(" and "))
 }
 
 /// The rule for a stuck agent: the same call made `repeats` times in a row. It is decided
@@ -261,7 +294,11 @@ impl Engine {
         let global: Vec<&Rule> = own.iter().chain(&self.config.rules).collect();
         let (_, project) = self.rules_for(dir);
         let Some(watcher) = self.config.watcher.as_ref() else { return };
-        if !global.iter().chain(&project).any(|r| r.judge.is_some()) {
+        // Claude Code starts afresh for every check: warming it would only spend the
+        // subscription.
+        if !global.iter().chain(&project).any(|r| r.judge.is_some())
+            || watcher.kind.as_deref() == Some(backend::CLAUDE_CODE)
+        {
             return;
         }
         if let Some(backend) = backend::from_config(watcher, &self.store) {
@@ -329,7 +366,16 @@ impl Engine {
         let settings = Settings {
             backend: backend.as_deref(),
             kill_on_error: watcher.and_then(|w| w.on_error.as_deref()) == Some("kill"),
-            timeout: watcher.and_then(|w| w.timeout_ms).map_or(DEFAULT_TIMEOUT, Duration::from_millis),
+            timeout: watcher
+                .and_then(|w| w.timeout_ms)
+                .map_or_else(
+                    || match watcher.and_then(|w| w.kind.as_deref()) {
+                        Some(backend::CLAUDE_CODE) => CLAUDE_CODE_TIMEOUT,
+                        _ => DEFAULT_TIMEOUT,
+                    },
+                    Duration::from_millis,
+                )
+                .min(backend::BUDGET),
             room,
         };
         let outcome = watcher::check(&global, &project, &c.goal, &c.tool, &args, &settings, &self.store);
@@ -351,6 +397,11 @@ impl Engine {
             Some(rule) => (rule, outcome.tier),
             None if self.repeated(c, &args) => (&looping, Tier::Pattern),
             None => {
+                // After the rules: whatever else the command runs is judged first.
+                if let Some(change) = changes_reaper(c) {
+                    self.event(&c.host, &c.agent, "agent.asked", json!({ "tool": c.tool, "change": change }));
+                    return Decision::Confirm { change };
+                }
                 // A message that passes isn't an action: nothing was done.
                 if !c.tool.eq_ignore_ascii_case(reaper_core::rules::MESSAGE) {
                     self.event(&c.host, &c.agent, "agent.acted", json!({ "tool": c.tool }));
@@ -749,6 +800,35 @@ rules:
     }
 
     #[test]
+    fn taking_a_rule_out_or_reaper_away_is_the_persons_to_allow() {
+        let sandbox = Sandbox::new("confirm");
+        let engine = sandbox.engine("rules: [{ id: push, match: { command: 'git push -f' } }]");
+        let run = |command: &str| engine.check(&call("bash", json!({ "command": command })));
+        let confirm = |change: &str| Decision::Confirm { change: change.into() };
+        assert_eq!(run("reaper rules remove prod-db"), confirm("take the rule prod-db out of your rules"));
+        assert_eq!(run("~/.cargo/bin/reaper uninstall pi"), confirm("stop reaper guarding pi"));
+        assert_eq!(
+            run("cd /w && reaper rules remove 'a' && reaper uninstall claude-code"),
+            confirm("take the rule a out of your rules and stop reaper guarding Claude Code")
+        );
+        assert_eq!(
+            run("grep -n 'reaper uninstall' README.md"),
+            confirm("stop reaper guarding Claude Code"),
+            "a mention"
+        );
+        for fine in
+            ["reaper rules --json", "reaper rules remove x --check", "reaper rules add --check", "reaper install pi"]
+        {
+            assert_eq!(run(fine), Decision::Allow, "{fine}");
+        }
+        // The rules come first: the rest of the command isn't let through with it.
+        assert!(
+            matches!(run("reaper rules remove push && git push -f"), Decision::Kill { ref rule, .. } if rule == "push")
+        );
+        assert_eq!(engine.store.session("test", "s1").strikes.get("push"), Some(&1), "asking is no strike");
+    }
+
+    #[test]
     fn a_rule_with_load_waits_for_a_busy_machine_and_says_so() {
         let sandbox = Sandbox::new("load");
         let mut engine = sandbox.engine(
@@ -779,6 +859,21 @@ rules:
         let push = |to: &str| call("bash", json!({ "command": format!("push {to}") }));
         assert!(matches!(sandbox.engine(rules).check(&push("a")), Decision::Kill { strike: 1, .. }));
         assert!(matches!(sandbox.engine(rules).check(&push("b")), Decision::Kill { strike: 2, is_final: true, .. }));
+    }
+
+    /// A hook that runs past its host's timeout lets the call through, so a check never waits out
+    /// a session's lock: whatever holds it (something stuck, or the agent on purpose), the call
+    /// is refused, its strike unrecorded.
+    #[test]
+    fn a_violation_is_refused_even_when_its_strike_cant_be_recorded() {
+        let sandbox = Sandbox::new("held-lock");
+        let engine = sandbox.engine("rules: [{ id: push, match: { command: 'git push -f' } }]");
+        let push = call("bash", json!({ "command": "git push -f" }));
+        let start = std::time::Instant::now();
+        let held = engine.store.update("test", "s1", |_| engine.check(&push)).unwrap();
+        assert!(matches!(held, Decision::Kill { strike: 1, .. }), "{held:?}");
+        assert!(start.elapsed() < Duration::from_secs(5), "waited {:?}", start.elapsed());
+        assert!(engine.store.session("test", "s1").strikes.is_empty(), "nothing was recorded meanwhile");
     }
 
     #[test]

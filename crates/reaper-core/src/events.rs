@@ -86,7 +86,18 @@ pub enum Kind {
         redirect: String,
     },
     #[serde(rename = "agent.died")]
-    Died { rule: String, reason: DeathReason },
+    Died {
+        rule: String,
+        reason: DeathReason,
+        /// What the human is to type to carry its work on (`/compact`, `/clear`), when it waits
+        /// for them. Absent when it doesn't, and in logs from before.
+        #[serde(default)]
+        carry_on: Option<String>,
+    },
+    /// Stopped by reaper, it was started over with a clean record: the human asked it for
+    /// something new, or, left to run by itself (Claude Code's auto mode), reaper carried it on.
+    #[serde(rename = "agent.revived")]
+    Revived,
     #[serde(rename = "agent.idle")]
     Idle,
     /// Waiting on the human mid-turn: a permission prompt, or a question it put to them. Whatever
@@ -264,6 +275,8 @@ mod tests {
         assert_eq!(old.kind, Kind::Redirected { rule: "r".into(), redirect: String::new() });
         let asked = parse_line(r#"{"at":1,"host":"claude-code","agent":"a","type":"agent.asked"}"#).unwrap();
         assert_eq!(asked.kind, Kind::Asked);
+        let revived = parse_line(r#"{"at":1,"host":"claude-code","agent":"a","type":"agent.revived"}"#).unwrap();
+        assert_eq!(revived.kind, Kind::Revived);
         let took_over = parse_line(r#"{"at":1,"host":"pi","agent":"b","type":"agent.spawned","dir":"/w","after":"a"}"#);
         assert!(matches!(took_over.unwrap().kind, Kind::Spawned { after: Some(a), parent: None, .. } if a == "a"));
         let before = parse_line(r#"{"at":1,"host":"pi","agent":"b","type":"agent.spawned","dir":"/w"}"#).unwrap();

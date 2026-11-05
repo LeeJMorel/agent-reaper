@@ -90,6 +90,13 @@ describe("talking to the reaper binary", () => {
     })
   })
 
+  test("taking a rule out comes back for the person to allow", async () => {
+    assert.deepEqual(await check("reaper rules remove push"), {
+      kind: "confirm",
+      change: "take the rule push out of your rules",
+    })
+  })
+
   test("events land in the log the console reads", async () => {
     // Idle sessions are reaped after five minutes unless the rules say otherwise.
     assert.deepEqual(await askReaper({ op: "event", host: "pi", agent: "s1", type: "agent.idle" }), {

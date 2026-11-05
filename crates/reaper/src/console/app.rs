@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use reaper_core::EXAMPLE_RULES;
 use reaper_core::draft;
 use reaper_core::lint::{Issue, Level, lint};
 use reaper_core::mori::Mori;
@@ -22,6 +21,7 @@ use reaper_core::state::{Agent, Kill, Model, QUIET_FOR, Status};
 use reaper_core::tail::{Tail, Update};
 
 use super::mori::Colors;
+use super::watcher::{self, Choice};
 use super::writer::{Proposal, Writer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +88,13 @@ pub struct App {
     /// When memento mori next wants a frame, as of the last one drawn.
     pub mori_next: Cell<Option<i64>>,
     pub colors: Colors,
-    /// Memento mori shows the followed session's whole prompt, not just its start.
+    /// Memento mori shows everything the followed session was asked, not just the start of the
+    /// latest.
     pub prompt_open: bool,
+    /// Rows the open prompts are scrolled up from the latest.
+    pub prompt_scroll: usize,
+    /// How far up they go, as last drawn: 0 when they all fit.
+    pub prompt_back: Cell<usize>,
     /// The agents reaper is installed in, by name.
     pub guarded: Vec<&'static str>,
     /// The agent that writes rules from the human's own words, if there's one here.
@@ -100,6 +105,8 @@ pub struct App {
     writing: Option<(String, Receiver<Result<Proposal, String>>)>,
     /// A written rule, tried, waiting for the human to add it or drop it.
     pub proposal: Option<Proposal>,
+    /// Choosing the watcher: what this machine has, and the one selected.
+    pub watcher_pick: Option<(Vec<Choice>, usize)>,
     /// A fixed memento mori clock, for frames printed by `--dump` and for tests.
     clock: Option<i64>,
     dirty: bool,
@@ -128,11 +135,14 @@ impl App {
             mori_next: Cell::new(None),
             colors: Colors::detect(),
             prompt_open: false,
+            prompt_scroll: 0,
+            prompt_back: Cell::new(0),
             guarded: Vec::new(),
             writer: None,
             asking: None,
             writing: None,
             proposal: None,
+            watcher_pick: None,
             clock: None,
             dirty: true,
         };
@@ -270,6 +280,11 @@ impl App {
             self.dirty = true;
             return Command::Nothing;
         }
+        if self.watcher_pick.is_some() {
+            self.pick_key(key.code);
+            self.dirty = true;
+            return Command::Nothing;
+        }
         if self.tab == Tab::Mori && self.mori_key(key.code) {
             self.dirty = true;
             return Command::Nothing;
@@ -298,6 +313,7 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.step(isize::MAX),
             KeyCode::Char('e') => return self.edit(),
             KeyCode::Char('n') if self.tab == Tab::Rules => self.new_rule(),
+            KeyCode::Char('w') if self.tab == Tab::Rules => self.open_watcher(watcher::choices),
             KeyCode::Enter if self.tab == Tab::Rules && self.proposal.is_some() => self.add_proposal(),
             KeyCode::Esc if self.tab == Tab::Rules && (self.proposal.is_some() || self.writing.is_some()) => {
                 self.proposal = None;
@@ -312,9 +328,21 @@ impl App {
     /// Keys with their own meaning in memento mori. False for the rest, which work as anywhere.
     fn mori_key(&mut self, code: KeyCode) -> bool {
         let now = self.mori_now();
+        let scrolls = self.prompt_open && self.prompt_back.get() > 0;
         match code {
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.mori.switch(1, now),
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.mori.switch(-1, now),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                self.prompt_scroll = 0;
+                self.mori.switch(1, now);
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.prompt_scroll = 0;
+                self.mori.switch(-1, now);
+            }
+            // The prompts cover the level, so there's nobody to pick while they're open.
+            KeyCode::Up | KeyCode::Char('k') if scrolls => self.scroll_prompts(1),
+            KeyCode::Down | KeyCode::Char('j') if scrolls => self.scroll_prompts(-1),
+            KeyCode::PageUp if scrolls => self.scroll_prompts(PAGE),
+            KeyCode::PageDown if scrolls => self.scroll_prompts(-PAGE),
             KeyCode::Up | KeyCode::Char('k') => self.mori.pick(1, now),
             KeyCode::Down | KeyCode::Char('j') => self.mori.pick(-1, now),
             KeyCode::Esc => {
@@ -328,7 +356,10 @@ impl App {
                 self.pane = Pane::Agents;
                 self.agent_sel = Some(id);
             }
-            KeyCode::Char('p') => self.prompt_open = !self.prompt_open,
+            KeyCode::Char('p') => {
+                self.prompt_open = !self.prompt_open;
+                self.prompt_scroll = 0;
+            }
             // A death for fun, played by stand-ins on a level of their own.
             KeyCode::Char('d') => {
                 self.mori.rehearse(now);
@@ -336,6 +367,12 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// Up is back to the older ones.
+    fn scroll_prompts(&mut self, delta: isize) {
+        let back = self.prompt_back.get();
+        self.prompt_scroll = self.prompt_scroll.min(back).saturating_add_signed(delta).min(back);
     }
 
     fn step(&mut self, delta: isize) {
@@ -437,6 +474,53 @@ impl App {
         self.notify(format!("Added {id}. Agents pick it up on their next action."), false);
     }
 
+    /// The watchers this machine has, the current one selected.
+    fn open_watcher(&mut self, choices: fn(Option<&reaper_core::rules::Watcher>) -> Vec<Choice>) {
+        let current = self.rules.config.watcher.as_ref();
+        let choices = choices(current);
+        let at = choices.iter().position(|c| c.is(current)).unwrap_or(0);
+        self.watcher_pick = Some((choices, at));
+    }
+
+    fn pick_key(&mut self, code: KeyCode) {
+        let Some((choices, at)) = self.watcher_pick.as_mut() else { return };
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => *at = at.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *at = (*at + 1).min(choices.len() - 1),
+            KeyCode::Esc => self.watcher_pick = None,
+            KeyCode::Enter => self.set_watcher(),
+            _ => {}
+        }
+    }
+
+    /// Writes the chosen watcher in. What happens when it can't answer (`onError`) stays as
+    /// the human set it; how long it may take goes back to the default for its kind.
+    fn set_watcher(&mut self) {
+        let Some((choices, at)) = self.watcher_pick.take() else { return };
+        let choice = &choices[at];
+        let mut picked = choice.watcher.clone();
+        if let (Some(w), Some(old)) = (picked.as_mut(), self.rules.config.watcher.as_ref()) {
+            w.on_error.clone_from(&old.on_error);
+        }
+        let text = match draft::set_watcher(&self.rules.text, picked.as_ref()) {
+            Ok(text) => text,
+            Err(e) => return self.notify(format!("Couldn't set the watcher: {e}."), true),
+        };
+        if let Err(e) = draft::save(&self.rules.path, &text) {
+            return self.notify(format!("Couldn't write {}: {e}", tilde(&self.rules.path)), true);
+        }
+        self.rules.refresh();
+        self.issues = lint(&self.rules.config);
+        let backup =
+            picked.as_ref().and_then(|w| w.fallback.first()).and_then(|f| choices.iter().find(|c| c.is(Some(f))));
+        let said = match (&picked, backup) {
+            (None, _) => "Watcher off: judged rules don't run.".to_string(),
+            (Some(_), Some(backup)) => format!("Watcher: {}, and {} when it can't answer.", choice.name, backup.name),
+            (Some(_), None) => format!("Watcher: {}.", choice.name),
+        };
+        self.notify(said, false);
+    }
+
     fn edit(&mut self) -> Command {
         if !self.rules.exists {
             match create_example(&self.rules.path) {
@@ -495,9 +579,11 @@ impl App {
     /// they can be resumed. Anyone quiet for half a day has most likely ended unheard, and goes
     /// too, until they do something.
     pub fn agents(&self) -> Vec<&Agent> {
+        // The dead leave the list a while after, unless their work is waiting for the human.
         let gone = |a: &&Agent| {
             let quiet = self.now - a.last_at;
-            quiet >= QUIET_FOR || matches!(a.status, Status::Dead | Status::Ended) && quiet >= DEAD_FOR
+            let over = matches!(a.status, Status::Dead | Status::Ended) && a.waits_for.is_none();
+            quiet >= QUIET_FOR || over && quiet >= DEAD_FOR
         };
         let mut agents: Vec<&Agent> = self.model.agents.iter().filter(|a| !gone(a)).collect();
         let sinks = |a: &Agent| matches!(a.status, Status::Dead | Status::Reaped | Status::Ended);
@@ -582,13 +668,14 @@ fn create_example(path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::OpenOptions::new().write(true).create_new(true).open(path)?.write_all(EXAMPLE_RULES.as_bytes())
+    fs::OpenOptions::new().write(true).create_new(true).open(path)?.write_all(draft::starter().as_bytes())
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyEventState;
+    use reaper_core::EXAMPLE_RULES;
 
     pub fn fixture() -> App {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -746,6 +833,45 @@ pub mod tests {
     }
 
     #[test]
+    fn the_watcher_is_chosen_from_what_this_machine_has() {
+        fn here(_: Option<&reaper_core::rules::Watcher>) -> Vec<Choice> {
+            let mut claude = reaper_core::rules::Watcher::new(Some("claude-code"), None, "claude-haiku-5-5");
+            let ollama = reaper_core::rules::Watcher::new(None, Some("http://localhost:11434/v1"), "qwen3:4b");
+            claude.fallback.push(ollama.clone());
+            let choice = |name: &str, watcher| Choice { name: name.into(), about: String::new(), watcher };
+            vec![choice("Claude Code", Some(claude)), choice("Ollama", Some(ollama)), choice("None", None)]
+        }
+        let dir = std::env::temp_dir().join(format!("reaper-console-watcher-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules.yaml");
+        fs::write(&rules, EXAMPLE_RULES).unwrap();
+        let mut app = App::new(rules.clone(), dir.join("events.jsonl"));
+        app.tab = Tab::Rules;
+        app.open_watcher(here);
+        assert_eq!(app.watcher_pick.as_ref().map(|(_, at)| *at), Some(1), "the example's Ollama watcher");
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.watcher_pick.is_some(), "q doesn't quit from here");
+        app.on_key(key(KeyCode::Enter));
+
+        let watcher = app.rules.config.watcher.as_ref().unwrap();
+        assert_eq!((watcher.kind.as_deref(), watcher.fallback.len()), (Some("claude-code"), 1));
+        assert_eq!(watcher.on_error.as_deref(), Some("allow"), "kept from before");
+        assert_eq!(app.rules.config.rules.len(), reaper_core::rules::parse(EXAMPLE_RULES).unwrap().rules.len());
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.text == "Watcher: Claude Code, and Ollama when it can't answer.")
+        );
+
+        app.open_watcher(here);
+        app.on_key(key(KeyCode::End));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.rules.config.watcher.is_none(), "turned off");
+    }
+
+    #[test]
     fn edit_goes_to_a_syntax_error_first_and_a_missing_file_is_created() {
         let dir = std::env::temp_dir().join(format!("reaper-console-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -755,7 +881,8 @@ pub mod tests {
 
         app.tab = Tab::Rules;
         assert!(matches!(app.on_key(key(KeyCode::Char('e'))), Command::Edit { .. }));
-        assert_eq!(fs::read_to_string(&rules).unwrap(), EXAMPLE_RULES, "created from the example");
+        assert_eq!(fs::read_to_string(&rules).unwrap(), draft::starter(), "created from the example");
+        assert!(app.rules.config.projects.is_empty(), "its sample project is only an illustration");
 
         fs::write(&rules, "rules:\n  - id: a\n    match: { command: [oops\n").unwrap();
         app.tick();

@@ -4,6 +4,7 @@
 //! but Claude Code hooks can't remove the attempt from the conversation. Claude's replies are
 //! judged when it stops, by the rules that list `message`.
 
+mod inject;
 pub mod install;
 pub mod watch;
 
@@ -15,17 +16,26 @@ use serde_json::{Value, json};
 
 use reaper_core::rules::MESSAGE;
 
-use crate::engine::{Check, Decision, Engine};
+use crate::engine::{CARRY_ON, Check, Decision, Engine, FOR_THE_PERSON};
 
 pub const HOST: &str = "claude-code";
 
 /// What the human sees when a session is stopped. Claude sees it too if the conversation
 /// continues, so it names no rule.
 const STOPPED: &str = "reaper stopped this session. The reaper console shows why.";
-/// The same, when its work waits for a fresh session to take it over.
+/// For the human, in a terminal, when its work waits for a fresh session to take it over.
 const HANDED_ON: &str = "reaper stopped this session. /clear starts a fresh one that takes its work over.";
+/// The same in a chat (the editor's, an app's), where carrying on means staying in it.
+const COMPACT_ON: &str = "reaper stopped this session. /compact, and it carries on here with a clean slate.";
+/// For the human, when a session left to run by itself was started over without them.
+const CARRIED_ON: &str =
+    "reaper: this session kept breaking rules, so it was started over with a clean slate. It carries on by itself.";
+/// The same, when reaper could compact it too: it carries on once that's done.
+const COMPACTING: &str = "reaper: this session kept breaking rules, so it's being compacted and started over with a clean slate. It carries on by itself.";
 /// Shown in a terminal's fresh session: Claude has the handoff, and starts when the human says.
 const TAKING_OVER: &str = "reaper: this session takes over the stopped one's work. Send any message to start it.";
+/// Shown once a stopped session is compacted: the same, in the same chat.
+const CARRYING_ON: &str = "reaper: this session carries on its work with a clean slate. Send any message to start it.";
 /// A `/clear` ends one session and starts the next straight away; a note older than this is stale.
 const CLEARING: Duration = Duration::from_secs(60);
 
@@ -33,12 +43,23 @@ fn deny(reason: &str) -> Value {
     json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })
 }
 
-/// Denied, and the agent making the call stops.
-fn stop(reason: &str) -> Value {
+/// Denied, and the agent making the call stops. `note` is for the human: how to carry it on.
+fn stop(note: Option<&str>) -> Value {
     let mut output = deny("Stopped.");
     output["continue"] = false.into();
-    output["stopReason"] = reason.into();
+    output["stopReason"] = STOPPED.into();
+    if let Some(note) = note {
+        output["systemMessage"] = note.into();
+    }
     output
+}
+
+/// How a session ends when reaper stops it.
+enum Ending {
+    /// Stopped; with what the human is to type to carry it on, when its work waits for them.
+    Stop(Option<&'static str>),
+    /// Left to run by itself, it carries on at once with a clean record, and hears this.
+    CarryOn(String),
 }
 
 /// How this Claude Code was started: `cli` in a terminal, `claude-vscode` in the editor,
@@ -55,6 +76,12 @@ fn cleared_from(engine: &Engine) -> Option<String> {
     let from = fs::read_to_string(&note).ok();
     let _ = fs::remove_file(&note);
     from.filter(|_| fresh.is_some_and(|age| age < CLEARING))
+}
+
+/// Run with nobody to approve its calls, so nobody to carry it on either: auto mode, and the
+/// modes that never ask.
+fn unattended(event: &Value) -> bool {
+    matches!(event["permission_mode"].as_str(), Some("auto" | "bypassPermissions" | "dontAsk"))
 }
 
 /// For sessions that started before reaper was installed, so no `UserPromptSubmit` recorded
@@ -225,8 +252,10 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
         };
         engine.check(&check)
     };
-    // What the human is told. A session's main agent, in a Claude Code someone is sitting at,
-    // leaves its work for a fresh session to take over.
+    // A session's main agent, in a Claude Code someone runs by hand, isn't just stopped. Left to
+    // run by itself (auto mode) it carries on at once, with a clean record. Otherwise its work
+    // waits for the human, who is told (not the stopped session) what to type to carry it on,
+    // and so is the console.
     let died = |rule: &str, together: bool| {
         let stops = engine.config.all_rules().any(|(_, r)| r.id == rule && r.stops());
         let reason = if together {
@@ -236,16 +265,49 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
         } else {
             "strikes"
         };
-        engine.event(HOST, agent, "agent.died", json!({ "rule": rule, "reason": reason }));
         let attended = !entrypoint.is_empty() && !entrypoint.starts_with("sdk");
-        let handed = agent == session && attended && engine.hand_on(HOST, agent, rule, &goal(), &dir).is_some();
-        if handed { HANDED_ON } else { STOPPED }
+        let main = agent == session && attended;
+        let mut fields = json!({ "rule": rule, "reason": reason });
+        if main && unattended(event) {
+            engine.event(HOST, agent, "agent.died", fields);
+            // Compacted, where reaper can type `/compact` into it, and set going again once that's
+            // done (see SessionStart). Elsewhere it carries on as it is, with a clean record.
+            if engine.hand_on(HOST, agent, rule, &goal(), &dir).is_some()
+                && claude_pid().is_some_and(|pid| inject::send(pid, "/compact"))
+            {
+                let _ = engine.store.update(HOST, agent, |s| s.compacting = true);
+                return Ending::Stop(Some(COMPACTING));
+            }
+            return engine.carry_on(HOST, agent, rule, &goal(), &dir).map_or(Ending::Stop(None), Ending::CarryOn);
+        }
+        let (command, note) = if entrypoint == "cli" { ("/clear", HANDED_ON) } else { ("/compact", COMPACT_ON) };
+        let waits = main && engine.hand_on(HOST, agent, rule, &goal(), &dir).is_some();
+        if waits {
+            fields["carry_on"] = command.into();
+        }
+        engine.event(HOST, agent, "agent.died", fields);
+        Ending::Stop(waits.then_some(note))
     };
 
-    let end_turn = |rule: &str, together: bool| {
-        let reason = died(rule, together);
-        engine.event(HOST, agent, "agent.idle", json!({}));
-        Some(json!({ "continue": false, "stopReason": reason }))
+    let end_turn = |rule: &str, together: bool| match died(rule, together) {
+        Ending::Stop(note) => {
+            engine.event(HOST, agent, "agent.idle", json!({}));
+            let mut output = json!({ "continue": false, "stopReason": STOPPED });
+            if let Some(note) = note {
+                output["systemMessage"] = note.into();
+            }
+            Some(output)
+        }
+        Ending::CarryOn(work) => Some(json!({ "decision": "block", "reason": work, "systemMessage": CARRIED_ON })),
+    };
+    // Its call is refused either way: stopped, or told its work instead.
+    let refused = |ending: Ending| match ending {
+        Ending::Stop(note) => stop(note),
+        Ending::CarryOn(work) => {
+            let mut output = deny(&work);
+            output["systemMessage"] = CARRIED_ON.into();
+            output
+        }
     };
 
     match event["hook_event_name"].as_str()? {
@@ -254,25 +316,49 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
             if event["source"] == "resume" {
                 let _ = engine.store.update(HOST, agent, |s| s.announced = false);
             }
-            // After a `/clear` of a stopped session, this one takes its work over.
-            let after = (event["source"] == "clear").then(|| cleared_from(engine)).flatten();
+            // After a `/clear` of a stopped session, this one takes its work over. After a
+            // `/compact` of one, it takes its own work over, in the same chat: announced again,
+            // as having taken over from itself.
+            let compacted = event["source"] == "compact" && engine.store.session(HOST, session).handoff.is_some();
+            let after = match event["source"].as_str() {
+                Some("clear") => cleared_from(engine),
+                Some("compact") if compacted => {
+                    let _ = engine.store.update(HOST, agent, |s| s.announced = false);
+                    Some(session.to_string())
+                }
+                _ => None,
+            };
             announce(event["model"].as_str(), after.as_deref());
             // A new session takes memory: idle pi sessions make room if it's short.
             engine.relieve(false);
             let work = engine.take_over(HOST, session, after.as_deref()?)?;
-            // Only Claude Code run by a program sends a hook's first message; in a terminal, the
-            // handoff waits in context for the human's.
-            Some(if entrypoint == "cli" {
-                json!({ "systemMessage": TAKING_OVER, "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": work } })
+            // Only Claude Code run by a program sends a hook's first message, and only as it
+            // starts; otherwise the handoff waits in context for the human's.
+            // Compacted by reaper because nobody was there: reaper sets it going again too.
+            let ours = compacted && engine.store.session(HOST, session).compacting;
+            if ours {
+                let _ = engine.store.update(HOST, session, |s| s.compacting = false);
+            }
+            let going = ours && claude_pid().is_some_and(|pid| inject::send(pid, CARRY_ON));
+            let note = match (compacted, going) {
+                (true, true) => "reaper: compacted, this session carries on its work with a clean slate.",
+                (true, false) => CARRYING_ON,
+                _ => TAKING_OVER,
+            };
+            Some(if entrypoint == "cli" || compacted {
+                json!({ "systemMessage": note, "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": work } })
             } else {
                 json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "initialUserMessage": work } })
             })
         }
         "UserPromptSubmit" => {
-            if let Some(prompt) = event["prompt"].as_str() {
+            // reaper's own line, setting a compacted session going again, isn't the task.
+            if let Some(prompt) = event["prompt"].as_str().filter(|p| p.trim() != CARRY_ON) {
                 let _ = engine.store.update(HOST, session, |s| s.goal = Some(prompt.to_string()));
             }
             engine.restart(HOST, session);
+            // Before its first call: the prompt itself is kept by an engine nobody waits for.
+            engine.revive(HOST, session);
             None
         }
         "PreToolUse" => {
@@ -289,8 +375,8 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
                     engine.event(HOST, agent, "agent.redirected", json!({ "rule": rule, "redirect": redirect }));
                     Some(deny(&redirect))
                 }
-                Decision::Kill { rule, is_final: true, .. } => Some(stop(died(&rule, false))),
-                Decision::Stopped { rule } => Some(stop(died(&rule, true))),
+                Decision::Kill { rule, is_final: true, .. } => Some(refused(died(&rule, false))),
+                Decision::Stopped { rule } => Some(refused(died(&rule, true))),
                 // Claude Code's own permission prompt: only the person can answer it.
                 Decision::Ask { rule, redirect, why } => Some(json!({
                     "hookSpecificOutput": {
@@ -300,6 +386,20 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
                     }
                 })),
                 Decision::Noted { message } => Some(deny(&message)),
+                // Changing reaper itself: the person decides, in the same prompt. A session that
+                // never prompts can't ask them.
+                Decision::Confirm { .. }
+                    if matches!(event["permission_mode"].as_str(), Some("bypassPermissions" | "dontAsk")) =>
+                {
+                    Some(deny(FOR_THE_PERSON))
+                }
+                Decision::Confirm { change } => Some(json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "ask",
+                        "permissionDecisionReason": format!("reaper: the agent wants to {change}."),
+                    }
+                })),
             }
         }
         // A reply that breaks a rule doesn't end the turn: Claude carries on with the redirect.
@@ -402,6 +502,25 @@ mod tests {
     }
 
     #[test]
+    fn taking_a_rule_out_goes_to_the_person_in_claude_codes_own_prompt() {
+        let sandbox = Sandbox::new("cc-confirm");
+        let engine = sandbox.engine(RULES);
+        // Not `no-prod`: its own command would break it, and the rules come first.
+        let out = reply(&engine, &pre_tool_use("reaper rules remove force-push")).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "ask");
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecisionReason"],
+            "reaper: the agent wants to take the rule force-push out of your rules."
+        );
+        // Nobody to ask: refused, and the agent hears whose it is.
+        for mode in ["bypassPermissions", "dontAsk"] {
+            let mut event = pre_tool_use("reaper uninstall claude-code");
+            event["permission_mode"] = mode.into();
+            assert_eq!(reply(&engine, &event).unwrap(), deny(FOR_THE_PERSON), "{mode}");
+        }
+    }
+
+    #[test]
     fn the_strike_limit_stops_the_session_without_naming_the_rule() {
         let sandbox = Sandbox::new("cc-stop");
         let engine = sandbox.engine(RULES);
@@ -433,7 +552,10 @@ mod tests {
         let sandbox = Sandbox::new("cc-handoff");
         let engine = sandbox.engine(RULES);
         let stopped = stopped_and_cleared(&engine);
-        assert_eq!(stopped["stopReason"], HANDED_ON);
+        // The human hears how to carry it on; the stopped session only that it stopped.
+        assert_eq!((&stopped["systemMessage"], &stopped["stopReason"]), (&json!(HANDED_ON), &json!(STOPPED)));
+        let log = std::fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
+        assert!(log.contains(r#""carry_on":"/clear""#), "the console hears it too: {log}");
 
         let out = reply(&engine, &hook("SessionStart", "s2", json!({ "source": "clear" }))).unwrap();
         assert_eq!(out["systemMessage"], TAKING_OVER);
@@ -454,6 +576,37 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_session_compacted_in_a_chat_carries_on_its_own_work_with_a_clean_slate() {
+        let sandbox = Sandbox::new("cc-handoff-compact");
+        let engine = sandbox.engine(RULES);
+        engine.prompted(HOST, "s1", "Load the fixtures.");
+        reply_in(&engine, &pre_tool_use("psql prod"), "claude-vscode");
+        let stopped = reply_in(&engine, &pre_tool_use("psql prod"), "claude-vscode").unwrap();
+        assert_eq!(stopped["systemMessage"], COMPACT_ON, "in a chat, compacting is how it carries on");
+
+        let compact = hook("SessionStart", "s1", json!({ "source": "compact" }));
+        let out = reply_in(&engine, &compact, "claude-vscode").unwrap();
+        assert_eq!(out["systemMessage"], CARRYING_ON);
+        let work = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(work.contains("> Load the fixtures.") && work.ends_with("Use the staging database."), "{work}");
+        let log = std::fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
+        let spawned: Vec<Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|e: &Value| e["type"] == "agent.spawned")
+            .collect();
+        assert_eq!(
+            (&spawned.last().unwrap()["agent"], &spawned.last().unwrap()["after"]),
+            (&json!("s1"), &json!("s1"))
+        );
+        // A clean slate: the next slip is a first strike again, not the end.
+        let again = reply_in(&engine, &pre_tool_use("psql prod"), "claude-vscode").unwrap();
+        assert_eq!(again, deny("Use the staging database."), "{again}");
+        // Compacting any other time is just compacting.
+        assert_eq!(reply_in(&engine, &compact, "claude-vscode"), None);
+    }
+
+    #[test]
     fn claude_code_run_by_a_program_starts_on_the_handoff_by_itself() {
         let sandbox = Sandbox::new("cc-handoff-sdk");
         let engine = sandbox.engine(RULES);
@@ -462,6 +615,29 @@ mod tests {
             reply_in(&engine, &hook("SessionStart", "s2", json!({ "source": "clear" })), "claude-vscode").unwrap();
         assert!(out["hookSpecificOutput"]["initialUserMessage"].as_str().unwrap().contains("> Load the fixtures."));
         assert!(out.get("systemMessage").is_none());
+    }
+
+    #[test]
+    fn left_to_run_by_itself_a_stopped_session_carries_on_with_a_clean_slate() {
+        let sandbox = Sandbox::new("cc-carry-on");
+        let engine = sandbox.engine(RULES);
+        engine.prompted(HOST, "s1", "Load the fixtures.");
+        let auto = |command: &str| {
+            let mut event = pre_tool_use(command);
+            event["permission_mode"] = "auto".into();
+            reply_in(&engine, &event, "claude-vscode").unwrap()
+        };
+        auto("psql prod");
+        let out = auto("psql prod");
+        assert_eq!(out["continue"], Value::Null, "it isn't stopped");
+        assert_eq!(out["systemMessage"], CARRIED_ON, "the human is told");
+        let work = out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(work.contains("> Load the fixtures.") && work.ends_with("Use the staging database."), "{work}");
+        assert!(sandbox.events().ends_with(&["agent.killed".into(), "agent.died".into(), "agent.revived".into()]));
+        // A clean slate; and if it runs through that too before the human says anything, it stops.
+        assert_eq!(auto("psql prod"), deny("Use the staging database."));
+        let stopped = auto("psql prod");
+        assert_eq!((&stopped["continue"], stopped.get("systemMessage")), (&json!(false), None));
     }
 
     #[test]

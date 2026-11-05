@@ -84,6 +84,40 @@ pub struct Watcher {
     pub unknown: Unknown,
 }
 
+impl Watcher {
+    /// A watcher of `kind` (`None`: OpenAI-compatible) answering with `model`, at `base_url`
+    /// unless it's Claude Code.
+    pub fn new(kind: Option<&str>, base_url: Option<&str>, model: &str) -> Self {
+        Self {
+            kind: kind.map(str::to_string),
+            base_url: base_url.map(str::to_string),
+            model: Some(model.to_string()),
+            api_key_env: None,
+            timeout_ms: None,
+            cache_key: None,
+            on_error: None,
+            fallback: Vec::new(),
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// As in `reaper rules --json`: the file's own key names, unknown keys left out.
+    pub fn to_json(&self) -> Value {
+        let mut map = Map::new();
+        put(&mut map, "kind", self.kind.clone());
+        put(&mut map, "baseURL", self.base_url.clone());
+        put(&mut map, "model", self.model.clone());
+        put(&mut map, "apiKeyEnv", self.api_key_env.clone());
+        put(&mut map, "timeoutMs", self.timeout_ms);
+        put(&mut map, "cacheKey", self.cache_key);
+        put(&mut map, "onError", self.on_error.clone());
+        if !self.fallback.is_empty() {
+            map.insert("fallback".into(), self.fallback.iter().map(Watcher::to_json).collect());
+        }
+        map.into()
+    }
+}
+
 /// Freeing what idle sessions hold. A session waiting on the human is the one least likely
 /// to be needed soon, so it goes first, and without waiting for memory to run short: its
 /// conversation is on disk, and resuming it sends the same prefix, so a provider's prompt
@@ -276,6 +310,30 @@ impl Rule {
     }
 }
 
+/// Agents name file arguments differently, so file tools also get `path` (pi: `path`, Claude
+/// Code: `file_path`) and `content`: what the call writes, a write's content or an edit's new
+/// text, never the text it replaces. One rule works whichever agent runs.
+pub fn portable(args: &Value) -> Value {
+    let mut args = args.clone();
+    let Some(map) = args.as_object_mut() else { return args };
+    if !map.contains_key("path")
+        && let Some(file) = ["file_path", "filePath", "notebook_path"].iter().find_map(|k| map.get(*k).cloned())
+    {
+        map.insert("path".into(), file);
+    }
+    if !map.contains_key("content") {
+        let new = |call: &Map<String, Value>| {
+            ["new_string", "newText", "new_source"].iter().find_map(|k| call.get(*k)?.as_str().map(str::to_string))
+        };
+        let edits = map.get("edits").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_object);
+        let written: Vec<String> = new(map).into_iter().chain(edits.filter_map(new)).collect();
+        if !written.is_empty() {
+            map.insert("content".into(), written.join("\n").into());
+        }
+    }
+    args
+}
+
 fn put<T: Into<Value>>(map: &mut Map<String, Value>, key: &str, value: Option<T>) {
     if let Some(value) = value {
         map.insert(key.into(), value.into());
@@ -344,23 +402,9 @@ impl Config {
     /// The rules as JSON, for scripts (`reaper rules --json`): the file's own key names,
     /// defaults filled in, unknown keys left out.
     pub fn to_json(&self) -> Value {
-        fn watcher(w: &Watcher) -> Value {
-            let mut map = Map::new();
-            put(&mut map, "kind", w.kind.clone());
-            put(&mut map, "baseURL", w.base_url.clone());
-            put(&mut map, "model", w.model.clone());
-            put(&mut map, "apiKeyEnv", w.api_key_env.clone());
-            put(&mut map, "timeoutMs", w.timeout_ms);
-            put(&mut map, "cacheKey", w.cache_key);
-            put(&mut map, "onError", w.on_error.clone());
-            if !w.fallback.is_empty() {
-                map.insert("fallback".into(), w.fallback.iter().map(watcher).collect());
-            }
-            map.into()
-        }
         let mut out = Map::new();
         if let Some(w) = &self.watcher {
-            out.insert("watcher".into(), watcher(w));
+            out.insert("watcher".into(), w.to_json());
         }
         let mut reap = json!({ "idle": self.idle() });
         if let Some(r) = &self.reap {
@@ -654,6 +698,31 @@ projects:
         assert!(!rules[0].matches(MESSAGE, &said), "a rule over every argument stays off messages");
         assert!(rules[1].matches(MESSAGE, &said));
         assert!(rules[1].applies_to("Edit") && !rules[1].applies_to("bash"));
+    }
+
+    #[test]
+    fn a_rule_on_content_sees_what_any_agent_writes_and_not_what_it_replaces() {
+        let rule =
+            &parse("rules: [{ id: dash, tools: [edit, multiedit, write], match: { content: '—' } }]").unwrap().rules[0];
+        let hit = |tool: &str, args: Value| rule.matches(tool, &portable(&args));
+        assert!(hit("Edit", json!({ "file_path": "a.md", "old_string": "a", "new_string": "a — b" })), "Claude Code");
+        assert!(
+            hit(
+                "edit",
+                json!({ "path": "a.md", "edits": [{ "oldText": "a", "newText": "b" }, { "oldText": "c", "newText": "c — d" }] })
+            ),
+            "pi"
+        );
+        assert!(hit(
+            "MultiEdit",
+            json!({ "file_path": "a.md", "edits": [{ "old_string": "a", "new_string": "a — b" }] })
+        ));
+        assert!(hit("Write", json!({ "file_path": "a.md", "content": "a — b" })));
+        assert!(
+            !hit("Edit", json!({ "file_path": "a.md", "old_string": "a — b", "new_string": "a, b" })),
+            "taking one out"
+        );
+        assert_eq!(portable(&json!({ "file_path": "a.md" }))["path"], "a.md");
     }
 
     #[test]

@@ -34,9 +34,11 @@ pub struct Agent {
     pub dir: Option<String>,
     pub model: Option<String>,
     pub label: Option<String>,
-    /// What the human first asked it for, which tells sessions apart.
-    pub prompt: Option<String>,
+    /// What the human asked it for, and when, oldest first.
+    pub prompts: Vec<(i64, String)>,
     pub status: Status,
+    /// Dead, with its work waiting for the human: what they're to type to carry it on.
+    pub waits_for: Option<String>,
     pub first_at: i64,
     pub last_at: i64,
     pub last_tool: Option<String>,
@@ -96,12 +98,20 @@ pub struct Model {
     index: HashMap<String, usize>,
     /// Oldest first.
     pub kills: Vec<Kill>,
+    /// Deaths in the whole log, so it only goes up: the log is only ever added to.
+    pub deaths: usize,
     pub watcher: WatcherHealth,
 }
 
 impl Default for Model {
     fn default() -> Self {
-        Self { agents: Vec::new(), index: HashMap::new(), kills: Vec::new(), watcher: WatcherHealth::Unknown }
+        Self {
+            agents: Vec::new(),
+            index: HashMap::new(),
+            kills: Vec::new(),
+            deaths: 0,
+            watcher: WatcherHealth::Unknown,
+        }
     }
 }
 
@@ -120,12 +130,18 @@ impl Model {
         if event.kind == Kind::Unknown {
             return;
         }
+        // Once a fresh session has taken its work over, the dead one no longer waits for the human.
+        if let Kind::Spawned { after: Some(from), .. } = &event.kind
+            && let Some(&i) = self.index.get(from)
+        {
+            self.agents[i].waits_for = None;
+        }
         let agent = self.agent_mut(event);
         agent.last_at = agent.last_at.max(event.at);
         // Kept apart from what it did: a prompt can run to pages.
         if let Kind::Prompted { prompt } = &event.kind {
-            if agent.prompt.is_none() {
-                agent.prompt = written(prompt).map(String::from);
+            if let Some(prompt) = written(prompt) {
+                agent.prompts.push((event.at, prompt.to_string()));
             }
             return;
         }
@@ -133,6 +149,10 @@ impl Model {
             agent.recent.pop_front();
         }
         agent.recent.push_back(event.clone());
+        // Up again, or closed: it no longer waits for the human.
+        if matches!(event.kind, Kind::Revived | Kind::Spawned { .. } | Kind::Acted { .. } | Kind::Ended) {
+            agent.waits_for = None;
+        }
 
         match &event.kind {
             Kind::Spawned { parent, project, dir, model, label, after } => {
@@ -186,8 +206,12 @@ impl Model {
                 agent.status = Status::Working;
                 self.settle(&event.agent, Outcome::Redirected(redirect.clone()));
             }
-            Kind::Died { reason, .. } => {
+            // Back up with a clean record; the death still counts.
+            Kind::Revived if agent.status == Status::Dead => agent.status = Status::Working,
+            Kind::Died { reason, carry_on, .. } => {
                 agent.status = Status::Dead;
+                agent.waits_for.clone_from(carry_on);
+                self.deaths += 1;
                 self.settle(&event.agent, Outcome::Died(*reason));
             }
             // Finishing a turn doesn't bring the dead or the closed back, and the dead stay dead
@@ -213,7 +237,7 @@ impl Model {
                     }
                 }
             }
-            Kind::Idle | Kind::Asked | Kind::Reaped { .. } | Kind::Prompted { .. } | Kind::Unknown => {}
+            Kind::Idle | Kind::Asked | Kind::Reaped { .. } | Kind::Revived | Kind::Prompted { .. } | Kind::Unknown => {}
         }
     }
 
@@ -228,7 +252,8 @@ impl Model {
                 dir: None,
                 model: None,
                 label: None,
-                prompt: None,
+                prompts: Vec::new(),
+                waits_for: None,
                 status: Status::Idle,
                 first_at: event.at,
                 last_at: event.at,
@@ -347,6 +372,22 @@ mod tests {
         .unwrap();
         model.apply(&failed);
         assert_eq!(model.watcher, WatcherHealth::Failing { at: 9, error: "connect ECONNREFUSED".into() });
+    }
+
+    #[test]
+    fn deaths_are_counted_over_the_whole_log_and_only_go_up() {
+        let mut model = fixture();
+        assert_eq!(model.deaths, 1);
+        let id = "01a18e1b-74d4-7499-8113-59ae26a82065";
+        let event = |at: i64, kind: &str, fields: &str| {
+            parse_line(&format!(r#"{{"at":{at},"host":"pi","agent":"{id}","type":"{kind}"{fields}}}"#)).unwrap()
+        };
+        // Up again and closed: nothing comes off. Dying again adds one.
+        model.apply(&event(10, "agent.acted", r#","tool":"read""#));
+        model.apply(&event(20, "agent.ended", ""));
+        assert_eq!(model.deaths, 1);
+        model.apply(&event(30, "agent.died", r#","rule":"r","reason":"strikes""#));
+        assert_eq!(model.deaths, 2);
     }
 
     #[test]

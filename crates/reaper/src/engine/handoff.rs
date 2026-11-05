@@ -1,7 +1,7 @@
 //! Handing on a session reaper stopped. A fresh session takes its work over: it hears what the
-//! human asked for, where the old one was working, which files it changed, what its version
-//! control says isn't committed there (worktrees included), and which way to go now, the
-//! redirect of the rule the old one died of. Never the rule, and never what the old one tried.
+//! human asked for, where the old one was working, which files it changed, which checkouts they
+//! are in (worktrees included) and how to see what isn't committed there, and which way to go
+//! now, the redirect of the rule the old one died of. Never the rule, and never what the old one tried.
 //! It starts without those attempts in its context, and with a clean record.
 
 use std::collections::BTreeSet;
@@ -9,11 +9,14 @@ use std::path::{Path, PathBuf};
 
 use reaper_core::events::written;
 use reaper_core::paths::tilde;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::vcs::{self, Checkout};
-use super::{Check, DEFAULT_REDIRECT, Engine, loop_rule, self_rules};
+use super::{Check, DEFAULT_REDIRECT, Engine, FULL, loop_rule, self_rules};
 
+/// What reaper types into a compacted session left to run by itself, to set it going again. It's
+/// reaper's, not the human's.
+pub const CARRY_ON: &str = "Carry on with the work above.";
 /// Prompts kept per session: the first, which usually says what the work is, and the latest.
 const PROMPTS: usize = 8;
 /// A prompt can be a pasted file or log; this much of it is kept.
@@ -22,17 +25,17 @@ const PROMPT_CHARS: usize = 4000;
 const CHANGED: usize = 40;
 /// Tools that change the file at their `path`.
 const EDITS: &[&str] = &["edit", "write", "multiedit", "notebookedit"];
-/// Checkouts asked what isn't committed: where the session was, and where it changed files.
+/// Checkouts named: where the session was, and where it changed files.
 const CHECKOUTS: usize = 3;
-/// What isn't committed, listed per checkout; the rest are counted.
-const SHOWN: usize = 30;
 
 impl Engine {
     /// The human asked the session `agent` for something. False when it's the handoff the
     /// session was started with, arriving as its first prompt: that one is reaper's.
     pub fn prompted(&self, host: &str, agent: &str, prompt: &str) -> bool {
         let prompt = prompt.trim();
-        if self.store.session(host, agent).took_over.as_deref().is_some_and(|t| t.trim() == prompt) {
+        if prompt == CARRY_ON
+            || self.store.session(host, agent).took_over.as_deref().is_some_and(|t| t.trim() == prompt)
+        {
             return false;
         }
         let kept: String = prompt.chars().take(PROMPT_CHARS).collect();
@@ -46,7 +49,29 @@ impl Engine {
             s.took_over = None;
             s.handoff = None;
         });
+        self.revive(host, agent);
         true
+    }
+
+    /// The human asked a session reaper had stopped for something new: it gets up with a clean
+    /// record, as one taking its work over would, not a slip away from being stopped again.
+    pub fn revive(&self, host: &str, agent: &str) {
+        let state = self.store.session(host, agent);
+        if state.pressure >= FULL || state.team.stopped.is_some() {
+            let _ = self.store.update(host, agent, |s| s.wipe_record());
+            self.event(host, agent, "agent.revived", json!({}));
+        }
+    }
+
+    /// The session `agent` died of `rule` with nobody there to carry it on (Claude Code's auto
+    /// mode): it takes its own work over at once, with a clean record, and what it's to carry on
+    /// with is returned for it to hear. Once until the human says anything: the same as handing
+    /// on, a session that took over and dies again is stopped for good.
+    pub fn carry_on(&self, host: &str, agent: &str, rule: &str, latest: &str, dir: &Path) -> Option<String> {
+        self.hand_on(host, agent, rule, latest, dir)?;
+        let work = self.take_over(host, agent, agent)?;
+        self.event(host, agent, "agent.revived", json!({}));
+        Some(work)
     }
 
     /// Notes a file an allowed call changes, for the session's handoff. Only the first change
@@ -91,9 +116,11 @@ impl Engine {
         Some(text)
     }
 
-    /// The session `agent` starts out taking over from `from`, a session reaper stopped: it
-    /// inherits what that one was asked and changed. Returns what it's to carry on with, unless
-    /// there's nothing waiting (another session took it, or the human spoke to `from` since).
+    /// The session `agent` takes over from `from`, a session reaper stopped: a fresh session, or
+    /// the same one carrying on after it was compacted. It inherits what `from` was asked and
+    /// changed, and starts with a clean record: no strikes, nothing blocked, nobody stopped.
+    /// Returns what it's to carry on with, unless there's nothing waiting (another session took
+    /// it, or the human spoke to `from` since).
     pub fn take_over(&self, host: &str, agent: &str, from: &str) -> Option<String> {
         // A lock-free look first: a resumed session that took over asks again every time.
         self.store.session(host, from).handoff?;
@@ -101,6 +128,7 @@ impl Engine {
             self.store.update(host, from, |s| (s.handoff.take(), s.prompts.clone(), s.changed.clone())).ok()?;
         let text = text?;
         let _ = self.store.update(host, agent, |s| {
+            s.wipe_record();
             s.took_over = Some(text.clone());
             s.prompts = prompts;
             s.changed = changed;
@@ -109,8 +137,7 @@ impl Engine {
     }
 }
 
-/// The checkouts the work was in: the one around `dir`, then those of the files it changed, as
-/// their version control sees them now.
+/// The checkouts the work was in: the one around `dir`, then those of the files it changed.
 fn checkouts(dir: &Path, changed: &BTreeSet<String>) -> Vec<Checkout> {
     let places = std::iter::once(dir.to_path_buf())
         .chain(changed.iter().filter_map(|file| Path::new(file).parent().map(Path::to_path_buf)));
@@ -125,12 +152,18 @@ fn checkouts(dir: &Path, changed: &BTreeSet<String>) -> Vec<Checkout> {
             break;
         }
     }
-    found.iter().filter_map(|(root, kind)| vcs::status(root, *kind)).collect()
+    found.iter().map(|(root, kind)| vcs::checkout(root, *kind)).collect()
 }
 
 /// What the fresh session hears, as its first prompt or as context: the human's own words, where
 /// the work is, and the redirect last, as what to do.
-fn handoff(prompts: &[String], dir: &Path, changed: &BTreeSet<String>, checkouts: &[Checkout], redirect: &str) -> String {
+fn handoff(
+    prompts: &[String],
+    dir: &Path,
+    changed: &BTreeSet<String>,
+    checkouts: &[Checkout],
+    redirect: &str,
+) -> String {
     // Where the old session was working is where the fresh one starts, or nearly: paths are
     // from there when they can be.
     let shown = |path: &Path| match path.strip_prefix(dir) {
@@ -155,19 +188,10 @@ fn handoff(prompts: &[String], dir: &Path, changed: &BTreeSet<String>, checkouts
         text += "\n";
     }
     for checkout in checkouts {
-        let (place, what) = (tilde(&checkout.root), checkout.describe());
-        if checkout.changes.is_empty() {
-            text += &format!("{place}, {what}, has nothing uncommitted.\n\n");
-            continue;
-        }
-        text += &format!("Not committed yet in {place}, {what} (some of it may be the person's own):\n\n");
-        for (how, path) in checkout.changes.iter().take(SHOWN) {
-            text += &format!("- {how} {path}\n");
-        }
-        if checkout.changes.len() > SHOWN {
-            text += &format!("- and {} more\n", checkout.changes.len() - SHOWN);
-        }
-        text += "\n";
+        let (place, what, status) = (tilde(&checkout.root), checkout.describe(), checkout.status_command());
+        text += &format!(
+            "{place} is {what}; `{status}` there shows what isn't committed yet (some of it may be the person's own).\n\n"
+        );
     }
     text += "Check where the work stands, then finish it. ";
     text += redirect;
@@ -246,7 +270,7 @@ Check where the work stands, then finish it. Open a pull request."
     }
 
     #[test]
-    fn work_in_a_worktree_is_handed_on_from_there_with_what_commands_changed_too() {
+    fn work_in_a_worktree_is_handed_on_from_there_with_how_to_see_what_is_half_done() {
         if crate::hosts::on_path("git").is_none() {
             return;
         }
@@ -258,9 +282,8 @@ Check where the work stands, then finish it. Open a pull request."
         git(&main, &["add", "."]);
         git(&main, &["commit", "-q", "-m", "start"]);
         git(&main, &["worktree", "add", "-q", "-b", "fix-login", tree.to_str().unwrap()]);
-        // Half done there: one file edited through a tool, one made by a command.
+        // Half done there, edited through a tool.
         std::fs::write(tree.join("src/login.rs"), "fn login() { todo!() }\n").unwrap();
-        std::fs::write(tree.join("src/session.rs"), "// started\n").unwrap();
 
         let engine = sandbox.engine(RULES);
         engine.prompted("test", "s1", "Fix the login.");
@@ -270,11 +293,37 @@ Check where the work stands, then finish it. Open a pull request."
         let (main, tree) = (tilde(&main), tilde(&tree));
         assert!(text.starts_with(&format!("You're taking over work that an earlier session started in {main} and")));
         assert!(text.contains(&format!("partly done:\n\n- {tree}/src/login.rs\n")), "{text}");
-        let uncommitted = format!(
-            "Not committed yet in {tree}, a git worktree on branch fix-login (some of it may be the person's own):\n\n- modified src/login.rs\n- new src/session.rs\n"
-        );
-        assert!(text.contains(&uncommitted), "{text}");
-        assert!(text.contains(&format!("{main}, a git checkout on branch main, has nothing uncommitted.")), "{text}");
+        let uncommitted = "`git status` there shows what isn't committed yet (some of it may be the person's own).";
+        assert!(text.contains(&format!("{tree} is a git worktree on branch fix-login; {uncommitted}")), "{text}");
+        assert!(text.contains(&format!("{main} is a git checkout on branch main; {uncommitted}")), "{text}");
+    }
+
+    /// reaper runs outside any sandbox the agent is in, so nothing a checkout's config says to
+    /// run may run when its work is handed on: here, git's `core.fsmonitor`, which `git status`
+    /// runs.
+    #[cfg(unix)]
+    #[test]
+    fn handing_work_on_never_runs_what_a_checkouts_config_says_to() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::hosts::on_path("git").is_none() {
+            return;
+        }
+        let sandbox = Sandbox::new("handoff-planted");
+        let (repo, ran) = (sandbox.root.join("app"), sandbox.root.join("ran"));
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let hook = sandbox.root.join("fsmonitor");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&repo, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+
+        let engine = sandbox.engine(RULES);
+        engine.prompted("test", "s1", "Fix the login.");
+        let text = engine.hand_on("test", "s1", "push", "", &repo).unwrap();
+        assert!(text.contains("is a git checkout on branch main"), "{text}");
+        assert!(!ran.exists(), "reaper ran the checkout's fsmonitor");
+        git(&repo, &["status"]);
+        assert!(ran.exists(), "the planted fsmonitor is one git runs");
     }
 
     #[test]
@@ -295,16 +344,50 @@ Check where the work stands, then finish it. Open a pull request."
         let sandbox = Sandbox::new("handoff-none");
         let engine = sandbox.engine(RULES);
         assert_eq!(engine.hand_on("test", "s1", "push", "", Path::new(WORK)), None, "no prompt known");
-        let latest = engine.hand_on("test", "s0", "push", "<ide_opened_file>a.rs</ide_opened_file>Tidy up.", Path::new(WORK)).unwrap();
+        let latest = engine
+            .hand_on("test", "s0", "push", "<ide_opened_file>a.rs</ide_opened_file>Tidy up.", Path::new(WORK))
+            .unwrap();
         assert!(latest.contains("It was asked:\n\n> Tidy up.\n"), "the host's latest, as the human wrote it: {latest}");
         engine.prompted("test", "s1", "Migrate the database.");
         assert_eq!(engine.hand_on("test", "s1", "prod", "", Path::new(WORK)), None, "the rule says to stop");
         assert!(
-            engine.hand_on("test", "s1", "reaper.loop", "", Path::new(WORK)).unwrap().ends_with("Try a different approach to the task.")
+            engine
+                .hand_on("test", "s1", "reaper.loop", "", Path::new(WORK))
+                .unwrap()
+                .ends_with("Try a different approach to the task.")
         );
         // The human speaking to the stopped session again makes the handoff out of date.
         engine.prompted("test", "s1", "Never mind, I'll do it.");
         assert_eq!(engine.take_over("test", "s2", "s1"), None);
+    }
+
+    #[test]
+    fn a_stopped_session_asked_for_something_new_gets_up_with_a_clean_record() {
+        let sandbox = Sandbox::new("handoff-revive");
+        let engine = sandbox.engine("strikes: 2\nrules: [{ id: push, match: { command: 'git push -f' } }]");
+        let push = || engine.check(&call("bash", json!({ "command": "git push -f" })));
+        assert!(matches!(push(), Decision::Kill { strike: 1, .. }));
+        assert!(matches!(push(), Decision::Kill { is_final: true, .. }));
+        engine.prompted("test", "s1", "Never mind that. Tidy the docs.");
+        assert!(matches!(push(), Decision::Kill { strike: 1, is_final: false, .. }), "a whole allowance again");
+        // Asking one that's still going changes nothing: its strikes stay.
+        engine.prompted("test", "s1", "And the tests.");
+        assert!(matches!(push(), Decision::Kill { strike: 2, is_final: true, .. }));
+    }
+
+    #[test]
+    fn left_to_itself_a_stopped_session_carries_on_once_with_a_clean_record() {
+        let sandbox = Sandbox::new("handoff-carry-on");
+        let engine = sandbox
+            .engine("strikes: 1\nrules: [{ id: push, match: { command: 'git push -f' }, redirect: Open a PR. }]");
+        let push = || engine.check(&call("bash", json!({ "command": "git push -f" })));
+        engine.prompted("test", "s1", "Ship it.");
+        assert!(matches!(push(), Decision::Kill { is_final: true, .. }));
+        let work = engine.carry_on("test", "s1", "push", "", Path::new(WORK)).unwrap();
+        assert!(work.contains("> Ship it.") && work.ends_with("Open a PR."), "{work}");
+        assert!(matches!(push(), Decision::Kill { is_final: true, .. }), "a clean record: one strike's worth again");
+        assert_eq!(engine.carry_on("test", "s1", "push", "", Path::new(WORK)), None, "not twice without the human");
+        assert_eq!(sandbox.events().iter().filter(|e| *e == "agent.revived").count(), 1);
     }
 
     #[test]

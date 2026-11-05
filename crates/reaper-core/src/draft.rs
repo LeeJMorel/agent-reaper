@@ -11,8 +11,9 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::EXAMPLE_RULES;
 use crate::lint::{Level, lint};
-use crate::rules::{Config, Rule, Unknown, parse};
+use crate::rules::{Config, Rule, Unknown, Watcher, parse, portable};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Draft {
@@ -49,7 +50,7 @@ impl Example {
                 let mut args: Map<String, Value> = fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 let named = args.remove("tool").and_then(|t| t.as_str().map(str::to_string));
                 let tool = named.unwrap_or_else(|| if args.contains_key("command") { "bash" } else { "write" }.into());
-                (tool, Value::Object(args))
+                (tool, portable(&Value::Object(args)))
             }
         }
     }
@@ -418,12 +419,40 @@ pub fn remove(text: &str, id: &str) -> Result<String, String> {
     if at > 0 && lines[at - 1].trim().is_empty() && lines.get(at).is_none_or(|l| l.trim().is_empty()) {
         lines.remove(at - 1);
     }
-    // A list left with nothing in it is written empty, not as a bare key.
+    // A list left with nothing in it is written empty, not as a bare key. A project left with
+    // no rules goes whole: it was only ever there to scope them.
+    let mut emptied = None;
     if let Some(key) = (0..at.min(lines.len())).rev().find(|&j| content(&lines[j]) && indent(&lines[j]) < dash.max(1)) {
         let after = (key + 1..lines.len()).find(|&j| content(&lines[j]));
         let empty = after.is_none_or(|j| indent(&lines[j]) <= indent(&lines[key]) && !item(&lines[j]));
-        if empty && lines[key].trim_end().ends_with("rules:") {
-            lines[key] = format!("{} []", lines[key].trim_end());
+        let project = place
+            .as_ref()
+            .and_then(|_| (0..key).rev().find(|&j| content(&lines[j]) && indent(&lines[j]) < indent(&lines[key])));
+        match project {
+            Some(p) if empty && lines[key].trim_end().ends_with("rules:") => {
+                let at = indent(&lines[p]);
+                let through = last(&lines, p, end(&lines, p, lines.len()));
+                lines.drain(p..=through);
+                // No gap left right under its parent, and one at most between neighbours.
+                let blank = |lines: &[String], j: usize| lines.get(j).is_some_and(|l| l.trim().is_empty());
+                if blank(&lines, p) && (p == 0 || blank(&lines, p - 1) || lines[p - 1].trim_end().ends_with(':')) {
+                    lines.remove(p);
+                } else if p > 0 && blank(&lines, p - 1) && (p == lines.len() || blank(&lines, p)) {
+                    lines.remove(p - 1);
+                }
+                let parent = (0..p.min(lines.len())).rev().find(|&j| content(&lines[j]) && indent(&lines[j]) < at);
+                if let Some(q) = parent.filter(|&q| lines[q].trim_end().ends_with("projects:")) {
+                    let next = (q + 1..lines.len()).find(|&j| content(&lines[j]));
+                    if next.is_none_or(|j| indent(&lines[j]) <= indent(&lines[q])) {
+                        lines[q] = format!("{} {{}}", lines[q].trim_end());
+                    }
+                }
+                emptied = place.clone();
+            }
+            _ if empty && lines[key].trim_end().ends_with("rules:") => {
+                lines[key] = format!("{} []", lines[key].trim_end());
+            }
+            _ => {}
         }
     }
     let new_text = lines.join("\n") + "\n";
@@ -435,10 +464,92 @@ pub fn remove(text: &str, id: &str) -> Result<String, String> {
     if let Some(list) = list.as_array_mut() {
         list.retain(|r| r["id"] != id);
     }
+    if let (Some(name), Some(projects)) = (&emptied, want["projects"].as_object_mut()) {
+        projects.remove(name);
+    }
     match parse(&new_text) {
         Ok(new) if new.to_json() == want => Ok(new_text),
         _ => Err(format!("couldn't take {id} out of the rules file without changing anything else; remove it by hand")),
     }
+}
+
+/// A new rules file: the example, its sample project commented out, so it shows how a project
+/// is written without applying to anything of the person's.
+pub fn starter() -> String {
+    let mut lines: Vec<String> = EXAMPLE_RULES.lines().map(str::to_string).collect();
+    if let Some((i, _)) = key(&lines, 0, lines.len(), 0, "projects") {
+        let through = last(&lines, i, end(&lines, i, lines.len()));
+        for line in lines[i..=through].iter_mut().filter(|l| content(l)) {
+            line.insert_str(indent(line), "# ");
+        }
+        lines.insert(i, "# A sample project: uncomment it and put in your own paths.".into());
+    }
+    lines.join("\n") + "\n"
+}
+
+/// The rules file's text with its watcher set to `watcher`, or taken out, the rest as it was.
+/// Checked like an insert: read back, only the watcher may have changed. A new one goes above
+/// the file's first key, below its opening comments.
+pub fn set_watcher(text: &str, watcher: Option<&Watcher>) -> Result<String, String> {
+    let old = parse(text).map_err(|_| "the rules file has a syntax error; it has to be fixed first".to_string())?;
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let block = watcher.map(render_watcher).unwrap_or_default();
+    match key(&lines, 0, lines.len(), 0, "watcher") {
+        Some((i, _)) => {
+            let through = last(&lines, i, end(&lines, i, lines.len()));
+            let gone = block.is_empty();
+            lines.splice(i..=through, block);
+            if gone && lines.get(i).is_some_and(|l| l.trim().is_empty()) && (i == 0 || lines[i - 1].trim().is_empty()) {
+                lines.remove(i);
+            }
+        }
+        None if block.is_empty() => return Ok(text.to_string()),
+        None => {
+            let first = (0..lines.len()).find(|&j| content(&lines[j]) && indent(&lines[j]) == 0);
+            let at = first.unwrap_or(lines.len());
+            let mut block = block;
+            if first.is_some() {
+                block.push(String::new());
+            }
+            lines.splice(at..at, block);
+        }
+    }
+    let new_text = lines.join("\n") + "\n";
+    let mut want = old.to_json();
+    if let Some(map) = want.as_object_mut() {
+        match watcher {
+            Some(w) => map.insert("watcher".into(), w.to_json()),
+            None => map.remove("watcher"),
+        };
+    }
+    match parse(&new_text) {
+        Ok(new) if new.to_json() == want => Ok(new_text),
+        _ => Err("couldn't set the watcher without changing anything else; set it by hand".into()),
+    }
+}
+
+/// A top-level `watcher:` block, its fallbacks one to a line.
+fn render_watcher(w: &Watcher) -> Vec<String> {
+    fn fields(w: &Watcher, quote: fn(&str) -> String) -> Vec<String> {
+        let text = [
+            ("kind", w.kind.as_deref()),
+            ("baseURL", w.base_url.as_deref()),
+            ("model", w.model.as_deref()),
+            ("apiKeyEnv", w.api_key_env.as_deref()),
+            ("onError", w.on_error.as_deref()),
+        ];
+        let mut out: Vec<String> = text.iter().filter_map(|(k, v)| v.map(|v| format!("{k}: {}", quote(v)))).collect();
+        out.extend(w.timeout_ms.map(|ms| format!("timeoutMs: {ms}")));
+        out.extend(w.cache_key.map(|on| format!("cacheKey: {on}")));
+        out
+    }
+    let mut lines = vec!["watcher:".to_string()];
+    lines.extend(fields(w, scalar).into_iter().map(|f| format!("  {f}")));
+    if !w.fallback.is_empty() {
+        lines.push("  fallback:".into());
+        lines.extend(w.fallback.iter().map(|f| format!("    - {{ {} }}", fields(f, flow).join(", "))));
+    }
+    lines
 }
 
 /// The rule as a block-style list item with its dash at `dash` columns, keys in the order
@@ -496,7 +607,6 @@ fn plain(text: &str, in_flow: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EXAMPLE_RULES;
 
     const SUITE: &str = r#"Here's the rule:
 
@@ -611,11 +721,52 @@ note: Assumed every project.
 
         let last = remove("rules:\n  - id: a\n    match: { command: x }\nstrikes: 2\n", "a").unwrap();
         assert_eq!(last, "rules: []\nstrikes: 2\n");
+        let projects = "projects:\n  app:\n    paths: [~/app]\n    rules:\n      - id: a\n        match: { command: x }\n\n  web:\n    paths: [~/web]\n    rules:\n      - id: b\n        match: { command: y }\nstrikes: 2\n";
+        let one = remove(projects, "a").unwrap();
+        assert_eq!(
+            one,
+            "projects:\n  web:\n    paths: [~/web]\n    rules:\n      - id: b\n        match: { command: y }\nstrikes: 2\n",
+            "a project left with no rules goes"
+        );
+        assert_eq!(remove(&one, "b").unwrap(), "projects: {}\nstrikes: 2\n");
         let flow = remove("rules:\n  - { id: a, match: { command: x } }\n  - { id: b, match: { command: y } }\n", "a");
         assert_eq!(flow.unwrap(), "rules:\n  - { id: b, match: { command: y } }\n");
         assert_eq!(remove(EXAMPLE_RULES, "nope").unwrap_err(), "there is no rule nope");
         let inline = remove("rules: [{ id: a, match: { command: x } }]\n", "a").unwrap_err();
         assert!(inline.contains("by hand"), "{inline}");
+    }
+
+    #[test]
+    fn a_new_rules_file_keeps_the_sample_project_as_comments() {
+        let text = starter();
+        let (new, example) = (parse(&text).unwrap(), parse(EXAMPLE_RULES).unwrap());
+        assert!(new.projects.is_empty(), "{text}");
+        assert_eq!(new.rules.len(), example.rules.len());
+        assert_eq!(new.watcher.as_ref().map(Watcher::to_json), example.watcher.as_ref().map(Watcher::to_json));
+        assert!(text.contains("\n# projects:\n  # my-app:\n") && text.contains("      # - id: prod-db\n"), "{text}");
+        assert!(lint(&new).iter().all(|i| i.level != Level::Error));
+    }
+
+    #[test]
+    fn the_watcher_is_set_in_place_and_nothing_else_moves() {
+        let mut claude = Watcher::new(Some("claude-code"), None, "claude-haiku-5-5");
+        claude.on_error = Some("allow".into());
+        claude.fallback.push(Watcher::new(None, Some("http://localhost:11434/v1"), "qwen3:4b"));
+        let set = set_watcher(EXAMPLE_RULES, Some(&claude)).unwrap();
+        let config = parse(&set).unwrap();
+        assert_eq!(config.watcher.as_ref().unwrap().to_json(), claude.to_json());
+        assert!(set.contains("    - { baseURL: http://localhost:11434/v1, model: qwen3:4b }"), "{set}");
+        assert_eq!(config.rules.len(), parse(EXAMPLE_RULES).unwrap().rules.len());
+        assert!(set.starts_with(EXAMPLE_RULES.split("watcher:").next().unwrap()), "the opening comments stay");
+
+        let none = set_watcher(&set, None).unwrap();
+        assert!(parse(&none).unwrap().watcher.is_none() && !none.contains("\n\n\n"), "{none}");
+        let back = set_watcher(&none, Some(&claude)).unwrap();
+        assert_eq!(parse(&back).unwrap().to_json(), config.to_json(), "a new one goes back in");
+        let fresh = set_watcher("", Some(&claude)).unwrap();
+        assert_eq!(parse(&fresh).unwrap().watcher.unwrap().to_json(), claude.to_json());
+        let flow = set_watcher("watcher: { model: m, baseURL: \"http://x\" }\nstrikes: 2\n", Some(&claude)).unwrap();
+        assert!(flow.ends_with("\nstrikes: 2\n") && !flow.contains("http://x"), "{flow}");
     }
 
     #[test]

@@ -38,7 +38,9 @@ folder level, `**` any depth).
 
 - `match`: regexes over the action's arguments. Use it whenever the thing shows in the command
   or the file path. Keys: `command` for shell commands, `path` for the file an agent reads or
-  writes (whichever agent it is), `"*"` for any argument. Patterns are JavaScript regexes,
+  writes, `content` for the text it writes (a new file, or an edit's new text, never the text
+  it replaces), `"*"` for any argument. `path` and `content` work whichever agent it is. In
+  examples, an edit is `{ tool: edit, path: …, new_string: … }`. Patterns are JavaScript regexes,
   searched anywhere in the text, and every key listed must match.
 - `judge`: a plain-English description of the bad action, decided by a small model (the
   watcher). Use it only for meaning a pattern can't see, such as "Connecting to, querying or
@@ -98,5 +100,5 @@ folder level, `**` any depth).
 If you're an agent and your person asks for a rule while you work: show them the snippet,
 check it with `reaper rules add --check <<'EOF'` … `EOF`, and once they agree, add it with
 `reaper rules add <<'EOF'` … `EOF`. reaper puts it in its rules file for you. To change a rule,
-take it out with `reaper rules remove <id>` and add the new version. reaper's own files are off
-limits to agents.
+take it out with `reaper rules remove <id>`, which your person is asked to allow, and add the
+new version. reaper's own files are off limits to agents.

@@ -13,7 +13,14 @@
 //! A watcher with fallbacks asks them in turn until one answers. One that just failed (not
 //! running, unloaded, rate-limited) waits at the back of the line for a minute, so the
 //! checks after it don't each spend their time on it first.
+//!
+//! `kind: claude-code` asks the Claude Code the human is signed in to, so checks come out of
+//! their subscription and need no API key. Each check starts it afresh: measured with
+//! claude-haiku-5-5, 2.3 to 3 s a check, of which starting it was 0.5 to 1 s. Without the
+//! schema it answered in half the time and missed a production query, so the schema stays.
 
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use reaper_core::events::now;
@@ -22,27 +29,30 @@ use serde_json::{Value, json};
 
 use super::prefix::Prompt;
 use super::store::Store;
+use crate::hosts::{first_line, headless, on_path};
 
-/// What OpenAI-compatible requests ask for beyond the prompt, in the order they're dropped
-/// when an endpoint refuses them.
-const EXTRAS: [&str; 2] = ["reasoning_effort", "response_format"];
+pub const CLAUDE_CODE: &str = "claude-code";
+
+/// What requests ask for beyond the prompt, in the order they're dropped when an endpoint
+/// refuses them: no reasoning, and an answer to the verdict's schema.
+const OPENAI_EXTRAS: [&str; 2] = ["reasoning_effort", "response_format"];
+const ANTHROPIC_EXTRAS: [&str; 2] = ["thinking", "output_config"];
 
 pub trait Backend {
     fn complete(&self, prompt: &Prompt, timeout: Duration, max_tokens: u32) -> Result<String, String>;
 }
 
-/// All the time a check spends on watchers, fallbacks included, unless the watcher's own
-/// timeout is longer: Claude Code gives a hook 30 s.
-const BUDGET: Duration = Duration::from_secs(20);
+/// All the time a check spends on watchers, fallbacks included. Claude Code gives a hook 30 s
+/// and lets the call through once they're up, so a check's own timeout is held to this too; a
+/// warmup, on nobody's path, may take longer.
+pub const BUDGET: Duration = Duration::from_secs(20);
 /// How long an endpoint that failed waits at the back of the line.
 const DOWN_MS: i64 = 60_000;
 
 pub fn from_config<'a>(watcher: &Watcher, store: &'a Store) -> Option<Box<dyn Backend + 'a>> {
     let mut endpoints: Vec<(String, Box<dyn Backend + 'a>)> = std::iter::once(watcher)
         .chain(&watcher.fallback)
-        .filter_map(|w| {
-            Some((format!("{} {}", w.base_url.as_deref()?.trim_end_matches('/'), w.model.as_deref()?), one(w, store)?))
-        })
+        .filter_map(|w| Some((endpoint(w)?, one(w, store)?)))
         .collect();
     match endpoints.len() {
         0 => None,
@@ -51,14 +61,29 @@ pub fn from_config<'a>(watcher: &Watcher, store: &'a Store) -> Option<Box<dyn Ba
     }
 }
 
+/// Where a watcher answers from: its base URL and model.
+fn endpoint(w: &Watcher) -> Option<String> {
+    let model = w.model.as_deref()?;
+    Some(match w.kind.as_deref() {
+        Some(CLAUDE_CODE) => format!("{CLAUDE_CODE} {model}"),
+        _ => format!("{} {model}", w.base_url.as_deref()?.trim_end_matches('/')),
+    })
+}
+
 fn one<'a>(watcher: &Watcher, store: &'a Store) -> Option<Box<dyn Backend + 'a>> {
-    let base_url = watcher.base_url.clone()?.trim_end_matches('/').to_string();
     let model = watcher.model.clone()?;
+    if watcher.kind.as_deref() == Some(CLAUDE_CODE) {
+        // Not on this PATH: it still fails at the check, where the reason shows.
+        let exe = on_path("claude").unwrap_or_else(|| "claude".into());
+        return Some(Box::new(ClaudeCode { exe, model }));
+    }
+    let base_url = watcher.base_url.clone()?.trim_end_matches('/').to_string();
     Some(match watcher.kind.as_deref() {
         Some("anthropic") => Box::new(Anthropic {
             base_url,
             model,
             key: std::env::var(watcher.api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY")).unwrap_or_default(),
+            store,
         }),
         _ => Box::new(OpenAi {
             base_url,
@@ -123,6 +148,31 @@ fn post(url: &str, headers: &[(&str, &str)], body: &Value, timeout: Duration) ->
     }
 }
 
+/// Posts `body`; when the endpoint turns it down for one of the `extras` it asks for, drops
+/// that for good (remembered under `endpoint`) and asks again.
+fn post_dropping(
+    url: &str,
+    headers: &[(&str, &str)],
+    mut body: Value,
+    timeout: Duration,
+    extras: &[&str],
+    (store, endpoint): (&Store, &str),
+) -> Result<Value, String> {
+    loop {
+        match post(url, headers, &body, timeout) {
+            Err(e) if e.starts_with(REFUSED) => {
+                let map = body.as_object_mut().expect("an object");
+                let Some(extra) = extras.iter().find(|x| map.contains_key(**x) && e.contains(**x)) else {
+                    return Err(e);
+                };
+                map.remove(*extra);
+                store.refuse(endpoint, extra);
+            }
+            other => return other,
+        }
+    }
+}
+
 struct OpenAi<'a> {
     base_url: String,
     model: String,
@@ -132,13 +182,14 @@ struct OpenAi<'a> {
     store: &'a Store,
 }
 
-fn verdict_schema(ids: &[String]) -> Value {
-    json!({ "type": "json_schema", "json_schema": { "name": "verdict", "strict": true, "schema": {
+/// The verdict's JSON schema: it can name only the rules' ids.
+fn verdict(ids: &[String]) -> Value {
+    json!({
         "type": "object",
         "properties": { "violated": { "type": "array", "items": { "type": "string", "enum": ids } } },
         "required": ["violated"],
         "additionalProperties": false,
-    } } })
+    })
 }
 
 impl Backend for OpenAi<'_> {
@@ -162,36 +213,27 @@ impl Backend for OpenAi<'_> {
             body["reasoning_effort"] = "none".into();
         }
         if !refused.iter().any(|r| r == "response_format") && !prompt.ids.is_empty() {
-            body["response_format"] = verdict_schema(&prompt.ids);
+            body["response_format"] = json!({ "type": "json_schema", "json_schema": { "name": "verdict", "strict": true, "schema": verdict(&prompt.ids) } });
         }
         let auth = self.key.as_ref().map(|k| format!("Bearer {k}"));
         let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("authorization", a.as_str())).collect();
         let url = format!("{}/chat/completions", self.base_url);
-        let reply = loop {
-            match post(&url, &headers, &body, timeout) {
-                Err(e) if e.starts_with(REFUSED) => {
-                    // Turned down for something extra it asked for: drop it, for good.
-                    let map = body.as_object_mut().expect("an object");
-                    let Some(extra) = EXTRAS.into_iter().find(|x| map.contains_key(*x) && e.contains(x)) else {
-                        return Err(e);
-                    };
-                    map.remove(extra);
-                    self.store.refuse(&endpoint, extra);
-                }
-                other => break other?,
-            }
-        };
+        let reply = post_dropping(&url, &headers, body, timeout, &OPENAI_EXTRAS, (self.store, &endpoint))?;
         Ok(reply["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string())
     }
 }
 
-struct Anthropic {
+/// Claude models from 5.5 on think unless told not to and turn down any temperature but
+/// their own, so this sends none and switches thinking off.
+struct Anthropic<'a> {
     base_url: String,
     model: String,
     key: String,
+    /// Where refusals are remembered.
+    store: &'a Store,
 }
 
-impl Backend for Anthropic {
+impl Backend for Anthropic<'_> {
     fn complete(&self, prompt: &Prompt, timeout: Duration, max_tokens: u32) -> Result<String, String> {
         let cached = |text: &str| json!({ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } });
         let [preamble, global, project] = &prompt.system;
@@ -200,17 +242,57 @@ impl Backend for Anthropic {
         if !project.is_empty() {
             system.push(cached(project));
         }
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "max_tokens": max_tokens,
-            "temperature": 0,
             "system": system,
             "messages": [{ "role": "user", "content": [cached(&prompt.goal), { "type": "text", "text": prompt.action }] }],
         });
+        let endpoint = format!("{} {}", self.base_url, self.model);
+        let refused = self.store.refused(&endpoint);
+        if !refused.iter().any(|r| r == "thinking") {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        if !refused.iter().any(|r| r == "output_config") && !prompt.ids.is_empty() {
+            body["output_config"] = json!({ "format": { "type": "json_schema", "schema": verdict(&prompt.ids) } });
+        }
         let headers = [("x-api-key", self.key.as_str()), ("anthropic-version", "2023-06-01")];
-        let reply = post(&format!("{}/v1/messages", self.base_url), &headers, &body, timeout)?;
+        let url = format!("{}/v1/messages", self.base_url);
+        let reply = post_dropping(&url, &headers, body, timeout, &ANTHROPIC_EXTRAS, (self.store, &endpoint))?;
         let text = reply["content"].as_array().into_iter().flatten().filter_map(|b| b["text"].as_str()).collect();
         Ok(text)
+    }
+}
+
+/// The Claude Code the human is signed in to, in print mode with no tools, no MCP servers and
+/// no hooks (reaper's own would check the check), saving nothing. The task and action go in
+/// on stdin, so text that starts with `-` can't read as a flag.
+struct ClaudeCode {
+    exe: PathBuf,
+    model: String,
+}
+
+impl Backend for ClaudeCode {
+    fn complete(&self, prompt: &Prompt, timeout: Duration, _: u32) -> Result<String, String> {
+        let system: Vec<&str> = prompt.system.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
+        let mut command = Command::new(&self.exe);
+        command.args(["-p", "--model", &self.model, "--effort", "low", "--system-prompt", &system.join("\n\n")]);
+        command.args(["--tools", "", "--settings", r#"{"disableAllHooks":true}"#, "--strict-mcp-config"]);
+        command.args(["--no-session-persistence", "--output-format", "json"]);
+        if !prompt.ids.is_empty() {
+            command.args(["--json-schema", &verdict(&prompt.ids).to_string()]);
+        }
+        let input = format!("{}\n\n{}", prompt.goal, prompt.action);
+        let out = headless(&mut command, Some(&input), timeout).map_err(|e| format!("watcher (Claude Code): {e}"))?;
+        let reply: Value = serde_json::from_str(&out)
+            .map_err(|_| format!("watcher (Claude Code) answered oddly: {}", first_line(&out)))?;
+        if reply["is_error"].as_bool() == Some(true) {
+            return Err(format!("watcher (Claude Code): {}", first_line(reply["result"].as_str().unwrap_or_default())));
+        }
+        Ok(match &reply["structured_output"] {
+            Value::Null => reply["result"].as_str().unwrap_or_default().to_string(),
+            verdict => verdict.to_string(),
+        })
     }
 }
 
@@ -219,8 +301,9 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// An endpoint that refuses `reasoning_effort` the way OpenAI's non-reasoning models do.
-    fn picky(bodies: Arc<Mutex<Vec<Value>>>) -> String {
+    /// An endpoint that turns down one parameter, the way OpenAI's non-reasoning models do
+    /// `reasoning_effort`, and otherwise sends `answer`.
+    fn picky(bodies: Arc<Mutex<Vec<Value>>>, refuses: &'static str, answer: &'static str) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -241,15 +324,15 @@ mod tests {
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 let body: Value = serde_json::from_slice(&body).unwrap();
-                let refuse = body.get("reasoning_effort").is_some();
+                let refuse = body.get(refuses).is_some();
                 bodies.lock().unwrap().push(body);
                 let (status, reply) = if refuse {
-                    (
-                        "400 Bad Request",
-                        r#"{"error":{"message":"Unsupported parameter: 'reasoning_effort' is not supported with this model."}}"#,
-                    )
+                    let error = format!(
+                        r#"{{"error":{{"message":"Unsupported parameter: '{refuses}' is not supported with this model."}}}}"#
+                    );
+                    ("400 Bad Request", error)
                 } else {
-                    ("200 OK", r#"{"choices":[{"message":{"content":"{\"violated\":[\"prod\"]}"}}]}"#)
+                    ("200 OK", answer.to_string())
                 };
                 let head = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -319,7 +402,7 @@ mod tests {
 
     #[test]
     fn a_watcher_that_isnt_running_hands_over_to_its_fallback() {
-        let url = picky(Arc::new(Mutex::new(Vec::new())));
+        let url = picky(Arc::new(Mutex::new(Vec::new())), "reasoning_effort", OPENAI_ANSWER);
         let dir = std::env::temp_dir().join(format!("reaper-fallback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::at(&dir);
@@ -343,7 +426,7 @@ mod tests {
     #[test]
     fn answers_to_the_rules_ids_and_drops_what_an_endpoint_refuses_for_good() {
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        let url = picky(bodies.clone());
+        let url = picky(bodies.clone(), "reasoning_effort", OPENAI_ANSWER);
         let dir = std::env::temp_dir().join(format!("reaper-backend-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::at(&dir);
@@ -367,4 +450,98 @@ mod tests {
         backend.complete(&prompt, Duration::from_secs(5), 400).unwrap();
         assert_eq!(bodies.lock().unwrap().len(), 3);
     }
+
+    #[test]
+    fn claude_is_asked_without_thinking_or_a_temperature_and_to_the_verdicts_schema() {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let answer = r#"{"content":[{"type":"text","text":"{\"violated\":[\"prod\"]}"}]}"#;
+        let url = picky(bodies.clone(), "thinking", answer);
+        let dir = std::env::temp_dir().join(format!("reaper-anthropic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::at(&dir);
+        let config = reaper_core::rules::parse(&format!(
+            "watcher: {{ kind: anthropic, baseURL: \"{url}\", model: claude-haiku-5-5 }}\nrules: [{{ id: prod, judge: touching production }}]"
+        ))
+        .unwrap();
+        let (watcher, rule) = (config.watcher.unwrap(), config.rules);
+        let prompt = super::super::prefix::layout(&[&rule[0]], &[], "fix", "bash", &json!({ "command": "psql prod" }));
+        let backend = from_config(&watcher, &store).unwrap();
+
+        assert_eq!(backend.complete(&prompt, Duration::from_secs(5), 400).unwrap(), r#"{"violated":["prod"]}"#);
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent[0]["thinking"], json!({ "type": "disabled" }));
+        assert!(sent.iter().all(|b| b.get("temperature").is_none()));
+        assert_eq!(sent.len(), 2, "a model that won't have thinking off is asked again without it");
+        assert_eq!(
+            sent[1]["output_config"]["format"]["schema"]["properties"]["violated"]["items"]["enum"],
+            json!(["prod"])
+        );
+        backend.complete(&prompt, Duration::from_secs(5), 400).unwrap();
+        assert_eq!(bodies.lock().unwrap().len(), 3, "and remembered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_code_judges_on_the_subscription_with_nothing_but_the_question() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reaper-claude-code-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("claude");
+        let (args, input) = (dir.join("args"), dir.join("input"));
+        let answer = r#"{"is_error":false,"result":"","structured_output":{"violated":["prod"]}}"#;
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\necho '{answer}'\n",
+            args.display(),
+            input.display()
+        );
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = reaper_core::rules::parse("rules: [{ id: prod, judge: touching production }]").unwrap();
+        let prompt = super::super::prefix::layout(
+            &[&config.rules[0]],
+            &[],
+            "-p fix the signup bug",
+            "bash",
+            &json!({ "command": "psql prod" }),
+        );
+        let backend = ClaudeCode { exe, model: "claude-haiku-5-5".into() };
+
+        assert_eq!(backend.complete(&prompt, Duration::from_secs(5), 400).unwrap(), r#"{"violated":["prod"]}"#);
+        let args = std::fs::read_to_string(&args).unwrap();
+        for arg in [
+            "--tools",
+            r#"{"disableAllHooks":true}"#,
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--json-schema",
+        ] {
+            assert!(args.lines().any(|l| l == arg), "{arg} in {args}");
+        }
+        let input = std::fs::read_to_string(&input).unwrap();
+        assert!(input.contains("-p fix the signup bug") && input.contains("psql prod"), "{input}");
+        assert!(!args.contains("signup"), "the task goes in on stdin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asks the real Claude Code, on the subscription: `cargo test -- --ignored for_real`.
+    #[test]
+    #[ignore]
+    fn claude_code_judges_for_real() {
+        let config =
+            reaper_core::rules::parse("rules: [{ id: prod, judge: Connecting to or querying a production database. }]")
+                .unwrap();
+        let backend = ClaudeCode { exe: on_path("claude").expect("claude on PATH"), model: "claude-haiku-5-5".into() };
+        for (command, verdict) in
+            [("psql postgres://prod-db.internal/app -c 'select 1'", vec!["prod"]), ("ls -la src/", vec![])]
+        {
+            let args = json!({ "command": command });
+            let prompt = super::super::prefix::layout(&[&config.rules[0]], &[], "fix the signup bug", "bash", &args);
+            let reply = backend.complete(&prompt, Duration::from_secs(20), 400).unwrap();
+            assert_eq!(super::super::watcher::parse_verdict(&reply), verdict, "{command}: {reply}");
+        }
+    }
+
+    const OPENAI_ANSWER: &str = r#"{"choices":[{"message":{"content":"{\"violated\":[\"prod\"]}"}}]}"#;
 }

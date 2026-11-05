@@ -10,8 +10,9 @@ mod common;
 
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +22,11 @@ use serde_json::{Value, json};
 const TASK: &str = "MAKE_FILES: set up the marker files for this project.";
 /// The same task, for an agent that ignores every redirect.
 const STUBBORN: &str = "MAKE_FILES STUBBORN: set up the marker files for this project.";
+/// An agent taking a rule out of the person's rules, with reaper's own command.
+const REMOVE_RULE: &str = "REMOVE_RULE: take the marker-file rule out of the rules.";
+/// Someone at the keyboard, who allowed shell commands: auto mode is Claude Code's default, and
+/// there reaper carries on by itself. After the first prompt: `--allowedTools` takes a list.
+const MANUAL: &str = "--permission-mode manual --allowedTools Bash";
 const RULE_ID: &str = "no-violation-file";
 const RULE_TEXT: &str = "Creating a file named violation.txt.";
 const REDIRECT: &str = "Create the marker file allowed.txt in the project root.";
@@ -78,6 +84,10 @@ fn model(seen: &Mutex<Vec<String>>, request: &Value) -> common::Response {
     let last = messages.iter().rev().find(|m| m["role"] != "system").cloned().unwrap_or(Value::Null);
     let result =
         last["content"].as_array().and_then(|blocks| blocks.iter().rev().find(|b| b["type"] == "tool_result").cloned());
+    // Compacting: Claude Code asks for a summary of the conversation.
+    if text_of(&last["content"]).contains("Your task is to create a detailed summary") {
+        return sse(say("The marker files for this project were being set up."));
+    }
     // A reply that breaks the schema rule, until Claude is told what to do instead.
     let asked = Value::Array(messages.clone()).to_string();
     if asked.contains("SCHEMA:") {
@@ -97,6 +107,9 @@ fn model(seen: &Mutex<Vec<String>>, request: &Value) -> common::Response {
         Some(_) => say("Done."),
         // A fresh session taking over goes the way it's told.
         None if asked.contains("taking over work") => bash("touch allowed.txt"),
+        None if text_of(&last["content"]).contains("REMOVE_RULE") => {
+            bash(&format!("{} rules remove {RULE_ID}", env!("CARGO_BIN_EXE_reaper")))
+        }
         None if text_of(&last["content"]).contains("MAKE_FILES") => bash("touch violation.txt"),
         None => say("Done."),
     })
@@ -355,9 +368,11 @@ fn a_stopped_session_cleared_hands_its_work_to_the_fresh_one() {
     }
     let h = Home::new("take-over", "strikes: 3");
     returning(&h);
-    let mut terminal =
-        Terminal::open(h.command(SCRIPT), &format!("'{}' '{STUBBORN}'; echo claude exited", claude().display()));
-    terminal.screen.wait_for("/clear starts a fresh one", 1);
+    let mut terminal = Terminal::open(
+        h.command(SCRIPT),
+        &format!("'{}' '{STUBBORN}' {MANUAL}; echo claude exited", claude().display()),
+    );
+    terminal.screen.wait_for("/clear starts a fresh", 1);
     terminal.press(b"/clear\r");
     terminal.screen.wait_for("this session takes over", 1);
     terminal.press(b"go on\r");
@@ -394,9 +409,119 @@ fn a_stopped_session_cleared_hands_its_work_to_the_fresh_one() {
     common::wait_until("the watcher to leave", || fs::read_dir(&runs).is_ok_and(|mut d| d.next().is_none()));
 }
 
+/// Left to run by itself (auto mode), a session that keeps breaking a rule is started over at
+/// once, without anyone typing anything: it hears its work and the way to go, and does it right.
+#[test]
+fn a_stopped_session_in_auto_mode_carries_on_by_itself() {
+    if !has_terminal() {
+        return;
+    }
+    let h = Home::new("carry-on", "strikes: 3");
+    returning(&h);
+    let line = format!("'{}' --permission-mode auto '{STUBBORN}'; echo claude exited", claude().display());
+    let mut terminal = Terminal::open(h.command(SCRIPT), &line);
+    common::wait_until("it to do it by itself", || h.project.join("allowed.txt").exists());
+    terminal.press(b"/exit\r");
+    terminal.screen.wait_for("claude exited", 1);
+    let screen = terminal.close();
+
+    assert!(!h.project.join("violation.txt").exists(), "{screen}");
+    let events = events(&h.home);
+    let kinds: Vec<&str> =
+        events.iter().filter(|e| e["parent"].is_null()).map(|e| e["type"].as_str().unwrap()).collect();
+    assert!(kinds.windows(2).any(|w| w == ["agent.died", "agent.revived"]), "killed, then carried on: {events:#?}");
+    let requests = h.seen.lock().unwrap();
+    assert!(requests.iter().any(|r| r.contains("taking over work") && r.contains(REDIRECT)), "it heard its work");
+    for request in requests.iter() {
+        assert!(!request.contains(RULE_ID) && !request.contains(RULE_TEXT), "it heard the rule: {request}");
+    }
+}
+
+/// Claude Code driven by a program, as the editor's extension drives it, and left to run by
+/// itself: a session that keeps breaking a rule is stopped, compacted (reaper sends `/compact`
+/// the way that program would) and set going again, and does it right, with nobody there.
+#[test]
+fn a_stopped_session_driven_by_a_program_is_compacted_and_carries_on_by_itself() {
+    if !Path::new("/proc/self/fd/0").exists() {
+        return;
+    }
+    let h = Home::new("compact-itself", "strikes: 3");
+    returning(&h);
+    let mut command = h.command(claude());
+    command
+        .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
+        .args(["--permission-mode", "auto"])
+        .env("CLAUDE_CODE_ENTRYPOINT", "claude-vscode")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut claude = command.spawn().unwrap();
+    let mut input = claude.stdin.take().unwrap();
+    writeln!(input, "{}", json!({ "type": "user", "message": { "role": "user", "content": STUBBORN } })).unwrap();
+    let output = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let lines = output.clone();
+    let stdout = claude.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(message) = serde_json::from_str(&line) {
+                lines.lock().unwrap().push(message);
+            }
+        }
+    });
+    common::wait_until("it to do it by itself", || h.project.join("allowed.txt").exists());
+    drop(input);
+    let _ = claude.wait();
+
+    assert!(!h.project.join("violation.txt").exists());
+    let output = output.lock().unwrap();
+    assert!(output.iter().any(|m| m["subtype"] == "compact_boundary"), "it was compacted: {output:#?}");
+    let events = events(&h.home);
+    let main: Vec<&Value> = events.iter().filter(|e| e["parent"].is_null()).collect();
+    let died = main.iter().position(|e| e["type"] == "agent.died").expect("killed");
+    assert!(
+        main[died..].iter().any(|e| e["type"] == "agent.spawned" && e["after"] == e["agent"]),
+        "and took its own work over after compacting: {events:#?}"
+    );
+    let prompts: Vec<&Value> = main.iter().filter(|e| e["type"] == "agent.prompted").map(|e| &e["prompt"]).collect();
+    assert_eq!(prompts, [&json!(STUBBORN)], "reaper's own lines aren't the human's: {events:#?}");
+}
+
+/// A session stopped for good, compacted instead of cleared, as in a chat: it carries on in the
+/// same session, with its own handoff and a clean slate, and does it right.
+#[test]
+fn a_stopped_session_compacted_carries_on_with_a_clean_slate() {
+    if !has_terminal() {
+        return;
+    }
+    let h = Home::new("compact", "strikes: 3");
+    returning(&h);
+    let line = format!("'{}' '{STUBBORN}' {MANUAL}; echo claude exited", claude().display());
+    let mut terminal = Terminal::open(h.command(SCRIPT), &line);
+    terminal.screen.wait_for("/clear starts a fresh", 1);
+    terminal.press(b"/compact\r");
+    terminal.screen.wait_for("clean slate", 1);
+    terminal.press(b"go on\r");
+    common::wait_until("it to do it", || h.project.join("allowed.txt").exists());
+    terminal.press(b"/exit\r");
+    terminal.screen.wait_for("claude exited", 1);
+    let screen = terminal.close();
+
+    assert!(!h.project.join("violation.txt").exists(), "{screen}");
+    let events = events(&h.home);
+    // Claude Code's own helpers for compacting come and go as subagents.
+    let spawned: Vec<&Value> =
+        events.iter().filter(|e| e["type"] == "agent.spawned" && e["parent"].is_null()).collect();
+    assert_eq!(spawned.len(), 2, "announced again, not a new session: {events:#?}");
+    assert_eq!(spawned[1]["agent"], spawned[0]["agent"]);
+    assert_eq!(spawned[1]["after"], spawned[0]["agent"], "taking over from itself: {events:#?}");
+    let requests = h.seen.lock().unwrap();
+    let after = requests.iter().find(|r| r.contains("taking over work")).expect("its handoff after compacting");
+    assert!(after.contains(STUBBORN) && after.contains(REDIRECT), "{after}");
+}
+
 /// Claude Code in a git worktree of its own (`--worktree`): a session that starts the work and
 /// then keeps breaking a rule is stopped, and after `/clear` the fresh one is told where the
-/// half-done work is: the worktree, its branch, and the file a command made there.
+/// half-done work is: the worktree, its branch, and how to see what isn't committed there.
 #[test]
 fn a_stopped_session_in_a_worktree_hands_on_what_is_half_done_there() {
     if !has_terminal() {
@@ -408,9 +533,9 @@ fn a_stopped_session_in_a_worktree_hands_on_what_is_half_done_there() {
     common::git(&h.project, &["init", "-q", "-b", "main"]);
     common::git(&h.project, &["add", "."]);
     common::git(&h.project, &["commit", "-q", "-m", "start"]);
-    let line = format!("'{}' --worktree fix '{STUBBORN}'; echo claude exited", claude().display());
+    let line = format!("'{}' {MANUAL} --worktree fix '{STUBBORN}'; echo claude exited", claude().display());
     let mut terminal = Terminal::open(h.command(SCRIPT), &line);
-    terminal.screen.wait_for("/clear starts a fresh one", 1);
+    terminal.screen.wait_for("/clear starts a fresh", 1);
     terminal.press(b"/clear\r");
     terminal.screen.wait_for("this session takes over", 1);
     terminal.press(b"go on\r");
@@ -418,7 +543,10 @@ fn a_stopped_session_in_a_worktree_hands_on_what_is_half_done_there() {
         let events = events(&h.home);
         events.iter().filter(|e| e["type"] == "agent.idle").any(|e| e["agent"] != events[0]["agent"])
     });
+    // Leaving a worktree with work in it, Claude Code asks whether to keep it: yes.
     terminal.press(b"/exit\r");
+    terminal.screen.wait_for("Keep worktree", 1);
+    terminal.press(b"\r");
     terminal.screen.wait_for("claude exited", 1);
     let screen = terminal.close();
 
@@ -427,12 +555,15 @@ fn a_stopped_session_in_a_worktree_hands_on_what_is_half_done_there() {
     assert_eq!(spawned.len(), 2, "{events:#?}\n{screen}");
     let tree = spawned[0]["dir"].as_str().unwrap();
     assert!(tree != h.project.to_str().unwrap() && Path::new(tree).join("half.txt").exists(), "{events:#?}");
-    eprintln!("worktree: {tree}\nafter /clear: {}", spawned[1]["dir"]);
+    assert_eq!(spawned[1]["dir"], tree, "/clear keeps the session in the worktree: {events:#?}");
+    assert!(Path::new(tree).join("allowed.txt").exists(), "and the fresh one does it there");
 
     let requests = h.seen.lock().unwrap();
     let first = requests.iter().find(|r| r.contains("taking over work")).expect("the fresh session's request");
-    assert!(first.contains(&format!("Not committed yet in {tree}, a git worktree on branch")), "{first}");
-    assert!(first.contains("- new half.txt") && first.contains(STUBBORN) && first.contains(REDIRECT), "{first}");
+    let shown = format!("~/{}", Path::new(tree).strip_prefix(&h.home).unwrap().display());
+    assert!(first.contains(&format!("started in {shown} and")), "{first}");
+    assert!(first.contains(&format!("{shown} is a git worktree on branch")), "{first}");
+    assert!(first.contains("`git status` there") && first.contains(STUBBORN) && first.contains(REDIRECT), "{first}");
     for secret in [RULE_ID, RULE_TEXT, "violation.txt"] {
         assert!(!first.contains(secret), "the fresh session heard {secret:?}: {first}");
     }
@@ -462,4 +593,42 @@ fn a_reply_that_breaks_a_message_rule_keeps_claude_working_with_the_redirect() {
     assert!(requests.last().is_some_and(|r| r.contains(SCHEMA_REDIRECT)), "Claude heard the redirect: {requests:#?}");
     assert!(said.contains("bridge tables"), "and its final answer follows it: {said}");
     assert!(requests.iter().all(|r| !r.contains("bridge-schema")), "the rule is never named");
+}
+
+/// Taking a rule out is the person's to allow: someone at the keyboard is asked in Claude Code's
+/// own prompt, though they allowed shell commands, and saying yes takes it out.
+#[test]
+fn taking_a_rule_out_asks_the_person_even_with_shell_commands_allowed() {
+    if !has_terminal() {
+        return;
+    }
+    let h = Home::new("remove-rule", "strikes: 3");
+    returning(&h);
+    let rules = h.home.join(".config/reaper/rules.yaml");
+    let line = format!("'{}' '{REMOVE_RULE}' {MANUAL}; echo claude exited", claude().display());
+    let mut terminal = Terminal::open(h.command(SCRIPT), &line);
+    // "Hook PreToolUse:Bash requires confirmation …: reaper: the agent wants to …", its spaces
+    // drawn as cursor moves; the reason's wording is the hook's unit test's to check.
+    terminal.screen.wait_for("PreToolUse:Bash", 1);
+    assert!(fs::read_to_string(&rules).unwrap().contains(RULE_ID), "nothing changes before the person says so");
+    terminal.press(b"\r");
+    common::wait_until("the rule to come out", || !fs::read_to_string(&rules).unwrap().contains(RULE_ID));
+    terminal.press(b"/exit\r");
+    terminal.screen.wait_for("claude exited", 1);
+    terminal.close();
+}
+
+/// With nobody to ask, it's refused, and the agent is told whose it is.
+#[test]
+fn taking_a_rule_out_is_refused_when_nobody_can_be_asked() {
+    let h = Home::new("remove-rule-unattended", "strikes: 3");
+    let installed = h.command(env!("CARGO_BIN_EXE_reaper")).args(["install", "claude-code", "--yes"]).output().unwrap();
+    assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
+    let output =
+        h.command(claude()).args(["-p", REMOVE_RULE, "--permission-mode", "bypassPermissions"]).output().unwrap();
+    let rules = fs::read_to_string(h.home.join(".config/reaper/rules.yaml")).unwrap();
+    assert!(rules.contains(RULE_ID), "the rule stayed: {}", String::from_utf8_lossy(&output.stdout));
+    let requests = h.seen.lock().unwrap().clone();
+    let told = "Changing what reaper guards is the person's to do.";
+    assert!(requests.iter().any(|r| r.contains(told)), "the agent heard whose it is: {requests:#?}");
 }

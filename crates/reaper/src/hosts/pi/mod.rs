@@ -3,6 +3,8 @@
 //!
 //!   {"op":"check","host":"pi","session":…,"agent":…,"dir":…,"tool":…,"args":{…},"goal":…}
 //!     → {"kind":"allow"} | {"kind":"kill","rule":…,"redirect":…,"strike":n,"final":bool,"reason"?:…}
+//!       | {"kind":"ask","rule":…,"redirect":…,"why":…} | {"kind":"noted","message":…}
+//!       | {"kind":"confirm","change":…}, for the person to allow: the call changes reaper itself
 //!       (plus "problem" when the rules on disk can't be used)
 //!   {"op":"warm","host":…,"agent":…,"dir":…,"goal":…}  → {"ok":true}, once the watcher has
 //!     the session's prefix: the human asked for something, so the prompt is logged too
@@ -65,6 +67,7 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
                     json!({ "kind": "ask", "rule": rule, "redirect": redirect, "why": why })
                 }
                 Decision::Noted { message } => json!({ "kind": "noted", "message": message }),
+                Decision::Confirm { change } => json!({ "kind": "confirm", "change": change }),
             };
             if let Some(problem) = &engine.problem {
                 reply["problem"] = problem.clone().into();
@@ -199,7 +202,10 @@ mod tests {
         assert_eq!(spawned["after"], "s1");
         assert!(work.starts_with("You're taking over work that an earlier session started in /w and"), "{work}");
         let died: Vec<&Value> = events.iter().filter(|e| e["type"] == "agent.died").collect();
-        assert!(died.iter().all(|d| d.get("dir").is_none() && d.get("goal").is_none()), "bookkeeping stays out of the log");
+        assert!(
+            died.iter().all(|d| d.get("dir").is_none() && d.get("goal").is_none()),
+            "bookkeeping stays out of the log"
+        );
         assert!(!log.contains("interactive"), "bookkeeping stays out of the log");
     }
 

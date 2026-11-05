@@ -27,14 +27,15 @@ usage:
   reaper run [--pi PATH] [ARGS]  a guarded pi session in this directory (ARGS go to pi)
   reaper install claude-code     guard Claude Code sessions (adds hooks to its settings)
   reaper install pi              guard pi sessions, however they're started (adds the extension)
-  reaper uninstall AGENT         stop guarding them
+  reaper uninstall AGENT         stop guarding them (when an agent runs it, you're asked first)
   reaper lint [FILE]             check a rules file
   reaper rules [--json] [FILE]   show the rules (--json: for scripts)
   reaper rules add [--check]     add the rule snippet on stdin, once its examples pass
                                  (the reaper-rule skill; in the console, press n on the rules tab)
   reaper rules remove ID [--check]  take one rule out of the rules file, the rest as it was
+                                 (when an agent runs it, you're asked first)
 
-used by agents, not by hand:
+run by pi's extension and Claude Code's hooks, not by hand:
   reaper engine                  one JSON request on stdin (the pi extension, and reaper itself)
   reaper hook claude-code        one Claude Code hook event on stdin
   reaper watch claude-code PID   reaps the Claude Code session PID when it sits idle (its hook starts this)

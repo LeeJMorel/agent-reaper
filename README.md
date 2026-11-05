@@ -24,9 +24,9 @@ database. reaper checks every command an agent runs and every file it touches ag
 of rules you wrote. When the agent tries something on the list, reaper stops it and gives it
 a better instruction instead ("use the local database"), and the agent keeps working without
 ever seeing the rule. An agent that breaks the same rule three times is killed, and a fresh
-session takes over its work: what you asked for, where it left things half done (worktree,
-branch and uncommitted changes, from git, jj, Mercurial, Sapling, Subversion or Fossil), and
-the better instruction. Agents you start through reaper are put down after five idle minutes
+session takes over its work: what you asked for, where it left things half done (the files
+it changed, and its checkout, worktree and branch in git, jj, Mercurial, Sapling, Subversion or
+Fossil), and the better instruction. Agents you start through reaper are put down after five idle minutes
 to free up memory, and pick up exactly where they left off when you come back.
 
 You can watch all of this happen. The console's **memento mori** tab draws each agent as a
@@ -103,7 +103,7 @@ Each rule describes a violation privately and says what to do instead.
 
 | Key | |
 |---|---|
-| `match` | Regexes over the call's arguments: `command`, `path` (any file read or written), or `"*"` for all of them. Deterministic and instant. |
+| `match` | Regexes over the call's arguments: `command`, `path` (any file read or written), `content` (the text written, never the text an edit replaces), or `"*"` for all of them. Deterministic and instant. |
 | `judge` | A plain-English description, decided by the watcher model. |
 | `redirect` | The only thing the agent ever hears. Write it as an instruction, not a prohibition; `reaper lint` flags redirects that say "don't". |
 | `tools` | Only check these tools. `message` means what the agent says: only rules that list it look at replies, judged by their `text`. |
@@ -120,11 +120,14 @@ several adds up. Strikes are never forgotten, and a session whose agents keep br
 between them is stopped together, until your next prompt.
 
 **The watcher** is a small model that judges `judge` rules: a trusted monitor watching a
-larger agent. It can be any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM, OpenRouter…)
-or Anthropic, with others under `fallback` to ask when it doesn't answer. Its prompt runs
+larger agent. It can be any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM, OpenRouter…),
+Anthropic, or the Claude Code you're signed in to (`kind: claude-code`), which uses your
+subscription instead of an API key and takes a few seconds a check. Others under `fallback`
+are asked when it doesn't answer. Press `w` on the console's rules tab to choose from the
+Claude Code and Ollama models you have; the other one becomes the fallback. Its prompt runs
 from most to least stable (rules → task → action), so checks reuse the model's prefix
-cache; on OpenAI-compatible endpoints its answer is constrained to a JSON verdict over your
-rule ids, with reasoning off; and when you submit a prompt it is sent your rules and the new
+cache; its answer is constrained to a JSON verdict over your rule ids, with reasoning off;
+and when you submit a prompt it is sent your rules and the new
 task ahead of the first check, so a model unloaded while you were away is ready in time.
 
 **Going in circles.** The same call that does something (a command, an edit, a fetch) made
@@ -149,9 +152,12 @@ agent adds the rule with `reaper rules add`.
 | Claude Code | ✓ |  | ✓ | ✓ |
 
 Claude Code's hooks can't edit the conversation, so a blocked attempt stays in its history;
-the agent still only hears the redirect, never the rule. Nor can they open a session, so once
-Claude Code is killed, `/clear` starts the fresh session that takes over its work; pi opens
-that one by itself. Replies are checked differently too:
+the agent still only hears the redirect, never the rule. Nor can they open a session: left to
+run by itself (auto mode and the like), a killed Claude Code carries its work on with a clean
+slate, compacted first where reaper can type `/compact` into it (the editor's, on Linux).
+Otherwise you're told to `/clear` (a fresh session takes over) or `/compact` (it carries on in
+the same chat). pi opens a fresh one by itself.
+Replies are checked differently too:
 pi checks what the agent wrote at the end of every turn and cuts a bad reply, while Claude Code
 checks its final reply when it stops and, if it breaks a rule, keeps it working with the
 redirect. Without pi installed, `reaper run` starts a guarded one, after downloading a pinned

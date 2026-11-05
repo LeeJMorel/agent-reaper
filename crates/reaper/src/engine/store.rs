@@ -8,10 +8,11 @@
 //! engine leaves a mark beside it; the session reaps itself if it is still idle.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use reaper_core::paths;
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,9 @@ pub struct Session {
     #[serde(default)]
     pub strikes: BTreeMap<String, u32>,
     /// What it has done wrong, as a share of what it's allowed: each kill adds one over the
-    /// rule's limit. Nothing takes it away: strikes are never forgotten.
+    /// rule's limit. Nothing takes it away while it's going. Once reaper has stopped it, a
+    /// session taking its work over (it, after compacting, or a fresh one) or the human asking it
+    /// for something new starts it over with a clean record.
     #[serde(default)]
     pub pressure: f64,
     /// As the session everyone in it works for (kept under the main agent's id).
@@ -58,6 +61,24 @@ pub struct Session {
     /// Stopped, its work waits here for a fresh session to take it over.
     #[serde(default)]
     pub handoff: Option<String>,
+    /// reaper typed `/compact` into it, left to run by itself, and sets it going again once
+    /// that's done.
+    #[serde(default)]
+    pub compacting: bool,
+}
+
+impl Session {
+    /// Starts its record over: no strikes, nothing blocked or asked about, nobody stopped. What
+    /// it was asked and changed stays.
+    pub fn wipe_record(&mut self) {
+        self.strikes.clear();
+        self.pressure = 0.0;
+        self.team = Team::default();
+        self.last_call = None;
+        self.repeats = 0;
+        self.blocked = None;
+        self.asking = None;
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -97,6 +118,11 @@ pub struct Live {
 /// A live file this old belongs to a session that's gone (it rewrites the file every 2 s).
 const STALE: Duration = Duration::from_secs(10);
 
+/// How long an update waits for a session's lock. Parallel tool calls each hold it for a moment;
+/// one held longer is stuck, or held on purpose, and a check that waited it out would run past
+/// its hook's timeout, which lets the call through. The update is dropped instead.
+const LOCK_WAIT: Duration = Duration::from_secs(1);
+
 pub fn mark_for(file: &Path) -> PathBuf {
     file.with_extension("reap")
 }
@@ -134,7 +160,14 @@ impl Store {
         let path = self.session_path(host, session);
         fs::create_dir_all(path.parent().expect("sessions dir"))?;
         let lock = File::options().create(true).truncate(false).write(true).open(path.with_extension("lock"))?;
-        lock.lock()?;
+        let asked = Instant::now();
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if asked.elapsed() < LOCK_WAIT => thread::sleep(Duration::from_millis(5)),
+                Err(e) => return Err(e.into()),
+            }
+        }
         let mut state: Session = fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let result = change(&mut state);
         let partial = path.with_extension(format!("json.{}", std::process::id()));

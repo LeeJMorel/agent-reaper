@@ -4,6 +4,7 @@ mod app;
 mod editor;
 mod mori;
 mod ui;
+mod watcher;
 mod writer;
 
 use std::io;

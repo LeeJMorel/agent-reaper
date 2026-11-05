@@ -6,9 +6,11 @@ pub mod pi;
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, ExitCode, ExitStatus};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use reaper_core::paths;
 
@@ -79,6 +81,50 @@ fn chose(agent: &str, guarded: bool) {
 
 pub fn on_path(program: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|dirs| env::split_paths(&dirs).map(|dir| dir.join(program)).find(|p| p.is_file()))
+}
+
+/// Runs an agent in print mode away from any project, so no project's instructions come
+/// along, with `input` on stdin; gives up after `timeout`. Its output, or its first word on
+/// what went wrong.
+pub fn headless(command: &mut Command, input: Option<&str>, timeout: Duration) -> Result<String, String> {
+    let mut child = command
+        .current_dir(env::temp_dir())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("couldn't start it: {e}"))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let input = input.to_string();
+        thread::spawn(move || stdin.write_all(input.as_bytes()));
+    }
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            text
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().expect("stdout is piped")));
+    let err = drain(Box::new(child.stderr.take().expect("stderr is piped")));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer within {:.1} seconds", timeout.as_secs_f32()));
+            }
+        }
+    };
+    let (out, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    if status.success() { Ok(out) } else { Err(first_line(if err.trim().is_empty() { &out } else { &err })) }
+}
+
+pub fn first_line(text: &str) -> String {
+    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("it failed without saying why").to_string()
 }
 
 fn exit_code(status: ExitStatus) -> ExitCode {

@@ -26,7 +26,7 @@ pub struct Issue {
 const NEGATIVE: &str = r"\b(don'?t|do not|never|avoid|stop|must not|mustn'?t|cannot|can'?t|shouldn'?t|should not|not allowed|forbidden|prohibited|instead of|refrain)\b";
 
 const ACTIONS: &[&str] = &["redirect", "stop"];
-const KINDS: &[&str] = &["openai", "anthropic"];
+const KINDS: &[&str] = &["openai", "anthropic", "claude-code"];
 
 fn words(text: &str) -> Vec<String> {
     text.to_lowercase()
@@ -172,7 +172,11 @@ pub fn lint(config: &Config) -> Vec<Issue> {
         Some(w) => {
             let fallbacks = w.fallback.iter().enumerate().map(|(i, f)| (format!("watcher fallback {}", i + 1), f));
             for (name, w) in std::iter::once(("watcher".to_string(), w)).chain(fallbacks) {
-                if w.base_url.is_none() || w.model.is_none() {
+                if w.kind.as_deref() == Some("claude-code") {
+                    if w.model.is_none() {
+                        l.push(Level::Error, None, None, format!("{name} needs a `model`"));
+                    }
+                } else if w.base_url.is_none() || w.model.is_none() {
                     l.push(Level::Error, None, None, format!("{name} needs `baseURL` and `model`"));
                 }
                 if let Some(kind) = &w.kind
@@ -289,7 +293,7 @@ rules:
         let issues = lint(
             &parse(
                 r#"
-watcher: { kind: openia, model: m, timeout: 5, fallback: [{ model: n, onError: kill }] }
+watcher: { kind: openia, model: m, timeout: 5, fallback: [{ model: n, onError: kill }, { kind: claude-code }] }
 reap: { idle: 5 minutes, after: 1, live: 0, free: lots }
 repeats: 1
 rule: []
@@ -309,9 +313,10 @@ projects:
         let all: Vec<_> = issues.iter().map(|i| i.message.as_str()).collect();
         for expected in [
             "watcher needs `baseURL` and `model`",
-            "watcher kind `openia` is not one of: openai, anthropic",
+            "watcher kind `openia` is not one of: openai, anthropic, claude-code",
             "unknown watcher key `timeout` is ignored",
             "watcher fallback 1 needs `baseURL` and `model`",
+            "watcher fallback 2 needs a `model`",
             "`onError` in watcher fallback 1 is ignored: the top watcher's applies",
             "reap.idle `5 minutes` is not a duration like 90s, 5m or 1h (or auto, or off); idle sessions are kept",
             "unknown reap key `after` is ignored",

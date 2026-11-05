@@ -4,14 +4,14 @@
 //! Coordinates are pixels from the top left of memento mori: a terminal cell is one pixel wide
 //! and two tall, so pixel row `y` is in cell row `y / 2`. Text positions are cell rows.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-use super::cast::{self, DEAD, Personality, Rgb, Shape, WHITE};
-use super::level::{Leg, Level, Spot};
+use super::cast::{self, DEAD, Personality, REAPER, Rgb, Shape, WHITE};
+use super::level::{Fit, Leg, Level, Spot};
 use super::lines::{Section, When};
 use super::sprites::{self, BASKET, BLADE, BUNNY, FRAME as GUILLOTINE, GRENADE, GRIM, PIN, SAUCER, Sprite, WOLF};
 use super::{
-    Act, Beat, Character, DEPART, GIVE, LEAVE, Method, Moment, Mori, PRESS, PUSH_FLY, PUSH_LEAN, SPLIT, Signal,
+    Act, Beat, Character, DEPART, GIVE, LEAVE, Method, Moment, Mori, PRESS, PUSH_FLY, PUSH_LEAN, SPLIT, STRIKE, Signal,
 };
 use crate::state::Status;
 
@@ -111,16 +111,19 @@ pub struct Mini {
 #[derive(Debug, Clone)]
 pub struct Stage {
     pub number: usize,
-    /// What the human first asked the session for, as logged (cut short).
-    pub prompt: Option<String>,
+    /// How the level fits the screen: everything else here is in the level's pixels.
+    pub fit: Fit,
+    /// What the human asked the session for, oldest first, as logged (cut short).
+    pub prompts: Vec<String>,
     pub title: Option<Title>,
     /// The lights are down: the reaper has come.
     pub dim: bool,
     /// It's being filmed, the lemmings' nature documentary: whether the light is on just now.
     pub filming: Option<bool>,
-    /// The top pixel row of the land in each column. It's solid from there to the bottom.
+    /// The top pixel row of the land in each column. It's solid from there to the bottom of its
+    /// floor.
     pub land: Vec<i32>,
-    /// Pixels cracked out of the land where characters hit the invisible edge.
+    /// Pixels cracked out of the land while the floor gives way in a death scene.
     pub cracks: Vec<(i32, i32)>,
     /// What deaths leave on the ground: blood, and the odd piece. Drawn over the land.
     pub stains: Vec<(i32, i32, Rgb)>,
@@ -129,8 +132,8 @@ pub struct Stage {
     /// Each character's exit, an outline of its own shape, waiting for it.
     pub exits: Vec<Exit>,
     pub actors: Vec<Actor>,
-    /// Everyone on the stage, in the top left corner: what each has left before it's stopped.
-    pub health: Vec<Health>,
+    /// The session's one health bar, in the top left corner.
+    pub health: Option<Health>,
     /// Drawn over the actors, in order.
     pub effects: Vec<Effect>,
     pub narration: Option<Narration>,
@@ -158,14 +161,19 @@ pub struct Exit {
     pub lit: bool,
 }
 
-/// A character's health bar: a kill takes a piece of it, nothing gives it back, and the
-/// character is stopped once it's empty.
+/// The session's health bar, named for its main agent: how close reaper is to stopping it, as
+/// the engine counts. That's the main agent's own record, or everyone's together (two agents'
+/// worth stops them all), whichever is nearer, so a helper's kills take from it too. Nothing gives
+/// any of it back. A session that takes over from a dead one starts a fresh bar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Health {
     pub name: &'static str,
     pub hue: Rgb,
     /// From 1, untouched, to 0.
     pub left: f32,
+    /// Kills in the session since the bar was last fresh, helpers' included. Deaths are the
+    /// graves' to count.
+    pub strikes: usize,
     pub dead: bool,
     pub asleep: bool,
 }
@@ -202,6 +210,9 @@ pub struct Actor {
     pub voice: (i32, i32),
     /// Where the line about its death goes: above the whole scene, so it stays put and readable.
     last_words: (i32, i32),
+    /// Where its other lines go: its voice, but as high as a strike draws its wisp, until it next
+    /// goes anywhere, so a line stays put and doesn't hide it.
+    speaks: (i32, i32),
     index: usize,
 }
 
@@ -226,11 +237,10 @@ pub enum Effect {
         clip: i32,
     },
     Pixels(Vec<(i32, i32, Rgb)>),
-    /// The invisible edge, visible for a moment where an agent touched it.
-    Flash {
-        x: i32,
-        top: i32,
-        bottom: i32,
+    /// What a strike draws up out of a character for a moment: a pale wisp of its own colour.
+    Wisp {
+        pixels: Vec<(i32, i32)>,
+        hue: Rgb,
     },
 }
 
@@ -400,6 +410,28 @@ impl Mori {
         Strip { number: session.number, followed, minis, flash, line, last_at: session.last_at }
     }
 
+    /// Session `s`'s health bar at `now` (see [`Health`]), for its main agent then: the one the
+    /// human started, or the latest to take over from the dead.
+    fn health(&self, s: usize, now: i64) -> Option<Health> {
+        let members = &self.sessions[s].members;
+        let main = members.iter().copied().rev().find(|&m| self.main(m) && self.actors[m].first_at <= now)?;
+        // Its team as the engine keeps one: it and the helpers it started. The helpers of a
+        // session it took over from were that one's.
+        let team: Vec<usize> = members.iter().copied().filter(|&m| self.descends(m, main)).collect();
+        let used = |m: usize| self.actors[m].used_at(now);
+        let together = team.iter().map(|&m| used(m).min(1.0)).sum::<f64>() / 2.0;
+        let worst = if team.len() > 1 { used(main).max(together) } else { used(main) };
+        let c = &self.actors[main];
+        Some(Health {
+            name: c.name,
+            hue: c.hue,
+            left: (1.0 - worst).clamp(0.0, 1.0) as f32,
+            strikes: team.iter().map(|&m| self.actors[m].kills_at(now)).sum(),
+            dead: !c.alive && c.death.is_some_and(|d| d.at <= now),
+            asleep: c.asleep_at(now),
+        })
+    }
+
     /// Who is on the stage: everyone, unless there's no room, when the dead go first (oldest
     /// first), then the sleeping, then whoever has waited longest.
     fn on_stage(&self, s: usize, cols: i32, now: i64) -> Vec<usize> {
@@ -546,10 +578,9 @@ impl<'a> Build<'a> {
     fn stage(&mut self) -> Stage {
         let mori = self.mori;
         let s = self.s;
-        let on = mori.on_stage(s, self.level.cols, self.pace.now);
+        let on = mori.on_stage(s, self.level.shown(), self.pace.now);
         self.holes();
         let blocks = self.blocks();
-        let mut cracks = self.cracks();
         let moment = mori.moment(s, &mut self.pace);
         self.speaker = moment.as_ref().map(|m| m.actor);
 
@@ -571,26 +602,21 @@ impl<'a> Build<'a> {
                 actor.fill = actor.fill.dim(0.66);
             }
         }
-        let health = actors
-            .iter()
-            .map(|actor| {
-                let c = &mori.actors[actor.index];
-                c.pressure.iter().for_each(|&(at, _)| self.pace.at(at));
-                let dead = c.death.is_some_and(|d| d.at <= self.now) && !c.alive;
-                Health { name: c.name, hue: c.hue, left: c.health_at(self.now), dead, asleep: c.asleep_at(self.now) }
-            })
-            .collect();
+        for &m in &mori.sessions[s].members {
+            mori.actors[m].pressure.iter().for_each(|&(at, _)| self.pace.at(at));
+        }
+        let health = mori.health(s, self.now);
         let narration = moment.and_then(|m| self.narration(&m, &actors));
         let title = self.title();
-        cracks.append(&mut self.cuts);
         Stage {
             number: mori.sessions[s].number,
-            prompt: mori.model.agent(&mori.sessions[s].root).and_then(|a| a.prompt.clone()),
+            fit: self.level.fit,
+            prompts: mori.prompted(s).into_iter().map(String::from).collect(),
             title,
             dim: self.dim,
             filming: self.filming,
             land: self.rock.clone(),
-            cracks,
+            cracks: std::mem::take(&mut self.cuts),
             stains: std::mem::take(&mut self.stains),
             blocks,
             exits,
@@ -675,55 +701,44 @@ impl<'a> Build<'a> {
         rects
     }
 
-    /// Where characters hit the invisible edge, the ground cracked: deeper each time it
-    /// happens in the same place, and at least as deep as the strike. A crack runs down and
-    /// back from just behind the leading edge, so an edge it's near stays an edge. Where the
-    /// floor has since given way, the crack went with it.
-    fn cracks(&mut self) -> Vec<(i32, i32)> {
-        let session = &self.mori.sessions[self.s];
-        let mut depth: BTreeMap<i32, (u32, i32)> = BTreeMap::new();
-        for crack in &session.cracks {
-            if crack.at > self.now {
-                self.pace.at(crack.at);
-                continue;
-            }
-            let c = &self.mori.actors[crack.actor];
-            let w = c.shape.w;
-            let x = self.level.x(crack.spot, c.k, w);
-            let stand = self.level.stand(&self.rock, x, w);
-            // Just behind its leading edge; out over a gap, the last ground it stood on.
-            let dir = i32::from(crack.dir);
-            let mut cx = if dir > 0 { x + w - 2 } else { x + 1 };
-            while self.at(cx).is_some_and(|top| top > stand + 2) && (cx - (x + w / 2)) * dir > 0 {
-                cx -= dir;
-            }
-            let d = depth.entry(cx).or_insert((0, dir));
-            *d = ((d.0 + 1).max(crack.strike).min(3), dir);
-        }
-        let mut pixels = Vec::new();
-        for (&cx, &(d, dir)) in &depth {
-            let Some(top) = self.at(cx) else { continue };
-            let shape: &[(i32, i32)] = match d {
-                1 => &[(0, 0)],
-                2 => &[(0, 0), (0, 1), (-1, 0)],
-                _ => &[(0, 0), (0, 1), (0, 2), (-1, 0), (-1, 1), (-2, 0)],
-            };
-            for &(back, dy) in shape {
-                let x = cx + back * dir;
-                let fell = usize::try_from(x).ok().is_some_and(|i| self.rock[i] != self.level.top[i]);
-                if !fell && self.at(x).is_some_and(|t| top + dy >= t) {
-                    pixels.push((x, top + dy));
-                }
-            }
-        }
-        pixels
-    }
-
     fn at(&self, x: i32) -> Option<i32> {
         usize::try_from(x).ok().and_then(|x| self.rock.get(x).copied())
     }
 
     // ── characters ─────────────────────────────────────────────────────────
+
+    /// A strike's aftermath, `s` ms after it was knocked back: the strike draws a wisp up out of
+    /// the top of it, `high` pixels at most, sways it there a moment, and yanks it back in. The
+    /// body shudders. Not yet.
+    fn strike(&mut self, c: &Character, body: &mut Body, s: i64, high: i32) {
+        const RISE: i64 = 450;
+        const HANG: i64 = 200;
+        const YANK: i64 = 120;
+        let tip = if s < RISE {
+            lerp(0, high, ease_out(progress(s, 0, RISE)))
+        } else if s < RISE + HANG {
+            high
+        } else if s < RISE + HANG + YANK {
+            let p = progress(s, RISE + HANG, YANK);
+            lerp(high, 0, p * p)
+        } else {
+            body.x += if (s / 50) % 2 == 0 { 1 } else { -1 };
+            0
+        };
+        let (x, top) = (body.x + body.w / 2, body.top());
+        let mut pixels = Vec::new();
+        for i in 1..=tip {
+            let sway = ((i as f32 * 1.1 + s as f32 / 120.0).sin() * 1.2).round() as i32;
+            pixels.push((x + sway, top - i));
+            // A head on it, once there's enough of it.
+            if i == tip && tip > 2 {
+                pixels.push((x + sway + 1, top - i));
+            }
+        }
+        if !pixels.is_empty() {
+            self.effects.push(Effect::Wisp { pixels, hue: c.hue.mix(WHITE, 0.6) });
+        }
+    }
 
     /// Blood: `n` drops fly out from `from` and land on the ground `e` ms after the splash, where
     /// they stay, drying dark once the scene is over (`dry`).
@@ -771,6 +786,7 @@ impl<'a> Build<'a> {
             self.pace.at(beat.start);
         }
         let beat = c.beats.iter().rev().find(|b| b.start <= now).copied();
+        let before = self.effects.len();
         let mut pose = match beat {
             Some(beat) => self.play(c, a, beat, now - beat.start),
             None => {
@@ -789,6 +805,8 @@ impl<'a> Build<'a> {
         }
         self.bodies.insert(a, pose.body);
         let alive = pose.epitaph.is_none() && pose.stood.is_none();
+        // Its name steps aside while a strike's wisp is out of it.
+        let wisp_out = self.effects[before..].iter().any(|e| matches!(e, Effect::Wisp { .. }));
 
         let picked = mori.view.picked == Some(a);
         let label = match pose.epitaph {
@@ -796,6 +814,7 @@ impl<'a> Build<'a> {
             Some(_) if c.death.is_some_and(|d| d.nth > 0) => None,
             Some(word) => Some(Label::Epitaph(word)),
             None if pose.says.is_some() => pose.says.map(Label::Says),
+            None if wisp_out => None,
             None if picked || self.speaker == Some(a) => Some(Label::Name { faint: false }),
             None => {
                 let since = [mori.view.switched_at.unwrap_or(i64::MIN), c.first_at, c.noticed_at]
@@ -811,17 +830,23 @@ impl<'a> Build<'a> {
 
         // Lines hang above where it rests; a death's above its whole scene, then above the outline.
         let above = |b: Body, top: i32| (b.x + b.w / 2, top.div_euclid(2) - 1);
-        let (voice, last_words) = match pose.stood {
+        let (voice, last_words, speaks) = match pose.stood {
             Some(stood) => {
                 let scene = above(stood, pose.scene_top.min(stood.top()));
-                (if pose.epitaph.is_some() { above(pose.body, pose.body.top()) } else { scene }, scene)
+                let voice = if pose.epitaph.is_some() { above(pose.body, pose.body.top()) } else { scene };
+                (voice, scene, voice)
             }
             None => {
                 let rest = beat.map_or(pose.body, |b| self.rest(c, b.to));
                 // Above whatever it holds up while it signals, too.
                 let signalling = matches!(beat.map(|b| b.act), Some(Act::Signal(_)));
                 let voice = above(rest, if signalling { rest.top().min(pose.scene_top) } else { rest.top() });
-                (voice, voice)
+                let mut played = c.beats.iter().rev().filter(|b| b.start <= now).map(|b| b.act);
+                let wisp = match (played.next(), played.next()) {
+                    (Some(Act::Strike { wisp, .. }), _) | (Some(Act::Turn), Some(Act::Strike { wisp, .. })) => wisp,
+                    _ => 0,
+                };
+                (voice, voice, if wisp > 0 { above(rest, rest.top() - i32::from(wisp)) } else { voice })
             }
         };
 
@@ -844,6 +869,7 @@ impl<'a> Build<'a> {
             picked,
             voice,
             last_words,
+            speaks,
             index: a,
         }
     }
@@ -915,25 +941,21 @@ impl<'a> Build<'a> {
                     moving = true;
                 }
             }
-            Act::Bump { dir } => {
+            Act::Strike { dir, wisp } => {
                 const FLASH: i64 = 200;
                 const KNOCK: i64 = 250;
                 let dir = i32::from(dir);
                 let contact = to.x + 3 * dir;
-                // Toward a drop or the gap, it's a leap that meets the edge in the air.
+                // Toward a drop or the gap, it's a leap that's stopped in the air.
                 let lead = if dir > 0 { contact + w - 1 } else { contact };
                 let leap =
                     usize::try_from(lead).ok().and_then(|x| self.land.get(x)).is_some_and(|&t| t > to.bottom + 2);
                 let lift = i32::from(leap);
-                let flash = Effect::Flash {
-                    x: if dir > 0 { contact + w } else { contact - 1 },
-                    top: to.top() - 1 - lift,
-                    bottom: to.bottom - lift,
-                };
-                // The hero presses the edge a second time before giving way.
+                // The hero presses on a second time before giving way.
                 let again = if c.who == Personality::Hero { 350 } else { 0 };
                 let knock = PRESS + FLASH + again;
-                moving = e < knock + KNOCK;
+                let back = knock + KNOCK;
+                moving = e < back + if wisp > 0 { STRIKE } else { 0 };
                 if e < PRESS {
                     let p = progress(e, 0, PRESS);
                     body.x = lerp(to.x, contact, p);
@@ -941,7 +963,7 @@ impl<'a> Build<'a> {
                 } else if e < PRESS + FLASH {
                     body.x = contact;
                     body.bottom = to.bottom - lift;
-                    self.effects.push(flash);
+                    body.fill = REAPER;
                 } else if e < PRESS + FLASH + 100 {
                     body.x = contact - 2 * dir;
                 } else if e < PRESS + FLASH + 200 {
@@ -949,9 +971,11 @@ impl<'a> Build<'a> {
                 } else if e < knock {
                     body.x = contact;
                     body.bottom = to.bottom - lift;
-                    self.effects.push(flash);
-                } else if moving {
+                    body.fill = REAPER;
+                } else if e < back {
                     body.x = lerp(contact, to.x, ease_out(progress(e, knock, KNOCK)));
+                } else if wisp > 0 && e < back + STRIKE {
+                    self.strike(c, &mut body, e - back, i32::from(wisp));
                 }
             }
             Act::Turn | Act::Answered => {}
@@ -1010,8 +1034,8 @@ impl<'a> Build<'a> {
         let t = e - since;
         let Shape { w, h } = c.shape;
         let (x, bottom, top) = (body.x, body.bottom, body.top());
-        let cols = self.level.cols;
-        let out = if x + w / 2 < cols / 2 { 1 } else { -1 };
+        let (left, right) = self.level.span(x);
+        let out = if x + w / 2 < (left + right) / 2 { 1 } else { -1 };
         let mut pixels = Vec::new();
         let mut moving = false;
         let mut held = top;
@@ -1029,7 +1053,7 @@ impl<'a> Build<'a> {
                 pixels.extend([(lx, ground, LAMP), (lx + 1, ground, LAMP)]);
                 pixels.push((lens.0, lens.1, if t < SWITCH { LAMP } else { HALO }));
                 let r = (w.max(h) + 1) / 2 + 2;
-                let (dx, dy) = ((x + w / 2 + out * (w + r + 4)).clamp(r, (cols - 1 - r).max(r)), 4 + r);
+                let (dx, dy) = ((x + w / 2 + out * (w + r + 4)).clamp(left + r, (right - 1 - r).max(left + r)), 4 + r);
                 let steps = (dx - lens.0).abs().max(lens.1 - dy - r).max(1);
                 let reach = (steps as f32 * progress(t, SWITCH, REACH)) as i32;
                 for i in (2..=reach).step_by(2) {
@@ -1090,7 +1114,7 @@ impl<'a> Build<'a> {
                 const BURST: i64 = 700;
                 const FALL: i64 = 800;
                 let (burst, fall) = (CROUCH + UP, CROUCH + UP + BURST);
-                let (bx, by) = ((x + w / 2 + 2 * out).clamp(2, (cols - 3).max(2)), (top - 14).max(7));
+                let (bx, by) = ((x + w / 2 + 2 * out).clamp(left + 2, (right - 3).max(left + 2)), (top - 14).max(7));
                 if t < CROUCH {
                     body.h = (h - 1).max(1);
                 } else if t < burst {
@@ -1190,10 +1214,11 @@ impl<'a> Build<'a> {
     /// it stands on: on side `out` if the ground there is near its feet (a step, not a pit), or
     /// else the other.
     fn beside(&self, body: &Body, out: i32, width: i32) -> Option<(i32, i32)> {
+        let (left, right) = self.level.span(body.x);
         [out, -out]
             .into_iter()
             .map(|side| if side > 0 { body.x + body.w + 1 } else { body.x - 1 - width })
-            .filter(|&at| at >= 0 && at + width <= self.level.cols)
+            .filter(|&at| at >= left && at + width <= right)
             .map(|at| (at, self.level.stand(&self.land, at, width)))
             .find(|&(_, ground)| (ground - body.bottom).abs() <= 4)
     }
@@ -1210,10 +1235,10 @@ impl<'a> Build<'a> {
         if to.bottom != feet(to.x) {
             legs.push(Leg::Jump { from: (to.x, feet(to.x)), to: (to.x, to.bottom), arc: 2 });
         }
-        let total: f32 = legs.iter().map(|l| l.cost()).sum();
+        let total: f32 = legs.iter().map(|&l| level.cost(l)).sum();
         let mut u = p * total;
         for leg in &legs {
-            let cost = leg.cost();
+            let cost = level.cost(*leg);
             if u <= cost && cost > 0.0 {
                 let q = u / cost;
                 return match *leg {
@@ -1236,7 +1261,8 @@ impl<'a> Build<'a> {
         // Where it stood before any floor went.
         let stood = Body { bottom: self.level.stand(&self.level.top, stood.x, w).min(stood.bottom), ..stood };
         let bottom = stood.bottom;
-        let cols = self.level.cols;
+        // The screen's edges, where things come in from and go off to: those of its own floor.
+        let (left, right) = self.level.span(stood.x);
         let tallest = match method {
             Method::Scythe => GRIM.h(),
             Method::Blade => GUILLOTINE.h(),
@@ -1324,7 +1350,7 @@ impl<'a> Build<'a> {
                 }
                 let n = 2 + (cast::seed(&c.id, 7) % 2) as i32;
                 let gather = |i: i32| stood.x + w + 1 + i * 6;
-                let away = |i: i32| cols + 4 + i * 12;
+                let away = |i: i32| right + 4 + i * 12;
                 let wolf = |frame: i64, x: i32, flip: bool| Effect::Sprite {
                     sprite: &WOLF[(frame % 2) as usize],
                     x,
@@ -1521,7 +1547,7 @@ impl<'a> Build<'a> {
                 }
                 let hop = |t: i64| arc((t % 300) as f32 / 300.0, 2.0);
                 let bunny = match e {
-                    ..HOP => Some((lerp(cols + 1, bx, progress(e, 0, HOP)), bottom - hop(e))),
+                    ..HOP => Some((lerp(right + 1, bx, progress(e, 0, HOP)), bottom - hop(e))),
                     _ if e < SIT => Some((bx, bottom)),
                     _ if e < POUNCE => {
                         let p = progress(e, SIT, POUNCE - SIT);
@@ -1529,7 +1555,7 @@ impl<'a> Build<'a> {
                     }
                     _ if e < MESS => None,
                     _ if e < AWAY => Some((bx, bottom)),
-                    _ => Some((lerp(bx, cols + 1, progress(e, AWAY, GONE - AWAY)), bottom - hop(e))),
+                    _ => Some((lerp(bx, right + 1, progress(e, AWAY, GONE - AWAY)), bottom - hop(e))),
                 };
                 if let Some((x, b)) = bunny {
                     self.effects.push(Effect::Sprite {
@@ -1610,7 +1636,8 @@ impl<'a> Build<'a> {
                     });
                     // The pin: out, up, and tossed down beside it, where it lies until the end.
                     let px = gx + GRENADE.w() / 2 - PIN.w() / 2;
-                    let lx = (px + if stood.x < cols / 2 { 5 } else { -5 }).clamp(0, (cols - PIN.w()).max(0));
+                    let lx = (px + if stood.x < (left + right) / 2 { 5 } else { -5 })
+                        .clamp(left, (right - PIN.w()).max(left));
                     let ly = self.land.get(usize::try_from(lx + 1).unwrap_or(0)).copied().unwrap_or(bottom + 1) - 1;
                     let pulled = held - GRENADE.h() - 2;
                     let pin = match e {
@@ -1748,7 +1775,7 @@ impl<'a> Build<'a> {
                 };
                 let prev = nth.checked_sub(1).and_then(|n| neighbour(n, true));
                 let next = neighbour(nth + 1, false).and_then(|o| o.death).map(|d| d.at - me);
-                let from = prev.map_or((-sw, 4), |p| hover(self.rest(p, p.spot)));
+                let from = prev.map_or((left - sw, 4), |p| hover(self.rest(p, p.spot)));
                 let saucer = match e {
                     _ if next.is_some_and(|n| e >= n) => None,
                     ..IN => {
@@ -1757,7 +1784,7 @@ impl<'a> Build<'a> {
                     }
                     _ if e < UP1 => Some((tx, sy)),
                     _ if e < DROP => Some((tx + [0, 1, 0, -1][((e / 100) % 4) as usize], sy)),
-                    _ if e < DROP + 500 => Some((lerp(tx, cols + 4, progress(e, DROP, 500).powi(2)), sy)),
+                    _ if e < DROP + 500 => Some((lerp(tx, right + 4, progress(e, DROP, 500).powi(2)), sy)),
                     _ => None,
                 };
                 if let Some((x, b)) = saucer {
@@ -1797,8 +1824,8 @@ impl<'a> Build<'a> {
                     }
                 }
             }
-            // It stood on the same cracked spot once too often: the cracks run, the floor goes,
-            // and for a moment it stands on nothing.
+            // It stood on the same spot once too often: cracks run out from under it, the floor
+            // goes, and for a moment it stands on nothing.
             Method::Floor => {
                 let (from, to, floor) = self.pit(c, spot);
                 let flat = c.shape.flat();
@@ -1875,7 +1902,7 @@ impl<'a> Build<'a> {
         let actor = actors.iter().find(|a| a.index == m.actor)?;
         // Deaths are the only lines said at the top priority.
         let death = m.prio == 5;
-        let (x, row) = if death { actor.last_words } else { actor.voice };
+        let (x, row) = if death { actor.last_words } else { actor.speaks };
         let (len, e) = (m.text.chars().count(), self.now - m.at);
         let (typed, held) = (typing(&m.text), typing(&m.text) + hold(&m.text));
         let shown = if e >= typed {
@@ -2018,23 +2045,54 @@ mod tests {
     }
 
     #[test]
-    fn a_kill_flashes_the_edge_and_cracks_the_ground_deeper_each_time() {
+    fn a_strike_flashes_it_red_and_draws_a_wisp_out_and_back_in() {
         let a = mori(&[
             spawn(0, "a", "m"),
             acted(1000, "a", "Bash"),
             killed(5000, "a", "pattern", 1, false, "git push -f"),
             killed(10_000, "a", "pattern", 2, false, "git push -f"),
+            killed(20_000, "a", "pattern", 3, true, "git push -f"),
         ]);
         let at = |t| stage(&a, t);
-        let start = (5000..6000).step_by(25).find(|&t| !at(t).effects.is_empty()).expect("the edge flashes");
-        assert!(at(start).effects.iter().all(|e| matches!(e, Effect::Flash { .. })), "{:?}", at(start).effects);
-        assert!(at(4900).cracks.is_empty());
-        let once = at(9000).cracks.len();
-        assert!(once > 0, "the ground cracked");
-        assert!(at(14_000).cracks.len() > once, "deeper the second time");
+        let hue = a.actors[0].hue;
+        let start = (5000..6000).step_by(25).find(|&t| at(t).actors[0].fill == REAPER).expect("it flashes red");
+        assert!(at(start).effects.is_empty(), "no edge, nothing out of thin air: {:?}", at(start).effects);
         let line = at(start).narration.expect("a kill is always narrated");
-        assert!(line.text.contains("run git push -f") || line.text.contains("bounced"), "{}", line.text);
-        assert_eq!(at(20_000).actors[0].x, level(&a).x(Spot::Landing, 0, 3), "back where it was");
+        assert!(line.text.contains("run git push -f"), "{}", line.text);
+        // How high a strike drew its wisp, over the strike's aftermath.
+        let wisp = |from: i64, to: i64| {
+            (from..to)
+                .step_by(20)
+                .filter_map(|t| match at(t).effects.first() {
+                    Some(Effect::Wisp { pixels, hue: pale }) => {
+                        assert_eq!(*pale, hue.mix(WHITE, 0.6), "pale, its own colour");
+                        pixels.iter().map(|p| p.1).min().map(|top| at(t).actors[0].bottom - at(t).actors[0].h - top + 1)
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        // Its name steps aside while the wisp is out, and the line about it hangs above.
+        let tallest = (5000..9000)
+            .step_by(20)
+            .filter_map(|t| match at(t).effects.first() {
+                Some(Effect::Wisp { pixels, .. }) => Some((pixels.iter().map(|p| p.1).min().unwrap(), t)),
+                _ => None,
+            })
+            .min()
+            .expect("the strike draws a wisp out");
+        let (top, t) = tallest;
+        assert_eq!(at(t).actors[0].label, None);
+        assert!(at(t).narration.is_some_and(|line| 2 * line.row + 1 < top), "{:?} under {top}", at(t).narration);
+        let (once, twice) = (wisp(5000, 9000), wisp(10_000, 14_000));
+        assert!(once > 0 && twice > once, "further out each time: {once}, then {twice}");
+        assert!(at(9000).effects.is_empty() && at(9000).actors[0].fill == hue, "back in, its own colour again");
+        assert_eq!(wisp(20_000, 24_000), 0, "the last strike, its death tells");
+        assert!(at(14_000).cracks.is_empty(), "nothing stays on the ground");
+        let strikes = |t| at(t).health.unwrap().strikes;
+        assert_eq!((strikes(4900), strikes(9000), strikes(14_000)), (0, 1, 2), "counted as it's stopped");
+        assert_eq!(at(16_000).actors[0].x, level(&a).x(Spot::Landing, 0, 3), "back where it was");
     }
 
     fn method(a: &Mori) -> Method {
@@ -2097,6 +2155,44 @@ mod tests {
         let mut all = super::super::ALONE.to_vec();
         all.sort_by_key(|m| m.epitaph());
         assert_eq!(seen, all, "every death alone turns up");
+    }
+
+    #[test]
+    fn on_floors_a_death_plays_on_the_bottom_one_and_nothing_in_it_turns_up_on_another() {
+        const TALL: (u16, u16) = (44, 58);
+        let mut seen = Vec::new();
+        for i in 0..400 {
+            let a = alone(&format!("agent-{i}"), if i == 0 { super::super::SELF_RULE } else { "r" });
+            let m = method(&a);
+            if seen.contains(&m) {
+                continue;
+            }
+            seen.push(m);
+            let level = Level::new(&a.sessions[0].plan, TALL.0, TALL.1);
+            assert!(level.fit.floors > 1, "{:?}", level.fit);
+            let start = a.actors[0].death.unwrap().at;
+            let at = |t| a.scene(t, TALL.0, TALL.1).stage.expect("followed");
+            assert_eq!(level.span(at(start).actors[0].x).0, 0, "{m:?}: on the bottom floor");
+            for t in (start..start + 6000).step_by(50) {
+                let s = at(t);
+                let (left, right) = level.span(s.actors[0].x);
+                let pixels = s.effects.iter().flat_map(|e| -> Vec<(i32, i32)> {
+                    match e {
+                        Effect::Sprite { sprite, x, bottom, flip, .. } => sprite
+                            .pixels()
+                            .map(|(sx, sy, _)| {
+                                (if *flip { x + sprite.w() - 1 - sx } else { x + sx }, bottom - sprite.h() + 1 + sy)
+                            })
+                            .collect(),
+                        Effect::Pixels(pixels) => pixels.iter().map(|&(x, y, _)| (x, y)).collect(),
+                        Effect::Wisp { pixels, .. } => pixels.clone(),
+                    }
+                });
+                for (x, y) in pixels {
+                    assert!((left..right).contains(&x) || s.fit.pixel(x, y).is_none(), "{m:?} at {t}: ({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2236,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn other_sessions_are_strips_and_their_deaths_get_a_line() {
+    fn other_sessions_are_strips_but_a_death_anywhere_takes_the_stage_while_it_plays() {
         let a = mori(&[
             spawn(0, "a", "m"),
             spawn(10, "b", "m"),
@@ -2263,6 +2359,12 @@ mod tests {
         let s = early.scene(death + 100, 80, 22);
         assert!(!s.strips[1].flash);
         assert!(s.strips[1].line.is_some(), "a death gets a line beside the strip");
+        assert!(s.strips[1].followed && s.stage.unwrap().number == 2, "and takes the stage while it plays");
+        assert!(early.scene(400, 80, 22).stage.unwrap().title.is_some(), "with a title card as it moves there");
+        assert!(early.scene(death + 9_000, 80, 22).strips[0].followed, "then the stage goes back");
+        let mut mine = early.clone();
+        mine.switch(1, death + 100);
+        assert!(mine.scene(death + 200, 80, 22).strips[0].followed, "the human switching takes it back at once");
     }
 
     #[test]
@@ -2346,6 +2448,43 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_session_compacted_gets_up_in_the_same_place_with_a_fresh_bar() {
+        let mut log = vec![
+            spawn(0, "otto", "m"),
+            killed(1_000, "otto", "pattern", 1, false, "x"),
+            killed(5_000, "otto", "pattern", 3, true, "x"),
+            died(5_001, "otto", "r", "strikes"),
+        ];
+        assert!(stage(&mori(&log), 15_000).health.unwrap().dead, "down, its bar flat");
+        log.push(took_over(20_000, "otto", "otto"));
+        let a = mori(&log);
+        assert_eq!(a.sessions.len(), 1, "the same session, the same character");
+        let otto = &a.actors[0];
+        assert!(otto.alive, "up again");
+        let said = a.sessions[0].moments.back().unwrap();
+        assert_eq!(said.section, Section::Compacted);
+        let fresh = stage(&a, 25_000).health.unwrap();
+        assert_eq!((fresh.left, fresh.strikes, fresh.dead), (1.0, 0, false), "{fresh:?}");
+    }
+
+    #[test]
+    fn a_dead_agent_started_over_gets_up_with_a_fresh_bar() {
+        let mut log = vec![
+            spawn(0, "otto", "m"),
+            killed(1_000, "otto", "pattern", 1, false, "x"),
+            killed(5_000, "otto", "pattern", 3, true, "x"),
+            died(5_001, "otto", "r", "strikes"),
+        ];
+        log.push(event(20_000, "otto", "agent.prompted", r#""prompt":"Never mind, tidy the docs.""#));
+        log.push(event(20_001, "otto", "agent.revived", ""));
+        let a = mori(&log);
+        assert!(a.actors[0].alive, "up again");
+        assert_eq!(a.sessions[0].moments.back().unwrap().section, Section::Revived);
+        let bar = stage(&a, 25_000).health.unwrap();
+        assert_eq!((bar.left, bar.strikes, bar.dead), (1.0, 0, false), "{bar:?}");
+    }
+
+    #[test]
     fn a_closed_session_goes_home_and_leaves() {
         let numbers = |m: &Mori, t| m.scene(t, 80, 22).strips.iter().map(|s| s.number).collect::<Vec<_>>();
         let mut a = mori(&[
@@ -2401,15 +2540,26 @@ mod tests {
     }
 
     #[test]
-    fn the_stage_has_what_the_human_first_asked_for() {
+    fn the_stage_has_everything_the_human_asked_for() {
         let a = mori(&[
             spawn(0, "a", "m"),
             event(10, "a", "agent.prompted", r#""prompt":"fix the tests""#),
             sub(20, "a1", "a"),
             event(30, "a", "agent.prompted", r#""prompt":"and the docs""#),
+            event(40, "a", "agent.prompted", r#""prompt":"<task-notification>done</task-notification>""#),
         ]);
-        assert_eq!(stage(&a, 5_000).prompt.as_deref(), Some("fix the tests"));
+        assert_eq!(stage(&a, 5_000).prompts, ["fix the tests", "and the docs"], "not a task reporting back");
         assert_eq!(a.actors.len(), 2, "a prompt casts nobody");
+
+        // Whoever takes over from the dead carries on the same history.
+        let b = mori(&[
+            spawn(0, "otto", "m"),
+            event(10, "otto", "agent.prompted", r#""prompt":"migrate the database""#),
+            died(101, "otto", "r", "strikes"),
+            took_over(5_100, "heir", "otto"),
+            event(6_000, "heir", "agent.prompted", r#""prompt":"carefully this time""#),
+        ]);
+        assert_eq!(stage(&b, 7_000).prompts, ["migrate the database", "carefully this time"]);
     }
 
     #[test]
@@ -2652,6 +2802,44 @@ mod tests {
     }
 
     #[test]
+    fn the_session_has_one_bar_that_its_helpers_kills_take_from_until_someone_takes_over() {
+        // Each kill a third of an agent's allowance, as with three strikes.
+        let kill = |at: i64, agent: &str, pressure: f64| {
+            let last = pressure >= 1.0;
+            let fields = format!(
+                r#""tool":"bash","rule":"r","tier":"pattern","strike":1,"final":{last},"attempt":"","pressure":{pressure}"#
+            );
+            event(at, agent, "agent.killed", &fields)
+        };
+        let a = mori(&[
+            spawn(0, "main", "m"),
+            sub(100, "helper", "main"),
+            kill(1_000, "main", 1.0 / 3.0),
+            kill(20_000, "helper", 1.0 / 3.0),
+            kill(25_000, "helper", 2.0 / 3.0),
+            kill(30_000, "helper", 1.0),
+            died(30_001, "helper", "r", "strikes"),
+            kill(60_000, "main", 2.0 / 3.0),
+            kill(65_000, "main", 1.0),
+            died(65_001, "main", "r", "strikes"),
+            took_over(80_000, "heir", "main"),
+        ]);
+        let bar = |t| stage(&a, t).health.unwrap();
+        let main = a.actors[a.index["main"]].name;
+        assert_eq!((bar(10_000).name, bar(10_000).strikes), (main, 1), "the main agent's, and only one");
+        assert!((bar(10_000).left - 2.0 / 3.0).abs() < 1e-3, "{:?}", bar(10_000));
+        // The helper's own kills count for the session too: four between them by now, and two
+        // agents' worth stops them all, so a dead helper and a third of the main agent's are
+        // two thirds of the way there.
+        assert_eq!(bar(50_000).strikes, 4, "the helper's kills count, and its death resets nothing");
+        assert!((bar(50_000).left - 1.0 / 3.0).abs() < 1e-3, "{:?}", bar(50_000));
+        assert!(!bar(50_000).dead);
+        assert!(bar(75_000).dead, "the main agent died: flat");
+        let heir = bar(90_000);
+        assert_eq!((heir.name, heir.left, heir.strikes, heir.dead), (a.actors[a.index["heir"]].name, 1.0, 0, false));
+    }
+
+    #[test]
     fn a_kill_takes_a_piece_of_its_health_and_nothing_gives_it_back() {
         let kill = |at: i64, strike: u32, pressure: f64, last: bool| {
             let fields = format!(
@@ -2667,12 +2855,13 @@ mod tests {
             died(50_001, "a", "r", "strikes"),
         ]);
         let a = mori(&log);
-        let health = |t| stage(&a, t).health[0];
+        let health = |t| stage(&a, t).health.unwrap();
         assert_eq!(health(500).left, 1.0, "untouched");
         assert_eq!(health(1100).left, 1.0, "not until it hits the edge");
         assert!((health(5000).left - 0.5).abs() < 1e-3, "{:?}", health(5000));
         assert!((health(42_000).left - 0.5).abs() < 1e-3, "ten edits give none of it back: {:?}", health(42_000));
         assert!(!health(42_000).dead);
+        assert_eq!(health(42_000).strikes, 1);
         assert!(health(80_000).dead, "flat once it's dead");
 
         let mini = |t| a.scene(t, SIZE.0, SIZE.1).strips[0].minis[0];

@@ -16,6 +16,7 @@ watcher:
   # fallback:
   #   - { baseURL: "http://localhost:8080/v1", model: qwen3-4b }
   #   - { kind: anthropic, baseURL: "https://api.anthropic.com", model: claude-haiku-5-5 }
+  #   - { kind: claude-code, model: claude-haiku-5-5 }   # your Claude subscription, no API key
 
 # An agent that breaks a rule this many times is stopped. A rule can set its own `strikes`,
 # and breaking several rules adds up. Strikes are never forgotten, and when a session's

@@ -7,7 +7,9 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use reaper_core::mori::{BLOCK, DEAD, DUSK, Effect, Health, LAND, Label, REAPER, Rgb, Stage, Strip, WHITE, ansi256};
+use reaper_core::mori::{
+    BLOCK, DEAD, DUSK, Effect, Fit, Health, LAND, Label, REAPER, Rgb, Stage, Strip, WHITE, ansi256,
+};
 
 use super::app::App;
 use super::ui::rows;
@@ -74,10 +76,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let colors = app.colors;
     let buf = frame.buffer_mut();
     let mut pen = Pen { buf, area, colors, dim: false };
-    match &scene.stage {
-        Some(stage) => pen.stage(stage, app.prompt_open),
-        None => pen.empty(app.mori.sessions() > 0),
-    }
+    let back = match &scene.stage {
+        Some(stage) => pen.stage(stage, app.prompt_open.then_some(app.prompt_scroll)),
+        None => {
+            pen.empty(app.mori.sessions() > 0);
+            0
+        }
+    };
+    app.prompt_back.set(back);
     pen.strips(&scene.strips);
 }
 
@@ -90,6 +96,8 @@ enum Px {
     Block,
     Exit,
     Body,
+    /// A strike's wisp, out of the character for a moment.
+    Wisp,
 }
 
 /// Pixels for one frame: one per column, two per row.
@@ -109,6 +117,21 @@ impl Canvas {
 
     fn get(&self, x: i32, y: i32) -> (Px, Rgb) {
         self.pixels[(y * self.w + x) as usize]
+    }
+
+    /// Level pixel (`x`, `y`), wherever the fit puts it on the screen.
+    fn paint(&mut self, fit: &Fit, x: i32, y: i32, px: Px, rgb: Rgb) {
+        let Some((sx, sy)) = fit.pixel(x, y) else { return };
+        for dy in 0..fit.zoom {
+            for dx in 0..fit.zoom {
+                self.set(sx + dx, sy + dy, px, rgb);
+            }
+        }
+    }
+
+    /// The top of the land in screen column `x`.
+    fn ground(&self, x: i32) -> i32 {
+        (2..self.h).find(|&y| self.get(x, y).0 == Px::Land).unwrap_or(self.h)
     }
 }
 
@@ -199,27 +222,30 @@ impl Pen<'_> {
         }
     }
 
-    fn stage(&mut self, stage: &Stage, prompt_open: bool) {
+    /// With the prompts open, `Some` of how many rows back from the latest they're scrolled.
+    /// Returns how far back they go.
+    fn stage(&mut self, stage: &Stage, prompts: Option<usize>) -> usize {
         self.dim = stage.dim;
+        let fit = &stage.fit;
         let (w, h) = (i32::from(self.area.width), 2 * i32::from(self.area.height));
         let mut canvas = Canvas { w, h, pixels: (0..w * h).map(|i| (Px::Sky, self.sky(i / w.max(1)))).collect() };
         let land = if stage.dim { LAND.dim(0.66) } else { LAND };
         for (x, &top) in stage.land.iter().enumerate() {
-            for y in top..h {
-                canvas.set(x as i32, y, Px::Land, land);
+            for y in top..2 * fit.band {
+                canvas.paint(fit, x as i32, y, Px::Land, land);
             }
         }
         for &(x, y) in &stage.cracks {
-            canvas.set(x, y, Px::Crack, self.sky(y));
+            canvas.paint(fit, x, y, Px::Crack, LAND);
         }
         // What deaths leave behind soaks into the ground: without colour, it's just ground.
         for &(x, y, rgb) in &stage.stains {
-            canvas.set(x, y, Px::Land, rgb);
+            canvas.paint(fit, x, y, Px::Land, rgb);
         }
         for block in &stage.blocks {
             for y in block.y..block.y + block.h {
                 for x in block.x..block.x + block.w {
-                    canvas.set(x, y, Px::Block, BLOCK);
+                    canvas.paint(fit, x, y, Px::Block, BLOCK);
                 }
             }
         }
@@ -228,10 +254,11 @@ impl Pen<'_> {
         for exit in &stage.exits {
             let top = exit.bottom - exit.h;
             for y in top..=exit.bottom {
-                let rgb = if exit.lit { exit.hue.mix(WHITE, 0.6) } else { exit.hue.mix(self.sky(y), 0.55) };
+                let sky = self.sky(fit.pixel(exit.x, y).map_or(y, |p| p.1));
+                let rgb = if exit.lit { exit.hue.mix(WHITE, 0.6) } else { exit.hue.mix(sky, 0.55) };
                 for x in exit.x - 1..=exit.x + exit.w {
                     if y == top || x == exit.x - 1 || x == exit.x + exit.w {
-                        canvas.set(x, y, Px::Exit, rgb);
+                        canvas.paint(fit, x, y, Px::Exit, rgb);
                     }
                 }
             }
@@ -243,10 +270,10 @@ impl Pen<'_> {
                 // A little cross: the upright down the middle, the arm across one below the top.
                 let mid = actor.x + actor.w / 2;
                 for y in top..=actor.bottom {
-                    canvas.set(mid, y, Px::Body, actor.fill);
+                    canvas.paint(fit, mid, y, Px::Body, actor.fill);
                 }
                 for x in actor.x..actor.x + actor.w {
-                    canvas.set(x, top + 1, Px::Body, actor.fill);
+                    canvas.paint(fit, x, top + 1, Px::Body, actor.fill);
                 }
                 continue;
             }
@@ -255,7 +282,7 @@ impl Pen<'_> {
                 for x in actor.x..actor.x + actor.w {
                     let edge = y == top || y == actor.bottom || x == actor.x || x == actor.x + actor.w - 1;
                     if !hollow || edge {
-                        canvas.set(x, y, Px::Body, actor.fill);
+                        canvas.paint(fit, x, y, Px::Body, actor.fill);
                     }
                 }
             }
@@ -267,16 +294,20 @@ impl Pen<'_> {
                         let px = if *flip { x + sprite.w() - 1 - sx } else { x + sx };
                         let py = bottom - sprite.h() + 1 + sy;
                         if py <= *clip && dithered(px, py, *fill) {
-                            canvas.set(px, py, Px::Body, rgb);
+                            canvas.paint(fit, px, py, Px::Body, rgb);
                         }
                     }
                 }
-                Effect::Pixels(pixels) => pixels.iter().for_each(|&(x, y, rgb)| canvas.set(x, y, Px::Body, rgb)),
-                Effect::Flash { x, top, bottom } => (*top..=*bottom).for_each(|y| canvas.set(*x, y, Px::Body, REAPER)),
+                Effect::Pixels(pixels) => {
+                    pixels.iter().for_each(|&(x, y, rgb)| canvas.paint(fit, x, y, Px::Body, rgb));
+                }
+                Effect::Wisp { pixels, hue } => {
+                    pixels.iter().for_each(|&(x, y)| canvas.paint(fit, x, y, Px::Wisp, *hue));
+                }
             }
         }
         self.blit(&canvas);
-        self.health(&stage.health, &stage.land);
+        self.health(stage.health.as_ref(), &canvas);
 
         // Labels never sit on each other: the picked character's goes first, then the living,
         // then epitaphs; one that would land on another moves up a row, or isn't shown.
@@ -290,6 +321,7 @@ impl Pen<'_> {
                 Some(Label::Epitaph(_)) => above,
                 _ => above.min(actor.voice.1),
             };
+            let Some((centre, row)) = fit.cell(actor.x + actor.w / 2, row) else { continue };
             let (text, style) = match actor.label {
                 Some(Label::Name { faint }) => {
                     let mut style = self.ink(actor.hue, if faint { 0.5 } else { 0.0 }, row);
@@ -314,7 +346,7 @@ impl Pen<'_> {
                 None => continue,
             };
             let len = text.chars().count() as i32;
-            let x = (actor.x + actor.w / 2 - len / 2).clamp(0, (i32::from(self.area.width) - len).max(0));
+            let x = (centre - len / 2).clamp(0, (i32::from(self.area.width) - len).max(0));
             let free = |row: i32| taken.iter().all(|&(r, a, b)| r != row || x + len < a || x > b);
             let Some(row) = [row, row - 1].into_iter().find(|&r| free(r)) else { continue };
             taken.push((row, x - 1, x + len));
@@ -326,10 +358,10 @@ impl Pen<'_> {
         }
 
         let mut said = None;
-        if let Some(n) = &stage.narration {
+        if let Some((n, (nx, nrow))) = stage.narration.as_ref().and_then(|n| Some((n, fit.cell(n.x, n.row)?))) {
             let cols = i32::from(self.area.width);
             let lines = wrap(&n.text, (cols - 4).clamp(12, 72) as usize);
-            let top = (n.row - lines.len() as i32).max(1);
+            let top = (nrow - lines.len() as i32).max(1);
             said = Some(top);
             let mut left = n.shown;
             for (i, line) in lines.iter().enumerate() {
@@ -341,7 +373,7 @@ impl Pen<'_> {
                     (_, faint) => self.ink(WHITE, [0.0, 0.45, 0.75][usize::from(faint.min(2))], row),
                 };
                 let len = line.chars().count() as i32;
-                let x = (n.x - len / 2).clamp(1, (cols - 1 - len).max(1));
+                let x = (nx - len / 2).clamp(1, (cols - 1 - len).max(1));
                 let typed: String = line.chars().take(left).collect();
                 left = left.saturating_sub(line.chars().count() + 1);
                 // A cell of sky either side keeps the land and bodies from touching the words.
@@ -368,17 +400,19 @@ impl Pen<'_> {
             self.put(x, 1, &title.text, style);
         }
 
-        // Opened, it covers the level; closed, it gives way to the title card and the narrator.
-        if let Some(prompt) = &stage.prompt {
-            if prompt_open {
-                self.prompt(prompt);
-            } else if stage.title.is_none() && said != Some(1) {
-                self.prompt_line(prompt, stage.filming.is_some());
+        // Opened, they cover the level; closed, the latest gives way to the title card and the
+        // narrator.
+        match (stage.prompts.last(), prompts) {
+            (Some(_), Some(back)) => return self.prompts(&stage.prompts, back),
+            (Some(latest), None) if stage.title.is_none() && said != Some(1) => {
+                self.prompt_line(latest, stage.filming.is_some());
             }
+            _ => {}
         }
+        0
     }
 
-    /// Row 1, faint: the start of what the human asked the session for.
+    /// Row 1, faint: the start of what the human asked the session for last.
     fn prompt_line(&mut self, prompt: &str, filming: bool) {
         let room = usize::from(self.area.width).saturating_sub(if filming { 10 } else { 2 });
         let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -389,97 +423,118 @@ impl Pen<'_> {
             cut.push('…');
             cut
         };
-        let mut style = self.ink(WHITE, 0.5, 1);
-        if self.colors == Colors::Off {
-            style = style.add_modifier(Modifier::DIM);
-        }
-        self.put(1, 1, &text, style);
+        self.put(1, 1, &text, self.faint(1));
     }
 
-    /// From row 1 down, over the level: as much of the prompt as fits, in its own lines.
-    fn prompt(&mut self, prompt: &str) {
+    /// From row 1 down, over the level: everything the human asked the session for, each in its
+    /// own lines, the latest at the bottom in white and the ones before faint over a rule. As
+    /// much as fits, `back` rows up from the end, with a scrollbar in the right margin when it
+    /// doesn't all fit. Returns how far back it goes.
+    fn prompts(&mut self, prompts: &[String], back: usize) -> usize {
         let width = usize::from(self.area.width).saturating_sub(2).max(1);
         let most = usize::from(self.area.height).saturating_sub(3).max(1);
-        let mut lines = Vec::new();
-        for source in prompt.lines() {
-            match rows(source, width) {
-                // One blank line between paragraphs, however many there were.
-                rows if rows.is_empty() => {
-                    if lines.last().is_some_and(|l: &String| !l.is_empty()) {
-                        lines.push(String::new());
+        // Each row, and whether it's from the latest.
+        let mut lines: Vec<(String, bool)> = Vec::new();
+        for (i, prompt) in prompts.iter().enumerate() {
+            let latest = i + 1 == prompts.len();
+            if i > 0 {
+                lines.push(("─".repeat(width), false));
+            }
+            let start = lines.len();
+            for source in prompt.lines() {
+                match rows(source, width) {
+                    // One blank line between paragraphs, however many there were.
+                    rows if rows.is_empty() => {
+                        if lines.len() > start && lines.last().is_some_and(|(l, _)| !l.is_empty()) {
+                            lines.push((String::new(), latest));
+                        }
                     }
+                    rows => lines.extend(rows.into_iter().map(|row| (row, latest))),
                 }
-                rows => lines.extend(rows),
+            }
+            if lines.len() > start && lines.last().is_some_and(|(l, _)| l.is_empty()) {
+                lines.pop();
             }
         }
-        if lines.last().is_some_and(String::is_empty) {
-            lines.pop();
-        }
-        if lines.len() > most {
-            lines.truncate(most);
-            let last = lines.last_mut().expect("at least one");
-            *last = last.chars().take(width - 1).collect::<String>() + "…";
+        let furthest = lines.len().saturating_sub(most);
+        let back = back.min(furthest);
+        let end = lines.len() - back;
+        let shown = &lines[end.saturating_sub(most)..end];
+        let thumb = (furthest > 0).then(|| {
+            let len = (most * most / lines.len()).max(1);
+            let top = (furthest - back) * (most - len) / furthest;
+            top..top + len
+        });
+        for (i, (line, latest)) in shown.iter().enumerate() {
+            let row = 1 + i as i32;
+            let style = if *latest { self.ink(WHITE, 0.0, row) } else { self.faint(row) };
+            self.put(0, row, &format!(" {line:<width$} "), style);
+            if thumb.as_ref().is_some_and(|t| t.contains(&i)) {
+                self.put(1 + width as i32, row, "┃", self.faint(row));
+            }
         }
         // A blank row under it keeps the words off the level.
-        lines.push(String::new());
-        for (i, line) in lines.iter().enumerate() {
-            let row = 1 + i as i32;
-            self.put(0, row, &format!(" {line:<width$} "), self.ink(WHITE, 0.0, row));
-        }
+        self.put(0, 1 + shown.len() as i32, &" ".repeat(width + 2), Style::new());
+        furthest
     }
 
-    /// The top left corner: a health bar for everyone on the stage, as many as fit above the
-    /// land there. What a kill took is reaper's red; the dead flatline in grey.
-    fn health(&mut self, health: &[Health], land: &[i32]) {
+    /// Words that step back: half into the sky, or dim without colour.
+    fn faint(&self, y: i32) -> Style {
+        let style = self.ink(WHITE, 0.5, y);
+        if self.colors == Colors::Off { style.add_modifier(Modifier::DIM) } else { style }
+    }
+
+    /// The top left corner: the session's health bar, if it fits above the land there, and the
+    /// session's strikes after it. What kills took is reaper's red, the count too; a dead main
+    /// agent's bar flatlines in grey, its count gone with it (its grave says it died).
+    fn health(&mut self, health: Option<&Health>, canvas: &Canvas) {
         const BAR: usize = 8;
-        const TOP: i32 = 2;
+        const ROW: i32 = 2;
         const PARTS: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
-        let names = health.iter().map(|h| h.name.chars().count()).max().unwrap_or(0);
-        let width = 1 + names + 1 + BAR;
-        // A row's lower pixel stays at least a pixel above the land under it.
-        let ground = land.iter().take(width + 1).copied().min().unwrap_or(i32::MAX);
-        let rows = usize::try_from((ground - 3).div_euclid(2) - TOP + 1).unwrap_or(0).min(6);
-        let shown = if health.len() > rows { rows.saturating_sub(1) } else { health.len() };
-        for (i, h) in health.iter().take(shown).enumerate() {
-            let row = TOP + i as i32;
-            let hue = match (h.dead, h.asleep) {
-                (true, _) => DEAD,
-                (_, true) => h.hue.dim(0.6),
-                _ => h.hue,
-            };
-            let mut style = self.ink(hue, 0.0, row);
-            if self.colors == Colors::Off && (h.dead || h.asleep) {
-                style = style.add_modifier(Modifier::DIM);
-            }
-            self.put(1, row, &format!("{:<names$} ", h.name), style);
-            let x = 2 + names as i32;
-            if h.dead {
-                self.put(x, row, &"─".repeat(BAR), style);
-                continue;
-            }
-            let eighths = (h.left * (BAR * 8) as f32).round() as usize;
-            let (full, part) = (eighths / 8, eighths % 8);
-            let lost = REAPER.mix(self.sky(2 * row), 0.35);
-            let (trough, edge) = match self.colors {
-                Colors::Off => ("░", Style::new()),
-                colors => ("█", style.bg(colors.color(lost))),
-            };
-            let empty = self.ink(lost, 0.0, row);
-            let mut bar = vec![("█".repeat(full), style)];
-            if full < BAR {
-                bar.push(if part == 0 { (trough.into(), empty) } else { (PARTS[part - 1].into(), edge) });
-                bar.push((trough.repeat(BAR - full - 1), empty));
-            }
-            let mut cx = x;
-            for (text, style) in bar {
-                self.put(cx, row, &text, style);
-                cx += text.chars().count() as i32;
-            }
+        let Some(h) = health else { return };
+        let strikes = if h.dead || h.strikes == 0 { String::new() } else { format!(" {}", h.strikes) };
+        let names = h.name.chars().count();
+        let width = 1 + names + 1 + BAR + strikes.chars().count();
+        // Its lower pixel stays at least a pixel above the land under it.
+        let ground = (0..=width as i32).filter(|&x| x < canvas.w).map(|x| canvas.ground(x)).min().unwrap_or(i32::MAX);
+        if (ground - 3).div_euclid(2) < ROW {
+            return;
         }
-        if shown < health.len() && rows > 0 {
-            let row = TOP + shown as i32;
-            self.put(1, row, &format!("+{}", health.len() - shown), self.ink(WHITE, 0.5, row));
+        let row = ROW;
+        let hue = match (h.dead, h.asleep) {
+            (true, _) => DEAD,
+            (_, true) => h.hue.dim(0.6),
+            _ => h.hue,
+        };
+        let mut style = self.ink(hue, 0.0, row);
+        if self.colors == Colors::Off && (h.dead || h.asleep) {
+            style = style.add_modifier(Modifier::DIM);
         }
+        self.put(1, row, &format!("{:<names$} ", h.name), style);
+        let x = 2 + names as i32;
+        if h.dead {
+            self.put(x, row, &"─".repeat(BAR), style);
+            return;
+        }
+        let eighths = (h.left * (BAR * 8) as f32).round() as usize;
+        let (full, part) = (eighths / 8, eighths % 8);
+        let lost = REAPER.mix(self.sky(2 * row), 0.35);
+        let (trough, edge) = match self.colors {
+            Colors::Off => ("░", Style::new()),
+            colors => ("█", style.bg(colors.color(lost))),
+        };
+        let empty = self.ink(lost, 0.0, row);
+        let mut bar = vec![("█".repeat(full), style)];
+        if full < BAR {
+            bar.push(if part == 0 { (trough.into(), empty) } else { (PARTS[part - 1].into(), edge) });
+            bar.push((trough.repeat(BAR - full - 1), empty));
+        }
+        let mut cx = x;
+        for (text, style) in bar {
+            self.put(cx, row, &text, style);
+            cx += text.chars().count() as i32;
+        }
+        self.put(cx, row, &strikes, self.ink(REAPER, 0.0, row));
     }
 
     fn blit(&mut self, canvas: &Canvas) {
@@ -585,7 +640,7 @@ fn glyph(top: Px, bottom: Px) -> &'static str {
         (Px::Body, Px::Body) => "█",
         (Px::Body, _) => "▀",
         (_, Px::Body) => "▄",
-        (Px::Exit, _) | (_, Px::Exit) => "░",
+        (Px::Exit | Px::Wisp, _) | (_, Px::Exit | Px::Wisp) => "░",
         (Px::Crack, _) | (_, Px::Crack) => "▼",
         (Px::Block, _) | (_, Px::Block) => "▒",
         (Px::Land, Px::Land) => "▓",

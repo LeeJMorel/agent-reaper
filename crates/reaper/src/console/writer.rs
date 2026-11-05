@@ -3,19 +3,16 @@
 //! can do is answer. Its snippet is checked like any other (`draft::check`), and goes back to
 //! it once with whatever failed.
 
-use std::env;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use reaper_core::draft::{self, Draft, Report};
 use reaper_core::rules::parse;
 use serde_json::Value;
 
 use crate::SKILL;
-use crate::hosts::{on_path, pi::release};
+use crate::hosts::{first_line, headless, on_path, pi::release};
 
 const TIMEOUT: Duration = Duration::from_secs(180);
 const TRIES: usize = 2;
@@ -123,43 +120,8 @@ fn pi_print(exe: &Path, prompt: &str) -> Result<String, String> {
     run(&mut command)
 }
 
-/// Runs it away from any project, so no project's instructions come along, and gives up
-/// after `TIMEOUT`.
 fn run(command: &mut Command) -> Result<String, String> {
-    let mut child = command
-        .current_dir(env::temp_dir())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("couldn't start it: {e}"))?;
-    let drain = |mut pipe: Box<dyn Read + Send>| {
-        thread::spawn(move || {
-            let mut text = String::new();
-            let _ = pipe.read_to_string(&mut text);
-            text
-        })
-    };
-    let out = drain(Box::new(child.stdout.take().expect("stdout is piped")));
-    let err = drain(Box::new(child.stderr.take().expect("stderr is piped")));
-    let deadline = Instant::now() + TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("no answer within {} seconds", TIMEOUT.as_secs()));
-            }
-        }
-    };
-    let (out, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
-    if status.success() { Ok(out) } else { Err(first_line(if err.trim().is_empty() { &out } else { &err })) }
-}
-
-fn first_line(text: &str) -> String {
-    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("it failed without saying why").to_string()
+    headless(command, None, TIMEOUT)
 }
 
 #[cfg(test)]

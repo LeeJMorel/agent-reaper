@@ -44,7 +44,9 @@ type Kill = {
 type AskThePerson = { kind: "ask"; rule: string; redirect: string; why: string }
 /** Something to tell the agent instead of running the call: the answer to `reaper ask`. */
 type Noted = { kind: "noted"; message: string }
-type Decision = ({ kind: "allow" } | Kill | AskThePerson | Noted) & { problem?: string }
+/** The call changes reaper itself (`reaper rules remove`, `reaper uninstall`): the person decides. */
+type Confirm = { kind: "confirm"; change: string }
+type Decision = ({ kind: "allow" } | Kill | AskThePerson | Noted | Confirm) & { problem?: string }
 type EventReply = {
   ok: true
   reapAfterMs?: number
@@ -58,6 +60,8 @@ export type Ask = <Reply>(request: Record<string, unknown>) => Promise<Reply>
 const AFTER = "reaper.after"
 /** Opens the session that takes over. The human can run it too, while there's work waiting. */
 const TAKE_OVER = "reaper-take-over"
+/** What an agent hears when it would change reaper and nobody can be asked (as the engine's). */
+const FOR_THE_PERSON = "Changing what reaper guards is the person's to do. Ask them to run it themselves."
 
 /** Filled in by `reaper install pi` in the copy it puts where pi finds extensions. */
 const INSTALLED = undefined as { bin: string } | undefined
@@ -343,7 +347,14 @@ export function reaper(ask: Ask = askReaper) {
       if (decision.kind === "ask") {
         const message = `It breaks the rule ${decision.rule} (${decision.redirect})\n\nThe agent's reason: ${decision.why}\n\nAllow this call just once?`
         const allowed = ctx.hasUI && (await ctx.ui.confirm(`reaper: ${decision.rule}`, message))
-        return allowed ? undefined : { block: true, reason: ctx.hasUI ? "The person said no." : "Nobody is here to allow it." }
+        return allowed
+          ? undefined
+          : { block: true, reason: ctx.hasUI ? "The person said no." : "Nobody is here to allow it." }
+      }
+      if (decision.kind === "confirm") {
+        if (!ctx.hasUI) return { block: true, reason: FOR_THE_PERSON }
+        const allowed = await ctx.ui.confirm("reaper", `The agent wants to ${decision.change}. Allow it?`)
+        return allowed ? undefined : { block: true, reason: "The person said no." }
       }
       kills.set(event.toolCallId, decision)
       // The reason is never seen by the model: the result is cut at turn_end.

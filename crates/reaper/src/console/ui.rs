@@ -17,6 +17,7 @@ use reaper_core::state::{Agent, Kill, Outcome, Status, WatcherHealth};
 
 use super::app::{App, Pane, RuleRow, Tab, plural};
 use super::mori;
+use super::watcher::Choice;
 use super::writer::Proposal;
 
 const ACCENT: Color = Color::Red;
@@ -169,62 +170,86 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 // ── header / footer ─────────────────────────────────────────────────────────
 
+/// On a narrow terminal the summary's counts go first, then, to make room for anything that needs
+/// the human, the other tabs come down to their numbers and the name goes.
 fn header(frame: &mut Frame, area: Rect, app: &App) {
-    let tab = |key: &str, name: &str, on: bool| {
-        let style = if on { bold().add_modifier(Modifier::REVERSED) } else { dim() };
-        Span::styled(format!(" {key} {name} "), style)
+    let tabs = |named: bool, brand: bool| {
+        let tab = |key: &str, name: &str, on: bool| {
+            let style = if on { bold().add_modifier(Modifier::REVERSED) } else { dim() };
+            Span::styled(if named || on { format!(" {key} {name} ") } else { format!(" {key} ") }, style)
+        };
+        let mut spans = Vec::new();
+        if brand {
+            spans.push(Span::styled(" reaper ", Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)));
+            spans.push(Span::raw(" "));
+        }
+        spans.extend([
+            tab("1", "live", app.tab == Tab::Live),
+            Span::raw(" "),
+            tab("2", "rules", app.tab == Tab::Rules),
+            Span::raw(" "),
+            tab("3", "memento mori", app.tab == Tab::Mori),
+        ]);
+        Line::from(spans)
     };
-    let left = Line::from(vec![
-        Span::styled(" reaper ", Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
-        tab("1", "live", app.tab == Tab::Live),
-        Span::raw(" "),
-        tab("2", "rules", app.tab == Tab::Rules),
-        Span::raw(" "),
-        tab("3", "memento mori", app.tab == Tab::Mori),
-    ]);
-    let room = (area.width as usize).saturating_sub(left.width() + 1);
-    let right = summary(app, room);
+    let width = usize::from(area.width);
+    let room = |left: &Line| width.saturating_sub(left.width() + 1);
+    let with_summary = |left: Line<'static>| {
+        let right = summary(app, room(&left));
+        (left, right)
+    };
+    let (left, right) = [tabs(true, true), tabs(false, true)]
+        .into_iter()
+        .map(with_summary)
+        .find(|(left, right)| right.width() <= room(left))
+        .unwrap_or_else(|| with_summary(tabs(false, false)));
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(right.width() as u16)]).areas(area);
     frame.render_widget(left, l);
     frame.render_widget(right, r);
 }
 
-/// Counts (of the agents listed) are dropped first, alerts last.
+/// What reaper is doing about it: anyone waiting on the human first, then today's kills,
+/// deaths over all time (they only go up), and the watcher. Short of room, the counts go first;
+/// what needs the human never does.
 fn summary(app: &App, room: usize) -> Line<'static> {
-    let agents = app.agents();
-    let working = agents.iter().filter(|a| matches!(a.status, Status::Working | Status::Killed)).count();
-    let dead = agents.iter().filter(|a| a.status == Status::Dead).count();
+    const ALERT: u8 = 9;
     let today = app.model.kills.iter().filter(|k| k.at >= app.today).count();
-    let mut parts = vec![
-        Span::raw(plural(agents.len(), "agent")),
-        Span::styled(format!("{working} working"), if working > 0 { fg(Color::Green) } else { Style::new() }),
-        Span::styled(format!("{dead} dead"), if dead > 0 { fg(ACCENT) } else { Style::new() }),
-        Span::raw(format!("{} today", plural(today, "kill"))),
-        match &app.model.watcher {
-            WatcherHealth::Unknown => Span::styled("watcher –", dim()),
-            WatcherHealth::Ok { .. } => Span::styled("watcher ok", fg(Color::Green)),
-            WatcherHealth::Failing { at, .. } => Span::styled(
+    // Asking for a yes or an answer, or stopped with its work waiting for them.
+    let asking = app.agents().iter().filter(|a| a.status == Status::Asking || a.waits_for.is_some()).count();
+    // Each with how readily it goes when there isn't room, lowest first.
+    let mut parts: Vec<(u8, Span<'static>)> = Vec::new();
+    if asking > 0 {
+        let need = if asking == 1 { "needs" } else { "need" };
+        let help = format!("{} {need} help", plural(asking, "agent"));
+        parts.push((ALERT, Span::styled(help, fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    }
+    parts.push((0, Span::raw(format!("{} today", plural(today, "kill")))));
+    parts.push((1, Span::raw(format!("{} dead", app.model.deaths))));
+    parts.push(match &app.model.watcher {
+        WatcherHealth::Unknown => (2, Span::styled("watcher –", dim())),
+        WatcherHealth::Ok { .. } => (2, Span::styled("watcher ok", fg(Color::Green))),
+        WatcherHealth::Failing { at, .. } => (
+            ALERT,
+            Span::styled(
                 format!("watcher failing ({} ago)", ago(app.now, *at)),
                 fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-        },
-    ];
-    let asking = agents.iter().filter(|a| a.status == Status::Asking).count();
-    if asking > 0 {
-        let need = if asking == 1 { "needs" } else { "need" };
-        parts.push(Span::styled(format!("{asking} {need} you"), fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-    }
+        ),
+    });
     if app.rules.error.is_some() {
-        parts.push(Span::styled("rules: syntax error", fg(ACCENT).add_modifier(Modifier::BOLD)));
+        parts.push((ALERT, Span::styled("rules: syntax error", fg(ACCENT).add_modifier(Modifier::BOLD))));
     }
-    let width = |parts: &[Span]| parts.iter().map(Span::width).sum::<usize>() + 3 * parts.len().saturating_sub(1) + 1;
-    while parts.len() > 1 && width(&parts) > room {
-        parts.remove(0);
+    let width = |parts: &[(u8, Span)]| {
+        parts.iter().map(|(_, s)| s.width()).sum::<usize>() + 3 * parts.len().saturating_sub(1) + 1
+    };
+    while width(&parts) > room
+        && let Some(least) = (0..parts.len()).filter(|&i| parts[i].0 < ALERT).min_by_key(|&i| parts[i].0)
+    {
+        parts.remove(least);
     }
 
     let mut spans = Vec::new();
-    for (i, part) in parts.into_iter().enumerate() {
+    for (i, (_, part)) in parts.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" · ", dim()));
         }
@@ -255,6 +280,7 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
             Tab::Live => {
                 vec![("1 2 3", "tabs"), ("tab", "switch pane"), ("↑↓", "select"), ("e", "edit rule"), ("q", "quit")]
             }
+            Tab::Rules if app.watcher_pick.is_some() => vec![("↑↓", "choose"), ("enter", "use it"), ("esc", "cancel")],
             Tab::Rules if app.proposal.is_some() => {
                 vec![("enter", "add this rule"), ("n", "describe again"), ("esc", "drop it"), ("q", "quit")]
             }
@@ -264,6 +290,7 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
                     ("1 2 3", "tabs"),
                     ("↑↓", "select"),
                     ("n", "new rule"),
+                    ("w", "watcher"),
                     ("e", "edit in your editor"),
                     ("q", "quit"),
                 ]
@@ -289,25 +316,37 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
 /// Only the keys that do something just now, most useful first, so a narrow terminal loses
 /// the least useful.
 fn mori_keys(app: &App) -> Vec<(&'static str, &'static str)> {
-    let mut keys = vec![("←→", "switch session"), ("↑↓", "check on agent")];
+    let scrolls = app.prompt_open && app.prompt_back.get() > 0;
+    let mut keys = vec![("←→", "switch session"), ("↑↓", if scrolls { "scroll prompts" } else { "check on agent" })];
     if app.mori.picked().is_some() {
         keys.extend([("enter", "details"), ("esc", "deselect")]);
     } else if !app.mori.following_the_action() {
         // Back to showing whichever session is busy.
         keys.push(("esc", "auto-switch"));
     }
-    if app.mori.prompt(app.mori_now()).is_some() {
+    if !app.mori.prompts(app.mori_now()).is_empty() {
         keys.push(("p", if app.prompt_open { "hide prompt" } else { "show prompt" }));
     }
     keys.extend([("q", "quit"), ("d", "demo a death")]);
     keys
 }
 
+/// Two panes side by side, the first `first` percent of the room, or one over the other on a
+/// narrow terminal that's taller than it is wide.
+fn split(area: Rect, first: u16) -> [Rect; 2] {
+    let shares = [Constraint::Percentage(first), Constraint::Percentage(100 - first)];
+    if area.width < 80 && area.width < 2 * area.height {
+        Layout::vertical(shares).areas(area)
+    } else {
+        Layout::horizontal(shares).areas(area)
+    }
+}
+
 // ── live tab ────────────────────────────────────────────────────────────────
 
 fn live(frame: &mut Frame, area: Rect, app: &App) {
     let [lists, detail] = Layout::vertical([Constraint::Min(6), Constraint::Length(10)]).areas(area);
-    let [left, right] = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(lists);
+    let [left, right] = split(lists, 40);
     agents(frame, left, app);
     kills(frame, right, app);
 
@@ -502,13 +541,20 @@ fn agent_detail(app: &App, rows: usize, width: usize) -> Text<'static> {
             ))],
         ),
     ];
-    // A subagent works on its session's prompt, and a session carrying on a dead one's work on
-    // that one's. One line: some prompts are pages long.
-    let prompt =
-        a.prompt.as_deref().or_else(|| app.model.agent(a.parent.as_deref().or(a.after.as_deref())?)?.prompt.as_deref());
+    // What it was asked last. A subagent works on its session's prompt, and a session carrying on
+    // a dead one's work on that one's until it's asked something itself. One line: some prompts
+    // are pages long.
+    fn latest(a: &Agent) -> Option<&str> {
+        a.prompts.last().map(|(_, prompt)| prompt.as_str())
+    }
+    let prompt = latest(a).or_else(|| latest(app.model.agent(a.parent.as_deref().or(a.after.as_deref())?)?));
     if let Some(prompt) = prompt {
         let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
         lines.insert(2, field("prompt", vec![Span::raw(fit(&flat, width.saturating_sub(LABEL)))]));
+    }
+    if let Some(command) = &a.waits_for {
+        let next = format!("stopped, its work waiting for you: {command} in its session carries it on");
+        lines.insert(2, field("next", vec![Span::styled(fit(&next, width.saturating_sub(LABEL)), fg(Color::Cyan))]));
     }
     let room = rows.saturating_sub(lines.len());
     let recent: Vec<&Event> = a.recent.iter().rev().take(room).collect();
@@ -540,6 +586,7 @@ fn describe(event: &Event) -> Span<'static> {
         }
         Kind::Redirected { .. } => Span::styled("redirected", fg(Color::Yellow)),
         Kind::Died { rule, .. } => Span::styled(format!("died: {rule}"), fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Kind::Revived => Span::styled("started over with a clean record", fg(Color::Green)),
         Kind::Asked => Span::styled("asked you", fg(Color::Cyan)),
         Kind::Idle => Span::styled("finished its turn", dim()),
         Kind::Ended => Span::styled("session closed", dim()),
@@ -559,7 +606,7 @@ fn describe(event: &Event) -> Span<'static> {
 // ── rules tab ───────────────────────────────────────────────────────────────
 
 fn rules(frame: &mut Frame, area: Rect, app: &App) {
-    if !app.rules.exists && app.proposal.is_none() && app.writing().is_none() {
+    if !app.rules.exists && app.proposal.is_none() && app.writing().is_none() && app.watcher_pick.is_none() {
         let text = Text::from(vec![
             Line::styled(format!("No rules file at {}.", tilde(&app.rules.path)), bold()),
             Line::raw(""),
@@ -582,15 +629,53 @@ fn rules(frame: &mut Frame, area: Rect, app: &App) {
         main
     };
 
-    let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(main);
+    let [left, right] = split(main, 45);
     rule_list(frame, left, app);
     let width = right.width.saturating_sub(2) as usize;
     let (title, detail) = match (app.writing(), &app.proposal) {
+        _ if app.watcher_pick.is_some() => ("Watcher", watcher_detail(app)),
         (Some(asked), _) => ("New rule", writing_detail(app, asked, width)),
         (None, Some(proposal)) => ("New rule", proposal_detail(app, proposal, width)),
         (None, None) => ("Rule", rule_detail(app, width)),
     };
     frame.render_widget(Paragraph::new(detail).block(pane(title.into(), false)).wrap(Wrap { trim: false }), right);
+}
+
+fn watcher_detail(app: &App) -> Text<'static> {
+    let Some((choices, at)) = &app.watcher_pick else { return Text::default() };
+    let now = app.rules.config.watcher.as_ref();
+    let mut lines = vec![
+        Line::styled("Choose the watcher", fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Line::styled("It judges the rules that have a judge, in every project. Pattern rules don't need it.", dim()),
+        Line::raw(""),
+    ];
+    let backup = |choice: &Choice| {
+        let first = choice.watcher.as_ref().and_then(|w| w.fallback.first());
+        first.and_then(|f| choices.iter().find(|c| c.is(Some(f)))).map(|c| c.name.clone())
+    };
+    for (i, choice) in choices.iter().enumerate() {
+        let here = i == *at;
+        let mut name = vec![
+            Span::styled(if here { "› " } else { "  " }, fg(ACCENT)),
+            Span::styled(choice.name.clone(), if here { bold() } else { Style::new() }),
+        ];
+        if choice.is(now) {
+            name.push(Span::styled("  (now)", dim()));
+        }
+        lines.push(Line::from(name));
+        lines.push(Line::styled(format!("    {}", choice.about), dim()));
+        if let Some(backup) = backup(choice) {
+            lines.push(Line::styled(format!("    When it can't answer: {backup}."), dim()));
+        }
+    }
+    if choices.len() == 1 {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Neither Claude Code nor Ollama is here. To use another watcher, press e and set it in the file.",
+            dim(),
+        ));
+    }
+    Text::from(lines)
 }
 
 fn writing_detail(app: &App, asked: &str, width: usize) -> Text<'static> {
@@ -819,12 +904,8 @@ mod tests {
         let app = fixture();
         let screen = render(&app, 110, 28);
         for expected in [
-            "2 agents",
+            "2 kills today · 1 dead · watcher ok",
             "◌ 000001 reaped",
-            "0 working",
-            "0 dead",
-            "2 kills today",
-            "watcher ok",
             "78e845",
             "a82065",
             "↻ redirected",
@@ -833,6 +914,38 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
         }
+    }
+
+    #[test]
+    fn the_header_puts_anyone_waiting_on_the_human_first_and_never_drops_them() {
+        let mut app = fixture();
+        let header = |app: &App, width: u16| render(app, width, 28).lines().next().unwrap_or_default().to_string();
+        assert!(!header(&app, 110).contains("help"), "nobody waiting, no mention: {}", header(&app, 110));
+        let piet = "01a18e1b-7417-7499-8113-59ad5578e845";
+        let asked = format!(r#"{{"at":1793385526500,"host":"pi","agent":"{piet}","type":"agent.asked"}}"#);
+        app.model.apply(&parse_line(&asked).unwrap());
+        assert!(
+            header(&app, 110).ends_with("1 agent needs help · 2 kills today · 1 dead · watcher ok"),
+            "{}",
+            header(&app, 110)
+        );
+        // A session stopped with its work waiting for the human needs them too, and says how.
+        let wren = "01a18e1b-74d4-7499-8113-59ae26a82065";
+        let waits = format!(
+            r#"{{"at":1793385526600,"host":"claude-code","agent":"{wren}","type":"agent.died","rule":"r","reason":"strikes","carry_on":"/compact"}}"#
+        );
+        app.model.apply(&parse_line(&waits).unwrap());
+        assert!(header(&app, 110).contains("2 agents need help"), "{}", header(&app, 110));
+        assert_eq!(app.model.agent(wren).unwrap().waits_for.as_deref(), Some("/compact"));
+        // Short of room, the counts go and the call for help stays.
+        let narrow = header(&app, 80);
+        assert!(narrow.contains("2 agents need help") && !narrow.contains("kills today"), "{narrow}");
+        // Narrower still, the tabs make room for it rather than run into it.
+        let tight = header(&app, 44);
+        assert!(tight.starts_with(" 1 live   2   3 ") && tight.ends_with("2 agents need help"), "{tight}");
+        app.model = Default::default();
+        let calm = header(&app, 50);
+        assert_eq!(calm, " reaper   1 live   2 rules   3 memento mori", "the counts just go");
     }
 
     #[test]
@@ -852,6 +965,29 @@ mod tests {
         for expected in
             ["global", "force-push", "my-app", "prod-db", "watcher openai qwen3:4b", "“Push to a new branch"]
         {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn the_watcher_choices_show_what_falls_back_and_which_is_in_use() {
+        use reaper_core::rules::Watcher;
+        let mut app = fixture();
+        app.on_key(key(KeyCode::Char('2')));
+        let mut claude = Watcher::new(Some("claude-code"), None, "claude-haiku-5-5");
+        let ollama = Watcher::new(None, Some("http://localhost:11434/v1"), "qwen3:4b");
+        claude.fallback.push(ollama.clone());
+        let choice = |name: &str, watcher| Choice { name: name.into(), about: "About it.".into(), watcher };
+        let choices =
+            vec![choice("Claude Code · claude-haiku-5-5", Some(claude)), choice("Ollama · qwen3:4b", Some(ollama))];
+        app.watcher_pick = Some((choices, 0));
+        let screen = render(&app, 110, 28);
+        for expected in [
+            "› Claude Code · claude-haiku-5-5",
+            "When it can't answer: Ollama · qwen3:4b.",
+            "qwen3:4b  (now)",
+            "enter use it",
+        ] {
             assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
         }
     }
@@ -943,14 +1079,18 @@ mod tests {
     }
 
     #[test]
-    fn a_sessions_prompt_shows_on_one_line_and_opens_with_p() {
+    fn a_sessions_latest_prompt_shows_on_one_line_and_p_opens_them_all() {
         let mut app = fixture();
         let piet = "01a18e1b-7417-7499-8113-59ad5578e845";
-        let prompt = format!("Make the tests pass.\n\n\n{}", "Then tidy up. ".repeat(150));
-        let line = serde_json::json!({ "at": 1_793_385_526_400_i64, "host": "pi", "agent": piet, "type": "agent.prompted", "prompt": prompt });
+        let prompted = |at: i64, prompt: &str| {
+            let line = serde_json::json!({ "at": at, "host": "pi", "agent": piet, "type": "agent.prompted", "prompt": prompt });
+            parse_line(&line.to_string()).unwrap()
+        };
         let mut events: Vec<Event> =
             include_str!("../../../reaper-core/tests/fixtures/events.jsonl").lines().filter_map(parse_line).collect();
-        events.insert(1, parse_line(&line.to_string()).unwrap());
+        let long = format!("Make the tests pass.\n\n\n{}", "Then tidy up. ".repeat(150));
+        events.insert(1, prompted(1_793_385_526_350, "Fix the login."));
+        events.insert(2, prompted(1_793_385_526_400, &long));
         app.model = reaper_core::state::Model::default();
         app.model.apply_all(&events);
         app.mori.clear();
@@ -967,14 +1107,31 @@ mod tests {
             "only keys that do something: {screen}"
         );
 
+        // Open, it starts at the end of the latest, and scrolls back to the start.
         app.on_key(key(KeyCode::Char('p')));
         let screen = render(&app, 80, 24);
         let rows: Vec<&str> = screen.lines().collect();
-        assert_eq!(rows[2], " Make the tests pass.", "its own lines: {screen}");
-        assert_eq!(rows[3], "", "one blank line between paragraphs: {screen}");
-        assert!(rows[4].starts_with(" Then tidy up."), "{screen}");
-        assert!(rows[20].ends_with('…') && rows[21].is_empty(), "as much as fits: {screen}");
-        assert!(rows[23].contains("p hide prompt"), "{screen}");
+        assert!(rows[20].starts_with(" tidy up. Then tidy up.") && rows[20].ends_with('┃'), "{screen}");
+        assert!(rows[2].contains("tidy up.") && !rows[2].ends_with('┃'), "{screen}");
+        assert!(rows[21].is_empty(), "off the level: {screen}");
+        assert!(rows[23].contains("↑↓ scroll prompts") && rows[23].contains("p hide prompt"), "{screen}");
+
+        app.on_key(key(KeyCode::PageUp));
+        app.on_key(key(KeyCode::PageUp));
+        let screen = render(&app, 80, 24);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(rows[2].starts_with(" Fix the login.") && rows[2].ends_with('┃'), "{screen}");
+        assert!(rows[3].starts_with(" ─────"), "a rule between prompts: {screen}");
+        assert!(rows[4].starts_with(" Make the tests pass.") && rows[4].ends_with('┃'), "its own lines: {screen}");
+        assert_eq!(rows[5].trim(), "┃", "one blank line between paragraphs: {screen}");
+        assert!(rows[6].starts_with(" Then tidy up."), "{screen}");
+        assert!(!rows[20].ends_with('┃'), "{screen}");
+
+        // Closed and opened again, it's back at the latest.
+        app.on_key(key(KeyCode::Char('p')));
+        app.on_key(key(KeyCode::Char('p')));
+        let screen = render(&app, 80, 24);
+        assert!(screen.lines().nth(20).unwrap().ends_with('┃'), "{screen}");
 
         app.on_key(key(KeyCode::Char('1')));
         app.pane = Pane::Agents;
@@ -990,9 +1147,7 @@ mod tests {
         // Shortly after Wren died, while its grave is still there.
         app.freeze(1_793_385_526_497 + 10_000);
         app.on_key(key(KeyCode::Char('3')));
-        let piet = app.mori.name("01a18e1b-7417-7499-8113-59ad5578e845").unwrap();
-        assert!(render(&app, 80, 24).contains(&format!("1 · {piet}")));
-        app.on_key(key(KeyCode::Right));
+        // Wren's death still has the stage, whichever session was being followed.
         let wren = app.mori.name("01a18e1b-74d4-7499-8113-59ae26a82065").unwrap();
         let screen = render(&app, 80, 24);
         assert!(screen.contains(&format!("2 · {wren}")), "{screen}");
@@ -1002,6 +1157,10 @@ mod tests {
             panic!("dead, with an epitaph: {:?}", stage.actors[0]);
         };
         assert!(screen.contains(word), "{word}: {screen}");
+        // Switching takes the stage back at once.
+        app.on_key(key(KeyCode::Left));
+        let piet = app.mori.name("01a18e1b-7417-7499-8113-59ad5578e845").unwrap();
+        assert!(render(&app, 80, 24).contains(&format!("1 · {piet}")));
     }
 
     #[test]
@@ -1014,7 +1173,8 @@ mod tests {
         let piet = app.mori.name("01a18e1b-7417-7499-8113-59ad5578e845").unwrap();
         assert!(screen.contains(&format!("▾ {piet}")), "{screen}");
         assert!(screen.contains('█') && screen.contains('▓'), "{screen}");
-        assert!(screen.contains('▼'), "a crack where it was stopped: {screen}");
+        let bar = screen.lines().find(|l| l.starts_with(&format!(" {piet} "))).expect("its health bar");
+        assert!(bar.contains("░ 1"), "stopped once, counted after the bar: {screen}");
         let Ok(mut terminal) = Terminal::new(TestBackend::new(80, 24));
         let Ok(_) = terminal.draw(|f| draw(f, &app));
         let buffer = terminal.backend().buffer();

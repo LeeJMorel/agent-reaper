@@ -351,7 +351,7 @@ fn a_stopped_session_hands_its_work_to_a_fresh_one_that_does_it_right() {
     let seen = h.seen.lock().unwrap();
     let first = seen.agent.iter().find(|r| r.contains("taking over work")).expect("the fresh session's first request");
     assert!(first.contains(STUBBORN) && first.contains(REDIRECT), "{first}");
-    assert!(first.contains("a git worktree on branch feature") && first.contains("- new half.txt"), "{first}");
+    assert!(first.contains("is a git worktree on branch feature; `git status` there"), "{first}");
     for secret in [RULE_ID, RULE_TEXT, "violation.txt"] {
         assert!(!first.contains(secret), "the fresh session heard {secret:?}: {first}");
     }
