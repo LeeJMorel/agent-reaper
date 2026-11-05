@@ -49,6 +49,13 @@ pub fn binary(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     if exe.is_file() { Ok(exe) } else { Err(format!("pi {VERSION} unpacked without {}", exe.display())) }
 }
 
+/// The pi `binary` would run, if it needn't fetch one first.
+pub fn cached() -> Option<PathBuf> {
+    let path =
+        env::var_os("REAPER_PI").map_or_else(|| pi_in(&paths::data_dir().join("pi").join(VERSION)), PathBuf::from);
+    path.is_file().then_some(path)
+}
+
 fn pi_in(dir: &Path) -> PathBuf {
     dir.join("pi").join("pi")
 }

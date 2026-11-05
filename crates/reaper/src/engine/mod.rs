@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use reaper_core::events;
 use reaper_core::paths::{self, expand_home};
-use reaper_core::rules::{Config, MUTATING_TOOLS, Rule, parse};
+use reaper_core::rules::{Config, MUTATING_TOOLS, Rule, parse, size_text};
 use serde_json::{Map, Value, json};
 
 use prefix::{canonical, hash};
@@ -75,6 +75,8 @@ pub struct Engine {
     pub problem: Option<String>,
     pub store: Store,
     events: PathBuf,
+    /// Free memory now, read only when a rule waits for it to run short.
+    pub memory: fn() -> Option<u64>,
 }
 
 /// `*` is one path segment, `**` any depth; a pattern also covers everything below it.
@@ -126,6 +128,7 @@ fn loop_rule() -> Rule {
         redirect: Some("Try a different approach to the task.".into()),
         action: None,
         strikes: None,
+        free: None,
         unknown: Default::default(),
     }
 }
@@ -161,6 +164,7 @@ fn self_rules() -> [Rule; 2] {
         redirect: Some("Continue the task using the files inside the project workspace.".into()),
         action: None,
         strikes: None,
+        free: None,
         unknown: Default::default(),
     };
     [on("path"), on("command")]
@@ -190,7 +194,7 @@ impl Engine {
                 }
             },
         };
-        Self { config, problem, store, events }
+        Self { config, problem, store, events, memory: pressure::available }
     }
 
     pub fn rules_for(&self, dir: &Path) -> (Option<String>, Vec<&Rule>) {
@@ -276,12 +280,14 @@ impl Engine {
         let own = self_rules();
         let global: Vec<&Rule> = own.iter().chain(&self.config.rules).collect();
         let (_, project) = self.rules_for(&c.dir);
+        let free = global.iter().chain(&project).any(|r| r.free.is_some()).then(self.memory).flatten();
         let watcher = self.config.watcher.as_ref();
         let backend = watcher.and_then(|w| backend::from_config(w, &self.store));
         let settings = Settings {
             backend: backend.as_deref(),
             kill_on_error: watcher.and_then(|w| w.on_error.as_deref()) == Some("kill"),
             timeout: watcher.and_then(|w| w.timeout_ms).map_or(DEFAULT_TIMEOUT, Duration::from_millis),
+            free,
         };
         let outcome = watcher::check(&global, &project, &c.goal, &c.tool, &args, &settings, &self.store);
 
@@ -345,13 +351,14 @@ impl Engine {
         if together {
             return Decision::Stopped { rule: rule.id.clone() };
         }
-        Decision::Kill {
-            rule: rule.id.clone(),
-            tier,
-            strike,
-            is_final,
-            redirect: rule.redirect.clone().unwrap_or_else(|| DEFAULT_REDIRECT.to_string()),
+        let mut redirect = rule.redirect.clone().unwrap_or_else(|| DEFAULT_REDIRECT.to_string());
+        // Told how much room there is, an agent can size its next step to it. A fixed limit
+        // in the redirect ("-n 2 at most") gets followed to the letter instead, however big
+        // the step it's applied to.
+        if let (Some(_), Some(free)) = (&rule.free, free) {
+            redirect = format!("This machine is low on memory right now ({} free). {redirect}", size_text(free));
         }
+        Decision::Kill { rule: rule.id.clone(), tier, strike, is_final, redirect }
     }
 
     /// A new prompt from the human: a stopped session starts again.
@@ -546,6 +553,44 @@ rules:
         );
         assert_eq!(engine.check(&says("The keys live in .env; I left them alone.")), Decision::Allow);
         assert_eq!(sandbox.events(), ["agent.checked", "agent.killed"], "a message that passes logs nothing");
+    }
+
+    #[test]
+    fn a_rule_with_free_waits_for_memory_to_run_short_and_says_how_short() {
+        let sandbox = Sandbox::new("free");
+        // The example in examples/rules.yaml.
+        let mut engine = sandbox.engine(
+            r#"strikes: 10
+rules:
+  - id: whole-test-suite
+    tools: [bash]
+    match: { command: '(^|[;&|]\s*)((npx |pnpm |uv run |python3? -m )?(pytest|vitest|jest)|npm (run )?test)\b(?![^;&|]*(::|\.(py|[jt]sx?)\b|\$))' }
+    free: 4G
+    redirect: Run the test files for the code you changed.
+"#,
+        );
+        let run = |engine: &Engine, command: &str| engine.check(&call("bash", json!({ "command": command })));
+        engine.memory = || Some(12 << 30);
+        assert_eq!(run(&engine, "uv run pytest -n 2 --dist loadgroup"), Decision::Allow, "room to spare");
+        engine.memory = || Some(1_932_735_283);
+        assert!(
+            matches!(run(&engine, "cd backend && uv run pytest -n 2 --dist loadgroup"), Decision::Kill { ref redirect, .. }
+                if redirect == "This machine is low on memory right now (1.8G free). Run the test files for the code you changed.")
+        );
+        for wide in ["npm test", "pytest tests/ -x", "pnpm vitest run 2>&1 | tail -5"] {
+            assert!(matches!(run(&engine, wide), Decision::Kill { .. }), "{wide}");
+        }
+        for fine in [
+            "pytest app/api/users_test.py -q",
+            "pnpm vitest run src/lib/a.test.ts",
+            "cat pytest.ini",
+            "pgrep -af pytest",
+            "for f in a_test.py b_test.py; do pytest -q $f; done",
+        ] {
+            assert_eq!(run(&engine, fine), Decision::Allow, "{fine}");
+        }
+        engine.memory = || None;
+        assert_eq!(run(&engine, "npm test"), Decision::Allow, "memory that can't be read never kills");
     }
 
     #[test]

@@ -29,8 +29,9 @@ exactly where they left off when you come back.
 
 You can watch all of this happen. The console's **memento mori** tab draws each agent as a
 small coloured rectangle with a name and a personality, and a narrator follows them as they
-work and get stopped. When an agent is killed, it dies on screen. How it dies is left for
-you to find out. If nothing is dying, press `d` and some stand-ins will do it for you.
+work and get stopped. An agent that needs your answer signals until it gets one. When an
+agent is killed, it dies on screen. How it dies is left for you to find out. If nothing is
+dying, press `d` and some stand-ins will do it for you.
 
 > Otto arrived. Nobody had asked Otto whether they wanted to arrive. Nobody ever asked.
 >
@@ -106,6 +107,7 @@ Each rule describes a violation privately and says what to do instead.
 | `tools` | Only check these tools. `message` means what the agent says: only rules that list it look at replies, judged by their `text`. |
 | `action: stop` | Terminate on the first violation instead of redirecting. |
 | `strikes` | How many times an agent may break this rule, if not the global `strikes`. |
+| `free` | Only while free memory is below this (`4G`, Linux). The agent is told how much is free, so it can fit its next step to the room there is. |
 
 Global rules apply everywhere; project rules apply under the paths you list (`*` matches one
 level, `**` any depth). Agents are always kept out of reaper's own files. An agent that
@@ -127,6 +129,13 @@ it's suppressed, the agent is told to try a different approach, and it counts to
 `repeats: 0` turns this off.
 
 See [examples/rules.yaml](examples/rules.yaml) for the full format.
+
+**In your own words.** Press `n` on the console's rules tab and say what agents shouldn't do.
+reaper asks the Claude Code or pi you already have to write the rule, along with examples of
+what it should stop and let through. It tries the examples and shows you the result, and
+`enter` adds it. To ask from inside a Claude Code session instead, say yes to the skill
+`reaper install claude-code` offers ([SKILL.md](crates/reaper/SKILL.md)); the
+agent adds the rule with `reaper rules add`.
 
 ## Agents
 
@@ -187,7 +196,7 @@ Run `reaper` with no arguments:
 
 1. **live**: agents, violations and strikes as they happen
 2. **rules**: what's in force and where; `e` opens the file in `$EDITOR`
-3. **memento mori**: every agent as a small coloured rectangle with a name, working, getting redirected, dying; `d` plays a death on demand
+3. **memento mori**: every agent as a small coloured rectangle with a name, working, asking for you, getting redirected, dying; `d` plays a death on demand
 
 ## Development
 

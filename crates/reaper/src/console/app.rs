@@ -4,12 +4,16 @@ use std::cell::Cell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use reaper_core::EXAMPLE_RULES;
+use reaper_core::draft;
 use reaper_core::lint::{Issue, Level, lint};
 use reaper_core::mori::Mori;
 use reaper_core::paths::tilde;
@@ -18,6 +22,7 @@ use reaper_core::state::{Agent, Kill, Model, QUIET_FOR, Status};
 use reaper_core::tail::{Tail, Update};
 
 use super::mori::Colors;
+use super::writer::{Proposal, Writer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -87,6 +92,14 @@ pub struct App {
     pub prompt_open: bool,
     /// The agents reaper is installed in, by name.
     pub guarded: Vec<&'static str>,
+    /// The agent that writes rules from the human's own words, if there's one here.
+    pub writer: Option<Arc<Writer>>,
+    /// The new rule the human is describing, as they type.
+    pub asking: Option<String>,
+    /// A rule being written: what was asked, and where the answer arrives.
+    writing: Option<(String, Receiver<Result<Proposal, String>>)>,
+    /// A written rule, tried, waiting for the human to add it or drop it.
+    pub proposal: Option<Proposal>,
     /// A fixed memento mori clock, for frames printed by `--dump` and for tests.
     clock: Option<i64>,
     dirty: bool,
@@ -116,6 +129,10 @@ impl App {
             colors: Colors::detect(),
             prompt_open: false,
             guarded: Vec::new(),
+            writer: None,
+            asking: None,
+            writing: None,
+            proposal: None,
             clock: None,
             dirty: true,
         };
@@ -206,6 +223,27 @@ impl App {
             self.dirty = true;
         }
 
+        if let Some((_, answer)) = &self.writing {
+            let written = match answer.try_recv() {
+                Ok(written) => Some(written),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("it stopped without an answer".into())),
+            };
+            match written {
+                None => {}
+                Some(Ok(proposal)) => {
+                    self.writing = None;
+                    self.proposal = Some(proposal);
+                    self.dirty = true;
+                }
+                Some(Err(e)) => {
+                    self.writing = None;
+                    let name = self.writer.as_ref().map_or("The agent", |w| w.name.as_str());
+                    self.notify(format!("{name} couldn't write the rule: {e}"), true);
+                }
+            }
+        }
+
         if self.notice.as_ref().is_some_and(|n| Instant::now() >= n.until) {
             self.notice = None;
             self.dirty = true;
@@ -226,6 +264,11 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Command {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Command::Quit;
+        }
+        if self.asking.is_some() {
+            self.type_key(key.code);
+            self.dirty = true;
+            return Command::Nothing;
         }
         if self.tab == Tab::Mori && self.mori_key(key.code) {
             self.dirty = true;
@@ -254,6 +297,12 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.step(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.step(isize::MAX),
             KeyCode::Char('e') => return self.edit(),
+            KeyCode::Char('n') if self.tab == Tab::Rules => self.new_rule(),
+            KeyCode::Enter if self.tab == Tab::Rules && self.proposal.is_some() => self.add_proposal(),
+            KeyCode::Esc if self.tab == Tab::Rules && (self.proposal.is_some() || self.writing.is_some()) => {
+                self.proposal = None;
+                self.writing = None;
+            }
             _ => return Command::Nothing,
         }
         self.dirty = true;
@@ -324,6 +373,68 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Describing it again starts from what was asked last.
+    fn new_rule(&mut self) {
+        if self.writer.is_none() {
+            return self.notify("Writing a rule for you takes Claude Code or pi; press e to write one yourself.", true);
+        }
+        self.asking = Some(self.proposal.as_ref().map(|p| p.asked.clone()).unwrap_or_default());
+    }
+
+    fn type_key(&mut self, code: KeyCode) {
+        let Some(text) = self.asking.as_mut() else { return };
+        match code {
+            KeyCode::Char(c) => text.push(c),
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Esc => self.asking = None,
+            KeyCode::Enter if !text.trim().is_empty() => {
+                let asked = std::mem::take(text);
+                self.asking = None;
+                self.start_writing(asked);
+            }
+            _ => {}
+        }
+    }
+
+    fn start_writing(&mut self, asked: String) {
+        let Some(writer) = self.writer.clone() else { return };
+        let (answer, arrives) = mpsc::channel();
+        let (question, rules) = (asked.clone(), self.rules.text.clone());
+        thread::spawn(move || {
+            let _ = answer.send(writer.write(&question, &rules));
+        });
+        self.proposal = None;
+        self.writing = Some((asked, arrives));
+    }
+
+    pub fn writing(&self) -> Option<&str> {
+        self.writing.as_ref().map(|(asked, _)| asked.as_str())
+    }
+
+    fn add_proposal(&mut self) {
+        let Some(proposal) = &self.proposal else { return };
+        // Tried again on the file as it is now: it may have changed while the agent wrote.
+        let report = draft::check(&proposal.draft, &self.rules.text);
+        let id = proposal.draft.rule.id.clone();
+        let text = report.text.clone().filter(|_| report.ok());
+        if let Some(proposal) = self.proposal.as_mut() {
+            proposal.report = report;
+        }
+        let Some(text) = text else {
+            return self.notify("This rule can't go in as it is: n describes it again, e opens the file.", true);
+        };
+        if let Err(e) = draft::save(&self.rules.path, &text) {
+            return self.notify(format!("Couldn't write {}: {e}", tilde(&self.rules.path)), true);
+        }
+        self.proposal = None;
+        self.rules.refresh();
+        self.issues = lint(&self.rules.config);
+        self.rule_sel = Some(id.clone());
+        self.notify(format!("Added {id}. Agents pick it up on their next action."), false);
     }
 
     fn edit(&mut self) -> Command {
@@ -590,6 +701,48 @@ pub mod tests {
         assert_eq!(app.selected_rule().unwrap().1.id, "bridge-schema");
         app.on_key(key(KeyCode::Home));
         assert_eq!(app.selected_rule().unwrap().1.id, "force-push");
+    }
+
+    #[test]
+    fn a_rule_described_in_plain_words_is_written_tried_and_added() {
+        const SNIPPET: &str = "rule:\n  id: no-sudo\n  tools: [bash]\n  match: { command: '(^|[;&|(]\\s*)sudo\\b' }\n  redirect: Run it without elevated rights, or ask the person to run it.\nstops: [sudo make install]\nallows: [cat sudoers.md]\n";
+        let dir = std::env::temp_dir().join(format!("reaper-console-new-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules.yaml");
+        fs::write(&rules, EXAMPLE_RULES).unwrap();
+        let mut app = App::new(rules.clone(), dir.join("events.jsonl"));
+        app.tab = Tab::Rules;
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(app.asking.is_none() && app.notice.as_ref().is_some_and(|n| n.bad), "no agent to ask");
+
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = asked.clone();
+        let ask = move |prompt: &str| {
+            *seen.lock().unwrap() = prompt.to_string();
+            Ok(SNIPPET.to_string())
+        };
+        app.writer = Some(Arc::new(Writer { name: "test".into(), ask: Box::new(ask) }));
+        app.on_key(key(KeyCode::Char('n')));
+        for c in "no sudoq".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.asking.as_deref(), Some("no sudoq"), "q is typed, not quit");
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.writing(), Some("no sudo"));
+        let started = Instant::now();
+        while app.proposal.is_none() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+            app.tick();
+        }
+        assert!(asked.lock().unwrap().contains("no sudo"));
+        assert!(app.proposal.as_ref().is_some_and(|p| p.report.ok()));
+
+        app.on_key(key(KeyCode::Enter));
+        assert!(fs::read_to_string(&rules).unwrap().contains("  - id: no-sudo\n"));
+        assert!(app.proposal.is_none());
+        assert_eq!(app.selected_rule().map(|(_, r)| r.id.as_str()), Some("no-sudo"));
     }
 
     #[test]

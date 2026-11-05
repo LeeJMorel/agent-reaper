@@ -266,9 +266,12 @@ export function reaper(ask: Ask = askReaper) {
       tell({ op: "warm", host: HOST, agent: await agent(ctx), dir: ctx.cwd, goal: event.prompt })
     })
     pi.on("agent_start", async () => busy())
-    pi.on("ui_prompt_start", async () => {
+    pi.on("ui_prompt_start", async (_event, ctx) => {
       dialogs++
       busy()
+      // Opened while the agent works, it's the agent asking the human. Whatever it does next
+      // says it was answered.
+      if (!ctx.isIdle()) await emit(ctx, await agent(ctx), "agent.asked")
     })
     pi.on("ui_prompt_end", async (_event, ctx) => {
       dialogs = Math.max(0, dialogs - 1)

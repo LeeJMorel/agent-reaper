@@ -10,7 +10,9 @@ use super::cast::{self, DEAD, Personality, Rgb, Shape, WHITE};
 use super::level::{Leg, Level, Spot};
 use super::lines::{Section, When};
 use super::sprites::{self, BASKET, BLADE, BUNNY, FRAME as GUILLOTINE, GRENADE, GRIM, PIN, SAUCER, Sprite, WOLF};
-use super::{Act, Beat, Character, DEPART, GIVE, LEAVE, Method, Moment, Mori, PRESS, PUSH_FLY, PUSH_LEAN, SPLIT};
+use super::{
+    Act, Beat, Character, DEPART, GIVE, LEAVE, Method, Moment, Mori, PRESS, PUSH_FLY, PUSH_LEAN, SPLIT, Signal,
+};
 use crate::state::Status;
 
 /// How often to redraw while something moves.
@@ -35,6 +37,16 @@ const WATER: Rgb = Rgb(0x9C, 0xC8, 0xEE);
 /// The gold at the edge of the holy hand grenade's blast, and the halo of the enlightened.
 const HALO: Rgb = Rgb(0xF5, 0xE6, 0xA0);
 const BEAM: Rgb = Rgb(0xB8, 0xF0, 0xC8);
+/// A smoke signal's puffs: pale, and never the grey of the dead.
+const SMOKE: Rgb = Rgb(0xE4, 0xE0, 0xEE);
+const FIRE: Rgb = Rgb(0xF0, 0xA0, 0x3C);
+/// A signal lamp, and its glass while it's dark.
+const LAMP: Rgb = Rgb(0x3A, 0x33, 0x52);
+/// While nobody answers, a signal goes up again this long after it first did, then twice as
+/// long after that, and so on, up to `NUDGE_MAX` apart.
+const NUDGE: i64 = 20_000;
+const NUDGE_MAX: i64 = 300_000;
+const RAYS: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
 
 pub(super) fn typing(text: &str) -> i64 {
     (text.chars().count() as i64 * 15).clamp(600, 1800)
@@ -47,6 +59,18 @@ fn hold(text: &str) -> i64 {
 
 pub(super) fn life(text: &str) -> i64 {
     typing(text) + hold(text) + FADE
+}
+
+/// `e` ms after a signal first went up: how many times it has gone up again since, when it
+/// last did, and when it will next.
+fn nudge(e: i64) -> (u64, i64, i64) {
+    let (mut k, mut since, mut gap) = (0, 0, NUDGE);
+    while since + gap <= e {
+        since += gap;
+        gap = (gap * 2).min(NUDGE_MAX);
+        k += 1;
+    }
+    (k, since, since + gap)
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +90,7 @@ pub struct Strip {
     pub minis: Vec<Mini>,
     /// Someone there was just stopped.
     pub flash: bool,
-    /// One short line after a death there.
+    /// One short line while someone there signals, or after a death there.
     pub line: Option<String>,
     pub last_at: i64,
 }
@@ -79,6 +103,8 @@ pub struct Mini {
     pub asleep: bool,
     /// Not at work: home in its exit after a turn, or not given anything to do yet.
     pub waiting: bool,
+    /// Signalling: it needs the human.
+    pub asking: bool,
 }
 
 /// The followed session's level, and everyone on it.
@@ -349,7 +375,11 @@ impl Mori {
                 let c = &self.actors[m];
                 let dead = c.death.is_some_and(|d| d.at <= now) && !c.alive;
                 let waiting = c.home_at(now) || self.status(m) == Some(Status::Idle);
-                Mini { hue: c.hue, alive: !dead, asleep: c.asleep_at(now), waiting }
+                for b in c.beats.iter().filter(|b| matches!(b.act, Act::Signal(_) | Act::Answered)) {
+                    pace.at(b.start);
+                }
+                let asking = c.signal_at(now).is_some();
+                Mini { hue: c.hue, alive: !dead, asleep: c.asleep_at(now), waiting, asking }
             })
             .collect();
         let flash = session.kill_at.is_some_and(|k| now >= k && now < k + STRIP_FLASH_FOR);
@@ -357,11 +387,16 @@ impl Mori {
             pace.at(k);
             pace.at(k + STRIP_FLASH_FOR);
         }
-        // A death's line beside the strip stays until the session does anything newer.
-        let line = session.death.as_ref().and_then(|(at, line)| {
-            pace.at(*at);
-            (now >= *at && session.last_at <= *at).then(|| line.clone())
-        });
+        // Someone signalling says so beside the strip until they hear back. A death's line
+        // stays until the session does anything newer.
+        let calling = session.members.iter().find_map(|&m| Some((m, self.actors[m].signal_at(now)?.0)));
+        let line = match calling {
+            Some((m, since)) => self.line(m, Section::Calling, When::Always, since as u64).map(|(text, _)| text),
+            None => session.death.as_ref().and_then(|(at, line)| {
+                pace.at(*at);
+                (now >= *at && session.last_at <= *at).then(|| line.clone())
+            }),
+        };
         Strip { number: session.number, followed, minis, flash, line, last_at: session.last_at }
     }
 
@@ -402,6 +437,8 @@ impl Mori {
         let mut moments: Vec<&Moment> = session.moments.iter().collect();
         let quiet = self.quiet_line(s, pace);
         moments.extend(quiet.as_ref());
+        let nudge = self.nudge_line(s, pace);
+        moments.extend(nudge.as_ref());
         moments.sort_by_key(|m| m.at);
         let said = |after: i64| moments.iter().any(|n| n.at > after && n.at <= now);
         let mut current: Option<&Moment> = None;
@@ -441,6 +478,23 @@ impl Mori {
         let a = self.view.picked.filter(|p| alive.contains(p)).unwrap_or(alive[0]);
         let (text, _) = self.line(a, Section::Idle, When::Always, at as u64)?;
         Some(Moment { at, actor: a, prio: 1, view: false, quiet: true, section: Section::Idle, text })
+    }
+
+    /// Nobody has answered: each time a signal goes up again, a line about it.
+    fn nudge_line(&self, s: usize, pace: &mut Pace) -> Option<Moment> {
+        let now = pace.now;
+        let mut latest: Option<(i64, usize)> = None;
+        for &m in &self.sessions[s].members {
+            let Some((start, _)) = self.actors[m].signal_at(now) else { continue };
+            let (k, since, next) = nudge(now - start);
+            pace.at(start + next);
+            if k > 0 && latest.is_none_or(|(at, _)| start + since > at) {
+                latest = Some((start + since, m));
+            }
+        }
+        let (at, a) = latest?;
+        let (text, _) = self.line(a, Section::Nudge, When::Always, at as u64)?;
+        Some(Moment { at, actor: a, prio: 3, view: false, quiet: false, section: Section::Nudge, text })
     }
 }
 
@@ -764,7 +818,9 @@ impl<'a> Build<'a> {
             }
             None => {
                 let rest = beat.map_or(pose.body, |b| self.rest(c, b.to));
-                let voice = above(rest, rest.top());
+                // Above whatever it holds up while it signals, too.
+                let signalling = matches!(beat.map(|b| b.act), Some(Act::Signal(_)));
+                let voice = above(rest, if signalling { rest.top().min(pose.scene_top) } else { rest.top() });
                 (voice, voice)
             }
         };
@@ -798,6 +854,7 @@ impl<'a> Build<'a> {
         let mut body = to;
         let mut moving = false;
         let mut home = false;
+        let mut scene_top = None;
 
         match beat.act {
             Act::Arrive { parent } => match parent.and_then(|p| self.bodies.get(&p).copied()) {
@@ -897,7 +954,8 @@ impl<'a> Build<'a> {
                     body.x = lerp(contact, to.x, ease_out(progress(e, knock, KNOCK)));
                 }
             }
-            Act::Turn => {}
+            Act::Turn | Act::Answered => {}
+            Act::Signal(signal) => scene_top = Some(self.signal(c, signal, beat.start, e, &mut body)),
             Act::Home => {
                 home = e >= 150;
                 self.pace.at(beat.start + 150);
@@ -939,7 +997,205 @@ impl<'a> Build<'a> {
         if moving {
             self.pace.moving();
         }
-        Pose { body, epitaph: None, home, stood: None, scene_top: body.top(), says: None }
+        Pose { body, epitaph: None, home, stood: None, scene_top: scene_top.unwrap_or(body.top()), says: None }
+    }
+
+    /// Signalling for the human where it stands, toward the open sky in the middle of the
+    /// level: the signal plays, holds still, and plays again each time nobody has answered for a
+    /// while. Only the playing redraws. Returns the top pixel row of what it holds up near
+    /// itself, for lines about it to hang above.
+    fn signal(&mut self, c: &Character, signal: Signal, start: i64, e: i64, body: &mut Body) -> i32 {
+        let (_, since, next) = nudge(e);
+        self.pace.at(start + next);
+        let t = e - since;
+        let Shape { w, h } = c.shape;
+        let (x, bottom, top) = (body.x, body.bottom, body.top());
+        let cols = self.level.cols;
+        let out = if x + w / 2 < cols / 2 { 1 } else { -1 };
+        let mut pixels = Vec::new();
+        let mut moving = false;
+        let mut held = top;
+
+        match signal {
+            // A lamp at its feet switches on, its beam reaches up, and there in the sky is a disc
+            // of light with the character's own outline in it.
+            Signal::Searchlight => {
+                const SWITCH: i64 = 250;
+                const REACH: i64 = 600;
+                const GROW: i64 = 500;
+                // With no ground for it beside, it holds the lamp up on its head.
+                let (lx, ground) = self.beside(body, out, 2).unwrap_or((x + w / 2 - 1, top - 1));
+                let lens = (if out > 0 { lx + 1 } else { lx }, ground - 1);
+                pixels.extend([(lx, ground, LAMP), (lx + 1, ground, LAMP)]);
+                pixels.push((lens.0, lens.1, if t < SWITCH { LAMP } else { HALO }));
+                let r = (w.max(h) + 1) / 2 + 2;
+                let (dx, dy) = ((x + w / 2 + out * (w + r + 4)).clamp(r, (cols - 1 - r).max(r)), 4 + r);
+                let steps = (dx - lens.0).abs().max(lens.1 - dy - r).max(1);
+                let reach = (steps as f32 * progress(t, SWITCH, REACH)) as i32;
+                for i in (2..=reach).step_by(2) {
+                    let p = i as f32 / steps as f32;
+                    pixels.push((lerp(lens.0, dx, p), lerp(lens.1, dy + r, p), HALO.dim(0.75)));
+                }
+                let lit = lerp(0, r, progress(t, SWITCH + REACH, GROW));
+                let (sx, sy) = (dx - w / 2, dy - h / 2);
+                for py in dy - lit..=dy + lit {
+                    for px in dx - lit..=dx + lit {
+                        if lit > 0 && (px - dx).pow(2) + (py - dy).pow(2) <= lit * lit + lit {
+                            // Its outline is the sky, left dark in the light.
+                            if !((sx..sx + w).contains(&px) && (sy..sy + h).contains(&py)) {
+                                pixels.push((px, py, HALO));
+                            }
+                        }
+                    }
+                }
+                moving = t < SWITCH + REACH + GROW;
+            }
+            // A little fire beside it, and three puffs of smoke, one after another.
+            Signal::Smoke => {
+                const LIGHT: i64 = 200;
+                const APART: i64 = 450;
+                const RISE: i64 = 70;
+                const UP: i32 = 12;
+                // With no ground for a fire beside it, the smoke comes off the top of its head.
+                let fire = self.beside(body, out, 3);
+                let (fx, ground) = fire.unwrap_or((x + w / 2 - 1, top + 1));
+                moving = t < LIGHT + 2 * APART + i64::from(UP + 1) * RISE;
+                if fire.is_some() {
+                    pixels.extend((fx..fx + 3).map(|px| (px, ground, FIRE)));
+                    if t >= LIGHT / 2 {
+                        let flicker = if moving { ((t / 120) % 3) as i32 } else { 1 };
+                        pixels.push((fx + flicker, ground - 1, HALO));
+                    }
+                }
+                for i in 0..3 {
+                    let age = t - LIGHT - APART * i;
+                    let rise = (age / RISE) as i32;
+                    if age < 0 || rise > UP {
+                        continue;
+                    }
+                    let (px, py) = (fx + 1 + out * rise / 2, ground - 2 - rise);
+                    let mut puff = vec![(px, py), (px - 1, py), (px + 1, py), (px, py - 1)];
+                    if rise > 4 {
+                        puff.extend([(px - 1, py - 1), (px + 1, py - 1), (px - 2, py), (px + 2, py), (px, py - 2)]);
+                    }
+                    pixels.extend(puff.into_iter().map(|(x, y)| (x, y, SMOKE)));
+                }
+                held = ground - 4 - UP;
+            }
+            // It crouches and fires: up it goes, bursts in its colour, and a tiny parachute opens,
+            // so the flare hangs there.
+            Signal::Flare => {
+                const CROUCH: i64 = 200;
+                const UP: i64 = 600;
+                const BURST: i64 = 700;
+                const FALL: i64 = 800;
+                let (burst, fall) = (CROUCH + UP, CROUCH + UP + BURST);
+                let (bx, by) = ((x + w / 2 + 2 * out).clamp(2, (cols - 3).max(2)), (top - 14).max(7));
+                if t < CROUCH {
+                    body.h = (h - 1).max(1);
+                } else if t < burst {
+                    let p = ease_out(progress(t, CROUCH, UP));
+                    let (hx, hy) = (lerp(x + w / 2, bx, p), lerp(top - 1, by, p));
+                    pixels.extend([(hx, hy, WHITE), (hx, hy + 1, HALO), (hx, hy + 2, HALO.dim(0.7))]);
+                } else if t < fall {
+                    let reach = (1 + (t - burst) / 120) as i32;
+                    if t < burst + 150 {
+                        pixels.push((bx, by, WHITE));
+                    }
+                    for (ox, oy) in RAYS {
+                        for k in (reach - 2).max(1)..=reach.min(5) {
+                            let tip = k == reach.min(5);
+                            pixels.push((bx + ox * k, by + oy * k, if tip { c.hue } else { c.hue.mix(WHITE, 0.5) }));
+                        }
+                    }
+                } else if t < fall + FALL {
+                    // The sparks drift down and go out.
+                    let drop = ((t - fall) / 100) as i32;
+                    for (i, (ox, oy)) in RAYS.into_iter().enumerate() {
+                        if (i as i64 + (t - fall) / 200) % 2 == 0 {
+                            pixels.push((bx + ox * 5, by + oy * 5 + drop, c.hue));
+                        }
+                    }
+                }
+                if t >= fall {
+                    let py = by + lerp(0, 3, progress(t, fall, FALL));
+                    pixels.extend([
+                        (bx - 1, py - 2, WHITE),
+                        (bx, py - 3, WHITE),
+                        (bx + 1, py - 2, WHITE),
+                        (bx, py, c.hue),
+                    ]);
+                }
+                moving = t < fall + FALL;
+            }
+            // Up goes a pole beside it, with a flag in its colour, waved from side to side.
+            Signal::Flag => {
+                const RAISE: i64 = 300;
+                const WAVE: i64 = 2000;
+                const SWAP: i64 = 220;
+                let px = if out > 0 { x + w } else { x - 1 };
+                let pole_top = lerp(top, top - 4, progress(t, 0, RAISE));
+                let timber = sprites::ink(b'T').expect("timber is in the palette");
+                pixels.extend((pole_top..=bottom - h / 2).map(|py| (px, py, timber)));
+                if t >= RAISE {
+                    let side = if t < RAISE + WAVE && (t - RAISE) / SWAP % 2 == 1 { -out } else { out };
+                    for k in 1..=3 {
+                        pixels.extend([(px + side * k, pole_top, c.hue), (px + side * k, pole_top + 1, c.hue)]);
+                    }
+                }
+                moving = t < RAISE + WAVE;
+                held = pole_top;
+            }
+            // A lamp held up by its head flashes the one word of Morse it knows: three short,
+            // three long, three short. It redraws only when the lamp goes on or off.
+            Signal::Morse => {
+                const UP: i64 = 300;
+                const DOT: i64 = 150;
+                let (lx, ly) = (if out > 0 { x + w } else { x - 2 }, top - 2);
+                let mut flashes = Vec::new();
+                let mut at = UP;
+                for (i, len) in [DOT, 3 * DOT, DOT].into_iter().enumerate() {
+                    if i > 0 {
+                        at += 2 * DOT;
+                    }
+                    for _ in 0..3 {
+                        flashes.push((at, at + len));
+                        at += len + DOT;
+                    }
+                }
+                for &(on, off) in &flashes {
+                    self.pace.at(start + since + on);
+                    self.pace.at(start + since + off);
+                }
+                let lit = flashes.iter().any(|&(on, off)| (on..off).contains(&t));
+                let glass = if lit { HALO } else { LAMP };
+                pixels.extend([(lx, ly, glass), (lx + 1, ly, glass), (lx, ly + 1, LAMP), (lx + 1, ly + 1, LAMP)]);
+                if lit {
+                    let edge = if out > 0 { lx + 1 } else { lx };
+                    pixels.extend([(edge + out, ly - 1, HALO), (edge + 2 * out, ly - 2, HALO.dim(0.75))]);
+                }
+                held = ly - 2;
+            }
+        }
+        if !pixels.is_empty() {
+            self.effects.push(Effect::Pixels(pixels));
+        }
+        if moving {
+            self.pace.moving();
+        }
+        held
+    }
+
+    /// Where something `width` wide can stand on the ground beside `body`, and the pixel row
+    /// it stands on: on side `out` if the ground there is near its feet (a step, not a pit), or
+    /// else the other.
+    fn beside(&self, body: &Body, out: i32, width: i32) -> Option<(i32, i32)> {
+        [out, -out]
+            .into_iter()
+            .map(|side| if side > 0 { body.x + body.w + 1 } else { body.x - 1 - width })
+            .filter(|&at| at >= 0 && at + width <= self.level.cols)
+            .map(|at| (at, self.level.stand(&self.land, at, width)))
+            .find(|&(_, ground)| (ground - body.bottom).abs() <= 4)
     }
 
     fn travel(&self, from: Body, to: Body, w: i32, p: f32) -> (i32, i32) {
@@ -2371,6 +2627,93 @@ mod tests {
         assert!(mini(46_000).waiting, "waiting for its next turn");
         let arrived = mori(&[spawn(0, "b", "m")]);
         assert!(arrived.scene(5_000, SIZE.0, SIZE.1).strips[0].minis[0].waiting, "nothing to do yet");
+    }
+
+    fn asked(at: i64, agent: &str) -> String {
+        event(at, agent, "agent.asked", "")
+    }
+
+    fn signal_of(a: &Mori, k: usize) -> Option<(i64, Signal)> {
+        a.actors[k].beats.iter().find_map(|b| match b.act {
+            Act::Signal(signal) => Some((b.start, signal)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_signal_goes_up_again_further_apart_each_time_nobody_answers() {
+        assert_eq!(nudge(0), (0, 0, NUDGE));
+        assert_eq!(nudge(NUDGE - 1), (0, 0, NUDGE));
+        assert_eq!(nudge(NUDGE), (1, NUDGE, 3 * NUDGE));
+        assert_eq!(nudge(3 * NUDGE), (2, 3 * NUDGE, 7 * NUDGE));
+        let (_, since, next) = nudge(3_600_000);
+        assert_eq!(next - since, NUDGE_MAX, "no more than every five minutes");
+    }
+
+    #[test]
+    fn a_character_that_needs_the_human_signals_until_it_hears_back() {
+        let mut seen = Vec::new();
+        for i in 0..200 {
+            let id = format!("agent-{i}");
+            let log = [spawn(0, &id, "m"), acted(1000, &id, "Bash"), asked(1100, &id), acted(200_000, &id, "Read")];
+            let mut a = mori(&log);
+            let (start, signal) = signal_of(&a, 0).expect("it signals");
+            if seen.contains(&signal) {
+                continue;
+            }
+            seen.push(signal);
+            assert!(start >= 1100, "{signal:?}: after it gets where it was going");
+            let line = stage(&a, start + 100).narration.expect("asking is narrated");
+            assert!(line.text.contains(a.actors[0].name), "{signal:?}: {}", line.text);
+            assert!((start..start + 1500).step_by(50).any(|t| !stage(&a, t).effects.is_empty()), "{signal:?} plays");
+
+            // Then it holds still, signal up, until it goes up again.
+            let held = start + 10_000;
+            assert!(!stage(&a, held).effects.is_empty(), "{signal:?} holds its signal up");
+            assert_eq!(a.scene(held, SIZE.0, SIZE.1).next, Some(start + NUDGE), "{signal:?}: nothing to redraw");
+            assert!(a.scene(held, SIZE.0, SIZE.1).strips[0].minis[0].asking);
+            let again = stage(&a, start + NUDGE + 100).narration.expect("going up again is narrated");
+            assert_ne!(again.text, line.text, "{signal:?}");
+            assert!(again.text.contains(a.actors[0].name), "{signal:?}: {}", again.text);
+
+            a.pick(1, held);
+            let picked = stage(&a, held + 100).narration.expect("it answers when picked").text;
+            let asking = super::super::lines::BANK.iter().filter(|l| l.when == When::Asking);
+            let name = a.actors[0].name;
+            assert!(asking.map(|l| l.text.replace("{name}", name)).any(|l| l == picked), "{signal:?}: {picked}");
+
+            // Anything it does next says it heard back.
+            let after = stage(&a, 201_000);
+            assert!(after.effects.is_empty(), "{signal:?} came down: {:?}", after.effects);
+            assert!(!a.scene(201_000, SIZE.0, SIZE.1).strips[0].minis[0].asking);
+        }
+        let mut all = super::super::SIGNALS.to_vec();
+        all.sort_by_key(|s| format!("{s:?}"));
+        seen.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(seen, all, "every signal turns up");
+    }
+
+    #[test]
+    fn a_tool_with_no_place_still_answers_a_signal() {
+        let a = mori(&[spawn(0, "a", "m"), asked(1000, "a"), acted(5000, "a", "TodoWrite"), asked(5001, "a")]);
+        let signals = a.actors[0].beats.iter().filter(|b| matches!(b.act, Act::Signal(_))).count();
+        assert_eq!(signals, 2, "it heard back, then needed the human again");
+        let prompted = event(9000, "a", "agent.prompted", r#""prompt":"no, do it this way""#);
+        let rejected = mori(&[spawn(0, "a", "m"), asked(1000, "a"), prompted]);
+        assert!(stage(&rejected, 10_000).effects.is_empty(), "a new prompt is hearing back too");
+        let twice = mori(&[spawn(0, "a", "m"), asked(1000, "a"), asked(1001, "a")]);
+        assert_eq!(twice.actors[0].beats.iter().filter(|b| matches!(b.act, Act::Signal(_))).count(), 1);
+    }
+
+    #[test]
+    fn someone_signalling_in_another_session_says_so_beside_its_strip() {
+        let mut a = mori(&[spawn(0, "a", "m"), spawn(10, "b", "m"), asked(30_000, "b"), acted(90_000, "b", "Read")]);
+        a.choose(0);
+        let s = a.scene(40_000, 80, 22);
+        assert!(s.strips[1].minis[0].asking);
+        let line = s.strips[1].line.clone().expect("a line beside the strip");
+        assert!(line.contains(a.actors[1].name), "{line}");
+        assert!(a.scene(91_000, 80, 22).strips[1].line.is_none(), "until it hears back");
     }
 
     #[test]

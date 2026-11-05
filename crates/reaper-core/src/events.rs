@@ -85,6 +85,10 @@ pub enum Kind {
     Died { rule: String, reason: DeathReason },
     #[serde(rename = "agent.idle")]
     Idle,
+    /// Waiting on the human mid-turn: a permission prompt, or a question it put to them. Whatever
+    /// it does next says it was answered.
+    #[serde(rename = "agent.asked")]
+    Asked,
     /// Shut down after sitting idle, to free what it held. Its session is saved, so nothing
     /// is lost: resuming it brings it back (as a new `agent.spawned` with the same id).
     #[serde(rename = "agent.reaped")]
@@ -254,5 +258,7 @@ mod tests {
         assert_eq!(parse_line("   "), None);
         let old = parse_line(r#"{"at":1,"host":"pi","agent":"a","type":"agent.redirected","rule":"r"}"#).unwrap();
         assert_eq!(old.kind, Kind::Redirected { rule: "r".into(), redirect: String::new() });
+        let asked = parse_line(r#"{"at":1,"host":"claude-code","agent":"a","type":"agent.asked"}"#).unwrap();
+        assert_eq!(asked.kind, Kind::Asked);
     }
 }

@@ -10,6 +10,8 @@ pub enum Status {
     /// Started, or finished its turn.
     Idle,
     Working,
+    /// Waiting on the human mid-turn, for a yes or an answer.
+    Asking,
     /// Cut off, waiting to be redirected or to die.
     Killed,
     /// Hit the strike limit or a `stop` rule. A new prompt from the human brings it back.
@@ -190,6 +192,9 @@ impl Model {
                 let done = agent.parent.is_some() || agent.recent.len() == 1;
                 agent.status = if done { Status::Ended } else { Status::Idle };
             }
+            Kind::Asked if matches!(agent.status, Status::Idle | Status::Working | Status::Killed) => {
+                agent.status = Status::Asking;
+            }
             Kind::Reaped { .. } if agent.status != Status::Dead => agent.status = Status::Reaped,
             // Its subagents end with it. A session reaped as it closes stays reaped, whichever
             // comes first: it's there to be resumed.
@@ -202,7 +207,7 @@ impl Model {
                     }
                 }
             }
-            Kind::Idle | Kind::Reaped { .. } | Kind::Prompted { .. } | Kind::Unknown => {}
+            Kind::Idle | Kind::Asked | Kind::Reaped { .. } | Kind::Prompted { .. } | Kind::Unknown => {}
         }
     }
 
@@ -346,5 +351,21 @@ mod tests {
                 .unwrap();
         model.apply(&acted);
         assert_eq!(model.agent(id).unwrap().status, Status::Working);
+    }
+
+    #[test]
+    fn an_agent_asks_the_human_until_it_does_anything_else() {
+        let mut model = Model::default();
+        let event = |at: i64, kind: &str, fields: &str| {
+            parse_line(&format!(r#"{{"at":{at},"host":"claude-code","agent":"a","type":"{kind}"{fields}}}"#)).unwrap()
+        };
+        model.apply(&event(1, "agent.acted", r#","tool":"Bash""#));
+        model.apply(&event(2, "agent.asked", ""));
+        assert_eq!(model.agent("a").unwrap().status, Status::Asking);
+        model.apply(&event(3, "agent.acted", r#","tool":"Read""#));
+        assert_eq!(model.agent("a").unwrap().status, Status::Working, "answered");
+        model.apply(&event(4, "agent.died", r#","rule":"r","reason":"strikes""#));
+        model.apply(&event(5, "agent.asked", ""));
+        assert_eq!(model.agent("a").unwrap().status, Status::Dead, "the dead ask for nothing");
     }
 }

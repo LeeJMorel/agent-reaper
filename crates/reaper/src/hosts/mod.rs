@@ -32,6 +32,7 @@ pub fn guard() -> (Vec<(&'static str, &'static str)>, Option<String>) {
     {
         problem = Some(format!("couldn't update Claude Code's hooks: {e}"));
     }
+    claude_code::install::refresh_skill();
     let unless_chosen = |id: &str, present: bool, installed: bool, add: &dyn Fn() -> Result<(), String>| {
         (present && !installed && !left_alone(id).exists()).then(add)
     };
@@ -76,7 +77,7 @@ fn chose(agent: &str, guarded: bool) {
     }
 }
 
-fn on_path(program: &str) -> Option<PathBuf> {
+pub fn on_path(program: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|dirs| env::split_paths(&dirs).map(|dir| dir.join(program)).find(|p| p.is_file()))
 }
 

@@ -115,6 +115,11 @@ pub fn size_bytes(text: &str) -> Option<u64> {
     n.parse::<u64>().ok().filter(|&n| n > 0)?.checked_mul(scale)
 }
 
+/// Bytes as `512M` or `1.8G`, for telling an agent how much memory is free.
+pub fn size_text(bytes: u64) -> String {
+    if bytes >= 1 << 30 { format!("{:.1}G", bytes as f64 / f64::from(1u32 << 30)) } else { format!("{}M", bytes >> 20) }
+}
+
 /// `500ms`, `90s`, `5m`, `1h` in milliseconds. `None` for anything else, zero included.
 pub fn duration_ms(text: &str) -> Option<u64> {
     let text = text.trim();
@@ -156,11 +161,36 @@ pub struct Rule {
     /// How many times an agent may break this rule before it's stopped, when not the global
     /// `strikes`.
     pub strikes: Option<u32>,
+    /// Only while free memory is below this (`4G`): what matters is the room the machine has
+    /// left, not how much an agent asks for. Read from /proc/meminfo, so Linux only.
+    pub free: Option<String>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
 
 impl Rule {
+    /// Whether the rule applies with `free` bytes of memory free now (`None`: unknown). A rule
+    /// with `free` applies only below it, and never when memory can't be read or the setting
+    /// isn't a size (lint reports it).
+    pub fn in_force(&self, free: Option<u64>) -> bool {
+        self.free.is_none()
+            || self.free.as_deref().and_then(size_bytes).zip(free).is_some_and(|(floor, free)| free < floor)
+    }
+
+    /// The rule as JSON, in the file's own key names, unknown keys left out.
+    pub fn to_json(&self) -> Value {
+        let mut map = Map::new();
+        map.insert("id".into(), self.id.clone().into());
+        put(&mut map, "tools", self.tools.clone());
+        put(&mut map, "match", self.pattern.as_ref().map(|m| json!(m)));
+        put(&mut map, "judge", self.judge.clone());
+        put(&mut map, "redirect", self.redirect.clone());
+        put(&mut map, "action", self.action.clone());
+        put(&mut map, "strikes", self.strikes);
+        put(&mut map, "free", self.free.clone());
+        map.into()
+    }
+
     pub fn checked_by(&self) -> &'static str {
         match (self.pattern.is_some(), self.judge.is_some()) {
             (true, false) => "pattern",
@@ -214,6 +244,12 @@ impl Rule {
                 args.get(key).is_some_and(hit)
             }
         })
+    }
+}
+
+fn put<T: Into<Value>>(map: &mut Map<String, Value>, key: &str, value: Option<T>) {
+    if let Some(value) = value {
+        map.insert(key.into(), value.into());
     }
 }
 
@@ -279,22 +315,6 @@ impl Config {
     /// The rules as JSON, for scripts (`reaper rules --json`): the file's own key names,
     /// defaults filled in, unknown keys left out.
     pub fn to_json(&self) -> Value {
-        fn put<T: Into<Value>>(map: &mut Map<String, Value>, key: &str, value: Option<T>) {
-            if let Some(value) = value {
-                map.insert(key.into(), value.into());
-            }
-        }
-        fn rule(r: &Rule) -> Value {
-            let mut map = Map::new();
-            map.insert("id".into(), r.id.clone().into());
-            put(&mut map, "tools", r.tools.clone());
-            put(&mut map, "match", r.pattern.as_ref().map(|m| json!(m)));
-            put(&mut map, "judge", r.judge.clone());
-            put(&mut map, "redirect", r.redirect.clone());
-            put(&mut map, "action", r.action.clone());
-            put(&mut map, "strikes", r.strikes);
-            map.into()
-        }
         fn watcher(w: &Watcher) -> Value {
             let mut map = Map::new();
             put(&mut map, "kind", w.kind.clone());
@@ -321,12 +341,15 @@ impl Config {
         out.insert("reap".into(), reap);
         out.insert("strikes".into(), self.strikes.into());
         out.insert("repeats".into(), self.repeats.into());
-        out.insert("rules".into(), self.rules.iter().map(rule).collect());
+        out.insert("rules".into(), self.rules.iter().map(Rule::to_json).collect());
         let projects: Map<String, Value> = self
             .projects
             .iter()
             .map(|(name, p)| {
-                (name.clone(), json!({ "paths": p.paths, "rules": p.rules.iter().map(rule).collect::<Vec<_>>() }))
+                (
+                    name.clone(),
+                    json!({ "paths": p.paths, "rules": p.rules.iter().map(Rule::to_json).collect::<Vec<_>>() }),
+                )
             })
             .collect();
         out.insert("projects".into(), projects.into());
@@ -542,6 +565,22 @@ projects:
         }
         assert_eq!(duration_ms("m"), None);
         assert_eq!(duration_ms(&format!("{}h", u64::MAX)), None, "overflow is not a duration");
+    }
+
+    #[test]
+    fn a_rule_with_free_applies_only_while_memory_is_short() {
+        let rules = parse(
+            "rules:\n  - { id: suite, match: { command: pytest }, free: 4G }\n  - { id: push, match: { command: push } }\n  - { id: typo, match: { command: x }, free: lots }\n",
+        )
+        .unwrap()
+        .rules;
+        let gb = |n: u64| Some(n << 30);
+        assert!(rules[0].in_force(gb(3)) && !rules[0].in_force(gb(4)) && !rules[0].in_force(gb(12)));
+        assert!(!rules[0].in_force(None), "memory that can't be read never kills");
+        assert!(rules[1].in_force(gb(12)) && rules[1].in_force(None), "other rules always apply");
+        assert!(!rules[2].in_force(gb(1)), "a setting that isn't a size never applies");
+        assert_eq!(parse("rules:\n  - { id: suite, free: 4G }\n").unwrap().to_json()["rules"][0]["free"], "4G");
+        assert_eq!((size_text(1932735283), size_text(512 << 20)), ("1.8G".to_string(), "512M".to_string()));
     }
 
     #[test]

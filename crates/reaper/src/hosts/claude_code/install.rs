@@ -1,5 +1,6 @@
 //! `reaper install claude-code` / `reaper uninstall claude-code`: adds or removes reaper's
-//! hooks in Claude Code's user settings, leaving everything else in the file as it was.
+//! hooks in Claude Code's user settings, leaving everything else in the file as it was, and
+//! offers the skill for writing rules.
 
 use std::env;
 use std::fs;
@@ -17,7 +18,8 @@ const EVENTS: &[(&str, Option<&str>)] = &[
     ("PreToolUse", Some("*")),
     ("Stop", None),
     ("SubagentStop", None),
-    // "Waiting for your input": idle even when the last turn was interrupted (no `Stop`).
+    // "Waiting for your input": idle even when the last turn was interrupted (no `Stop`). And
+    // permission prompts, which are the agent asking the human.
     ("Notification", None),
     ("SessionEnd", None),
 ];
@@ -121,6 +123,32 @@ pub fn add(exe: &Path) -> Result<(), String> {
     write(&path, &settings)
 }
 
+/// Where Claude Code finds the human's own skills: beside its settings.
+fn skill_file(settings: &Path) -> PathBuf {
+    settings.with_file_name("skills").join("reaper-rule").join("SKILL.md")
+}
+
+fn add_skill(file: &Path) -> Result<(), String> {
+    let fail = |e: io::Error| format!("can't write {}: {e}", tilde(file));
+    fs::create_dir_all(file.parent().expect("SKILL.md has a directory")).map_err(fail)?;
+    fs::write(file, crate::SKILL).map_err(fail)
+}
+
+fn remove_skill(file: &Path) -> Result<(), String> {
+    fs::remove_file(file).map_err(|e| format!("can't remove {}: {e}", tilde(file)))?;
+    // Its folder too, unless the human keeps something of their own in it.
+    let _ = fs::remove_dir(file.parent().expect("SKILL.md has a directory"));
+    Ok(())
+}
+
+/// An installed skill kept in step with this reaper, without asking: the human said yes once.
+pub fn refresh_skill() {
+    let file = skill_file(&settings_path());
+    if fs::read_to_string(&file).is_ok_and(|text| text != crate::SKILL) {
+        let _ = fs::write(&file, crate::SKILL);
+    }
+}
+
 fn read(path: &Path) -> Result<Value, String> {
     match fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(json!({})),
@@ -160,28 +188,65 @@ pub fn run(args: &[String], remove: bool) -> Result<(), String> {
         }
     }
     let mut settings = read(&path)?;
+    let skill = skill_file(&path);
+    let skills = skill.parent().and_then(Path::parent).unwrap_or(&skill).to_path_buf();
+    let events = EVENTS.iter().map(|(e, _)| *e).collect::<Vec<_>>().join(", ");
+    let declined = || Err("nothing changed (pass --yes to skip the question)".to_string());
     if remove {
-        if !uninstall(&mut settings) {
+        let (hooks, has_skill) = (uninstall(&mut settings), skill.is_file());
+        if !hooks && !has_skill {
             chose("claude-code", false);
             println!("No reaper hooks in {}.", tilde(&path));
             return Ok(());
         }
-    } else {
-        let exe = env::current_exe().map_err(|e| format!("can't locate the reaper binary: {e}"))?;
-        install(&mut settings, &command(&exe));
+        let mut what = Vec::new();
+        if hooks {
+            what.push(format!("reaper's hooks from {} ({events})", tilde(&path)));
+        }
+        if has_skill {
+            what.push(format!("its rule-writing skill from {}", tilde(&skills)));
+        }
+        println!("Remove {}. Other settings stay as they are.", what.join(" and "));
+        if !yes && !confirm("Go ahead?") {
+            return declined();
+        }
+        if hooks {
+            write(&path, &settings)?;
+        }
+        if has_skill {
+            remove_skill(&skill)?;
+        }
+        chose("claude-code", false);
+        println!(
+            "Done.{}",
+            if hooks { " A copy of the previous settings is next to them (*.reaper-backup)." } else { "" }
+        );
+        return Ok(());
     }
 
-    let what = if remove { "Remove reaper's hooks from" } else { "Add reaper's hooks to" };
-    let events = EVENTS.iter().map(|(e, _)| *e).collect::<Vec<_>>().join(", ");
-    println!("{what} {} ({events}). Other settings stay as they are.", tilde(&path));
+    let exe = env::current_exe().map_err(|e| format!("can't locate the reaper binary: {e}"))?;
+    install(&mut settings, &command(&exe));
+    println!("Add reaper's hooks to {} ({events}). Other settings stay as they are.", tilde(&path));
     if !yes && !confirm("Go ahead?") {
-        return Err("nothing changed (pass --yes to skip the question)".into());
+        return declined();
     }
     write(&path, &settings)?;
-    chose("claude-code", !remove);
+    chose("claude-code", true);
     println!("Done. A copy of the previous file is next to it (*.reaper-backup).");
-    if !remove {
-        println!("New Claude Code sessions are now watched; open `reaper` to see them.");
+    println!("New Claude Code sessions are now watched; open `reaper` to see them.");
+
+    if skill.is_file() {
+        // Said yes before: brought up to date.
+        return add_skill(&skill);
+    }
+    println!();
+    println!(
+        "reaper can also add a skill to {}, so you can ask any Claude Code session for a rule in your own words (\"add a reaper rule that…\"). Sessions then know reaper is there.",
+        tilde(&skills)
+    );
+    if yes || confirm("Add the skill?") {
+        add_skill(&skill)?;
+        println!("Added. reaper keeps it up to date.");
     }
     Ok(())
 }
@@ -233,6 +298,19 @@ mod tests {
         assert!(!stale(&settings));
         settings["hooks"].as_object_mut().unwrap().remove("SessionEnd");
         assert!(stale(&settings), "a hook this reaper listens to is missing");
+    }
+
+    #[test]
+    fn the_skill_goes_beside_the_settings_and_comes_out_again() {
+        let dir = std::env::temp_dir().join(format!("reaper-skill-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let file = skill_file(&dir.join("settings.json"));
+        assert_eq!(file, dir.join("skills/reaper-rule/SKILL.md"));
+        add_skill(&file).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), crate::SKILL);
+        remove_skill(&file).unwrap();
+        assert!(!file.parent().unwrap().exists(), "its own folder goes");
+        assert!(dir.join("skills").is_dir(), "the skills folder stays");
     }
 
     #[test]

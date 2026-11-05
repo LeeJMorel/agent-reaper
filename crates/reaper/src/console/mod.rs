@@ -4,6 +4,7 @@ mod app;
 mod editor;
 mod mori;
 mod ui;
+mod writer;
 
 use std::io;
 use std::path::PathBuf;
@@ -92,6 +93,7 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    app.writer = writer::Writer::find().map(std::sync::Arc::new);
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();

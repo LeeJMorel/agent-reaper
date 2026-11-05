@@ -90,6 +90,13 @@ pub fn warm_request(event: &Value) -> Option<Value> {
     Some(json!({ "op": "warm", "host": HOST, "agent": agent, "dir": event["cwd"], "goal": goal }))
 }
 
+/// The session is waiting on the human mid-turn: a permission prompt, or a question from an
+/// MCP server. Older Claude Codes say so only in the message.
+fn asks(event: &Value) -> bool {
+    matches!(event["notification_type"].as_str(), Some("permission_prompt" | "elicitation_dialog"))
+        || event["message"].as_str().is_some_and(|m| m.contains("needs your permission"))
+}
+
 /// What the session's watcher (see `watch`) should know after this event: the session, its
 /// transcript, and since when it has been idle (`null` while it works). `None` when the event
 /// says nothing about that, like a subagent finishing. Hooks are the only part of Claude Code
@@ -226,8 +233,14 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
         }
         "PreToolUse" => {
             announce(None);
-            match judge(event["tool_name"].as_str().unwrap_or_default(), event["tool_input"].clone()) {
-                Decision::Allow => None,
+            let tool = event["tool_name"].as_str().unwrap_or_default();
+            match judge(tool, event["tool_input"].clone()) {
+                Decision::Allow => {
+                    if tool == "AskUserQuestion" {
+                        engine.event(HOST, agent, "agent.asked", json!({}));
+                    }
+                    None
+                }
                 Decision::Kill { rule, is_final: false, redirect, .. } => {
                     engine.event(HOST, agent, "agent.redirected", json!({ "rule": rule, "redirect": redirect }));
                     Some(deny(&redirect))
@@ -267,6 +280,11 @@ pub fn reply(engine: &Engine, event: &Value) -> Option<Value> {
         "SubagentStop" => {
             announce(None);
             engine.event(HOST, agent, "agent.idle", json!({}));
+            None
+        }
+        // Whatever it does next says it was answered.
+        "Notification" if asks(event) => {
+            engine.event(HOST, agent, "agent.asked", json!({}));
             None
         }
         // Closed, cleared, or exiting as it's reaped (the reap is recorded after, and wins).
@@ -375,6 +393,20 @@ mod tests {
             json!({ "hook_event_name": "SessionEnd", "session_id": "s1", "cwd": "/w", "reason": "prompt_input_exit" });
         assert_eq!(reply(&engine, &end), None);
         assert_eq!(sandbox.events(), ["agent.ended"]);
+    }
+
+    #[test]
+    fn a_permission_prompt_or_a_question_is_the_session_asking_the_human() {
+        let sandbox = Sandbox::new("cc-ask");
+        let engine = sandbox.engine(RULES);
+        let notify = |kind: &str| json!({ "hook_event_name": "Notification", "session_id": "s1", "cwd": "/w", "notification_type": kind });
+        assert_eq!(reply(&engine, &notify("idle_prompt")), None);
+        assert!(sandbox.events().is_empty(), "waiting for a prompt isn't asking");
+        reply(&engine, &notify("permission_prompt"));
+        assert_eq!(sandbox.events(), ["agent.asked"]);
+        let question = json!({ "hook_event_name": "PreToolUse", "session_id": "s1", "cwd": "/w", "tool_name": "AskUserQuestion", "tool_input": { "questions": [] } });
+        assert_eq!(reply(&engine, &question), None);
+        assert!(sandbox.events().ends_with(&["agent.acted".to_string(), "agent.asked".to_string()]));
     }
 
     #[test]

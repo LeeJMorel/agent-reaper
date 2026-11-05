@@ -142,13 +142,43 @@ const SAMPLES: [Method; 9] = [
     Method::Saucer,
 ];
 
-impl Method {
-    /// Picked at random by a hash, so a replay picks the same one.
-    fn random(pool: &[Method], id: &str, n: u64, last: Option<Method>) -> Method {
-        let i = (cast::seed(id, n) % pool.len() as u64) as usize;
-        if Some(pool[i]) == last { pool[(i + 1) % pool.len()] } else { pool[i] }
-    }
+/// Picked at random by a hash, so a replay picks the same one, and never `last` again.
+fn random<T: Copy + PartialEq>(pool: &[T], id: &str, n: u64, last: Option<T>) -> T {
+    let i = (cast::seed(id, n) % pool.len() as u64) as usize;
+    if Some(pool[i]) == last { pool[(i + 1) % pool.len()] } else { pool[i] }
+}
 
+/// How a character gets the human's attention when it needs a yes or an answer, picked at
+/// random like a death. It plays, then holds, and plays again while nobody answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// A lamp at its feet shines its own outline onto the sky.
+    Searchlight,
+    /// Puffs from a little fire.
+    Smoke,
+    /// Up it goes, bursts in its colour, and hangs there on a tiny parachute.
+    Flare,
+    /// Waved, in its colour. It doesn't know semaphore.
+    Flag,
+    /// A lamp, flashing the one word of Morse it knows.
+    Morse,
+}
+
+const SIGNALS: [Signal; 5] = [Signal::Searchlight, Signal::Smoke, Signal::Flare, Signal::Flag, Signal::Morse];
+
+impl Signal {
+    fn section(self) -> Section {
+        match self {
+            Signal::Searchlight => Section::Searchlight,
+            Signal::Smoke => Section::Smoke,
+            Signal::Flare => Section::Flare,
+            Signal::Flag => Section::Flag,
+            Signal::Morse => Section::Morse,
+        }
+    }
+}
+
+impl Method {
     /// One word, left above the body where the name used to be.
     pub fn epitaph(self) -> &'static str {
         match self {
@@ -220,6 +250,10 @@ enum Act {
     },
     /// The beat of stillness after a redirect. Nothing moves; newer beats wait for it.
     Turn,
+    /// It needs the human, and signals where it stands until it hears back.
+    Signal(Signal),
+    /// It heard back: the signal comes down, and it gets on.
+    Answered,
     /// Steps into its exit.
     Home,
     /// Stretches up as a subagent climbs out of the top of it.
@@ -243,6 +277,8 @@ impl Act {
             Act::Bump { .. } if who == Personality::Hero => 1050,
             Act::Bump { .. } => 700,
             Act::Turn => 350,
+            Act::Signal(_) => 300,
+            Act::Answered => 0,
             Act::Home => 300,
             Act::Split => SPLIT,
             Act::Sleep => 900,
@@ -363,6 +399,19 @@ impl Character {
         self.beats.iter().rev().find(|b| b.start <= now).is_some_and(|b| b.to == Spot::Exit)
     }
 
+    /// Signalling for the human, and nothing has said it heard back.
+    fn signalling(&self) -> bool {
+        matches!(self.beats.back(), Some(Beat { act: Act::Signal(_), .. }))
+    }
+
+    /// The signal it's making at `now`, and since when, if it is.
+    fn signal_at(&self, now: i64) -> Option<(i64, Signal)> {
+        match self.beats.iter().rev().find(|b| b.start <= now)? {
+            Beat { start, act: Act::Signal(signal), .. } => Some((*start, *signal)),
+            _ => None,
+        }
+    }
+
     fn asleep_at(&self, now: i64) -> bool {
         let latest = self.beats.iter().rev().filter(|b| b.start <= now).find_map(|b| match b.act {
             Act::Sleep => Some(true),
@@ -412,6 +461,8 @@ struct Session {
     holes: VecDeque<Hole>,
     /// How the last one here died, so the next goes differently.
     last_death: Option<Method>,
+    /// How the last one here signalled, likewise.
+    last_signal: Option<Signal>,
     /// Stand-ins playing a death for fun. Never shown as a strip, never numbered, never followed
     /// unless asked for.
     rehearsal: Option<Method>,
@@ -676,6 +727,8 @@ impl Mori {
             When::Dead
         } else if c.asleep {
             When::Asleep
+        } else if c.signal_at(now).is_some() {
+            When::Asking
         } else if c.kill.as_ref().is_some_and(|k| now - k.at < JUST_KILLED) {
             When::JustKilled
         } else if c.home {
@@ -711,8 +764,12 @@ impl Mori {
             return;
         }
         self.model.apply(event);
-        // The model keeps what the human asked for; nobody moves for it.
+        // The model keeps what the human asked for; nobody moves for it, apart from putting a
+        // signal away: that's hearing back.
         if matches!(event.kind, Kind::Prompted { .. }) {
+            if let Some(&a) = self.index.get(&event.agent) {
+                self.heard_back(a, event.at);
+            }
             return;
         }
         let back = self.index.get(&event.agent).is_some_and(|&a| self.gone(self.actors[a].session, event.at));
@@ -728,6 +785,9 @@ impl Mori {
         }
         if back || self.sessions[s].number == 0 {
             self.renumber(s, event.at);
+        }
+        if event.kind != Kind::Asked {
+            self.heard_back(a, event.at);
         }
 
         match &event.kind {
@@ -745,6 +805,7 @@ impl Mori {
             Kind::Checked { tier, .. } => self.check(a, *tier, event.at),
             Kind::Killed { .. } => self.kill(a, event),
             Kind::Redirected { .. } => self.turn(a, event.at),
+            Kind::Asked => self.ask(a, event.at),
             Kind::Died { rule, .. } => self.die(a, rule, event.at),
             Kind::Reaped { .. } => self.sleep(a, event.at),
             // A subagent's turn ends when its work is done. One first seen finishing never used a
@@ -797,6 +858,7 @@ impl Mori {
                     cracks: VecDeque::new(),
                     holes: VecDeque::new(),
                     last_death: None,
+                    last_signal: None,
                     rehearsal: self.rehearsing,
                     members: Vec::new(),
                     moments: VecDeque::new(),
@@ -1118,6 +1180,37 @@ impl Mori {
         self.say(a, start.max(after), Section::Redirected, When::Always, 2, false);
     }
 
+    /// It needs the human, for a yes or an answer: it signals where it stands, out of its exit
+    /// if it was in it, and keeps at it until whatever it does next says it heard back.
+    fn ask(&mut self, a: usize, at: i64) {
+        let c = &self.actors[a];
+        if !c.alive || c.signalling() {
+            return;
+        }
+        if c.asleep {
+            self.wake(a, at);
+        }
+        if self.actors[a].home {
+            self.go(a, at, Spot::Porch);
+        }
+        let c = &self.actors[a];
+        let s = c.session;
+        let signal = random(&SIGNALS, &c.id, c.seq, self.sessions[s].last_signal);
+        self.sessions[s].last_signal = Some(signal);
+        let here = c.spot;
+        let start = self.beat(a, at, here, Act::Signal(signal));
+        self.actors[a].noticed_at = start;
+        self.say(a, start, signal.section(), When::Always, 4, false);
+    }
+
+    /// Anything it does after asking says it heard back: the signal comes down first.
+    fn heard_back(&mut self, a: usize, at: i64) {
+        if self.actors[a].signalling() {
+            let here = self.actors[a].spot;
+            self.beat(a, at, here, Act::Answered);
+        }
+    }
+
     /// Its turn is over: it walks into its exit. The next thing it does brings it back out.
     fn home(&mut self, a: usize, at: i64) {
         let c = &self.actors[a];
@@ -1136,7 +1229,7 @@ impl Mori {
         let forced = self.rehearsing;
         let mut method = match rule {
             SELF_RULE => Method::Scythe,
-            _ => forced.filter(|m| ALONE.contains(m)).unwrap_or_else(|| Method::random(&ALONE, &c.id, c.seq, last)),
+            _ => forced.filter(|m| ALONE.contains(m)).unwrap_or_else(|| random(&ALONE, &c.id, c.seq, last)),
         };
         let (mut when, mut nth) = (at, 0);
         if method != Method::Scythe {
@@ -1158,9 +1251,9 @@ impl Mori {
             if let Some(&first) = line.first() {
                 method = match formed.and_then(|&m| self.actors[m].beats.back()) {
                     Some(Beat { act: Act::Die(m), .. }) => *m,
-                    _ => forced.filter(|m| GROUP.contains(m)).unwrap_or_else(|| {
-                        Method::random(&GROUP, &self.actors[first].id, self.actors[first].seq, last)
-                    }),
+                    _ => forced
+                        .filter(|m| GROUP.contains(m))
+                        .unwrap_or_else(|| random(&GROUP, &self.actors[first].id, self.actors[first].seq, last)),
                 };
                 for &m in &line {
                     self.join(m, method);
@@ -1327,6 +1420,7 @@ impl Mori {
         let (section, when) = match alive.len() {
             0 => (Section::Switched, When::Gone),
             _ if c.asleep => (Section::Picked, When::Asleep),
+            _ if c.signalling() => (Section::Picked, When::Asking),
             _ if c.home => (Section::Picked, When::Home),
             1 => (Section::Switched, When::Alone),
             _ => (Section::Switched, When::Team),

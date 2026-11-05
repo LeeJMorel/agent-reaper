@@ -89,6 +89,18 @@ impl Linter {
             }
             _ => {}
         }
+        if let Some(free) = rule.free.as_deref() {
+            if size_bytes(free).is_none() {
+                self.push(
+                    Level::Error,
+                    p,
+                    id,
+                    format!("free `{free}` is not a size like 512M or 2G; the rule never applies"),
+                );
+            } else if !cfg!(target_os = "linux") {
+                self.push(Level::Warn, p, id, "`free` reads /proc/meminfo, so this rule only applies on Linux".into());
+            }
+        }
         if !rule.stops() {
             match &rule.redirect {
                 None => self.push(
@@ -278,6 +290,7 @@ projects:
       - { id: x, match: { command: x }, redirects: Run it locally., action: kill }
       - { id: y, match: { command: y }, redirect: Run it locally., action: stop, strikes: 4 }
       - { id: z, match: { command: z }, redirect: Run it locally., strikes: 0 }
+      - { id: w, match: { command: w }, redirect: Run it locally., free: lots }
 "#,
             )
             .unwrap(),
@@ -301,6 +314,7 @@ projects:
             "action `kill` is not one of: redirect, stop",
             "`strikes` does nothing with `action: stop`: it stops at the first",
             "`strikes: 0` stops the agent at the first, as `strikes: 1`",
+            "free `lots` is not a size like 512M or 2G; the rule never applies",
         ] {
             assert!(all.contains(&expected), "missing {expected:?} in {all:#?}");
         }

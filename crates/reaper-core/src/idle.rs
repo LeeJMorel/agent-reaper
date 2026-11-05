@@ -34,7 +34,7 @@ pub struct Wait {
 
 /// The waits in a log, oldest first: from going idle to the next sign of the human (a new
 /// prompt's first action, a resume). Being reaped isn't one, nor is a session ending (being
-/// reaped ends it too). Subagents wait on nobody: their turn ends when their work is done.
+/// reaped ends it too), nor the agent asking the human something. Subagents wait on nobody: their turn ends when their work is done.
 /// Waits still open at the end count once they're longer than any timeout would be.
 pub fn waits(events: &[Event]) -> Vec<Wait> {
     let mut idle_since: HashMap<&str, i64> = HashMap::new();
@@ -45,7 +45,7 @@ pub fn waits(events: &[Event]) -> Vec<Wait> {
             subagents.insert(&event.agent);
         }
         match event.kind {
-            Kind::Reaped { .. } | Kind::Ended | Kind::Unknown => {}
+            Kind::Reaped { .. } | Kind::Ended | Kind::Asked | Kind::Unknown => {}
             _ if subagents.contains(event.agent.as_str()) => {}
             _ => {
                 if let Some(since) = idle_since.remove(event.agent.as_str()) {

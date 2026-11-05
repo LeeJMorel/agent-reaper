@@ -50,6 +50,14 @@ rules:
     match: { "*": '(^|/)\.env(\.|$)' }
     redirect: Read configuration through the settings module and its documented defaults.
 
+  # `free` applies a rule only while free memory is below it (Linux), and the agent is told
+  # how much is free. Here, test runs that name no test file (or variable) wait for room.
+  # - id: whole-test-suite
+  #   tools: [bash]
+  #   match: { command: '(^|[;&|]\s*)((npx |pnpm |uv run |python3? -m )?(pytest|vitest|jest)|npm (run )?test)\b(?![^;&|]*(::|\.(py|[jt]sx?)\b|\$))' }
+  #   free: 4G
+  #   redirect: Run the test files for the code you changed.
+
 # Project rules apply to every directory under the listed paths (`*` = one level, `**` = any depth).
 projects:
   my-app:

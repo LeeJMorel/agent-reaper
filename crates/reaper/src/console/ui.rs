@@ -17,6 +17,7 @@ use reaper_core::state::{Agent, Kill, Outcome, Status, WatcherHealth};
 
 use super::app::{App, Pane, RuleRow, Tab, plural};
 use super::mori;
+use super::writer::Proposal;
 
 const ACCENT: Color = Color::Red;
 const LABEL: usize = 10;
@@ -129,6 +130,7 @@ fn list<'a>(items: Vec<ListItem<'a>>, block: Block<'a>) -> List<'a> {
 fn status_look(status: Status) -> (&'static str, &'static str, Style) {
     match status {
         Status::Working => ("●", "working", fg(Color::Green)),
+        Status::Asking => ("?", "asking", fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Status::Idle => ("○", "idle", dim()),
         Status::Killed => ("◆", "killed", fg(Color::Yellow)),
         Status::Dead => ("✕", "dead", fg(ACCENT)),
@@ -208,6 +210,11 @@ fn summary(app: &App, room: usize) -> Line<'static> {
             ),
         },
     ];
+    let asking = agents.iter().filter(|a| a.status == Status::Asking).count();
+    if asking > 0 {
+        let need = if asking == 1 { "needs" } else { "need" };
+        parts.push(Span::styled(format!("{asking} {need} you"), fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    }
     if app.rules.error.is_some() {
         parts.push(Span::styled("rules: syntax error", fg(ACCENT).add_modifier(Modifier::BOLD)));
     }
@@ -228,7 +235,18 @@ fn summary(app: &App, room: usize) -> Line<'static> {
 }
 
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
-    let line = if let Some(notice) = &app.notice {
+    let line = if let Some(text) = &app.asking {
+        let (label, hint) = (" Describe the rule: ", "   enter ask · esc cancel");
+        // The end of a long description, where the typing is.
+        let room = usize::from(area.width).saturating_sub(label.len() + hint.len() + 1).max(8);
+        let shown: String = text.chars().skip(text.chars().count().saturating_sub(room)).collect();
+        Line::from(vec![
+            Span::styled(label, bold()),
+            Span::raw(shown),
+            Span::styled("█", fg(ACCENT)),
+            Span::styled(hint, dim()),
+        ])
+    } else if let Some(notice) = &app.notice {
         Line::styled(format!(" {}", notice.text), if notice.bad { fg(ACCENT) } else { fg(Color::Green) })
     } else if let Some(error) = &app.events_error {
         Line::styled(format!(" Can't read {}: {error}", tilde(app.events_path())), fg(ACCENT))
@@ -237,7 +255,19 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
             Tab::Live => {
                 vec![("1 2 3", "tabs"), ("tab", "switch pane"), ("↑↓", "select"), ("e", "edit rule"), ("q", "quit")]
             }
-            Tab::Rules => vec![("1 2 3", "tabs"), ("↑↓", "select"), ("e", "edit in your editor"), ("q", "quit")],
+            Tab::Rules if app.proposal.is_some() => {
+                vec![("enter", "add this rule"), ("n", "describe again"), ("esc", "drop it"), ("q", "quit")]
+            }
+            Tab::Rules if app.writing().is_some() => vec![("esc", "stop waiting"), ("1 2 3", "tabs"), ("q", "quit")],
+            Tab::Rules => {
+                vec![
+                    ("1 2 3", "tabs"),
+                    ("↑↓", "select"),
+                    ("n", "new rule"),
+                    ("e", "edit in your editor"),
+                    ("q", "quit"),
+                ]
+            }
             Tab::Mori => mori_keys(app),
         };
         // A hint that doesn't fit is left out whole, not cut off.
@@ -318,7 +348,7 @@ fn agent_line(a: &Agent, now: i64) -> Line<'static> {
     let (glyph, word, style) = status_look(a.status);
     let place = a.project.clone().or_else(|| a.dir.as_deref().map(|d| tilde(Path::new(d)))).unwrap_or_default();
     let doing = match a.status {
-        Status::Working => a.last_tool.clone().unwrap_or_default(),
+        Status::Working | Status::Asking => a.last_tool.clone().unwrap_or_default(),
         Status::Killed | Status::Dead => format!("strike {}", a.strike),
         Status::Idle | Status::Reaped | Status::Ended => String::new(),
     };
@@ -422,6 +452,9 @@ fn rule_terms(rule: &Rule, width: usize) -> Vec<Line<'static>> {
     if let Some(judge) = &rule.judge {
         lines.extend(wrapped("judge", judge, Style::new(), width));
     }
+    if let Some(free) = &rule.free {
+        lines.extend(wrapped("while", &format!("free memory is below {free}"), Style::new(), width));
+    }
     lines
 }
 
@@ -490,6 +523,7 @@ fn describe(event: &Event) -> Span<'static> {
         }
         Kind::Redirected { .. } => Span::styled("redirected", fg(Color::Yellow)),
         Kind::Died { rule, .. } => Span::styled(format!("died: {rule}"), fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Kind::Asked => Span::styled("asked you", fg(Color::Cyan)),
         Kind::Idle => Span::styled("finished its turn", dim()),
         Kind::Ended => Span::styled("session closed", dim()),
         Kind::Reaped { idle, reason } => {
@@ -508,11 +542,12 @@ fn describe(event: &Event) -> Span<'static> {
 // ── rules tab ───────────────────────────────────────────────────────────────
 
 fn rules(frame: &mut Frame, area: Rect, app: &App) {
-    if !app.rules.exists {
+    if !app.rules.exists && app.proposal.is_none() && app.writing().is_none() {
         let text = Text::from(vec![
             Line::styled(format!("No rules file at {}.", tilde(&app.rules.path)), bold()),
             Line::raw(""),
-            Line::raw("Press e to create one from the example and open it in your editor."),
+            Line::raw("Press n to describe a rule in your own words, and an agent you have writes it."),
+            Line::raw("Or press e to create the file from the example and open it in your editor."),
             Line::raw("Agents pick up changes on their next action; nothing needs restarting."),
         ]);
         frame.render_widget(Paragraph::new(text).block(pane("Rules".into(), true)).wrap(Wrap { trim: false }), area);
@@ -532,8 +567,73 @@ fn rules(frame: &mut Frame, area: Rect, app: &App) {
 
     let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(main);
     rule_list(frame, left, app);
-    let detail = rule_detail(app, right.width.saturating_sub(2) as usize);
-    frame.render_widget(Paragraph::new(detail).block(pane("Rule".into(), false)).wrap(Wrap { trim: false }), right);
+    let width = right.width.saturating_sub(2) as usize;
+    let (title, detail) = match (app.writing(), &app.proposal) {
+        (Some(asked), _) => ("New rule", writing_detail(app, asked, width)),
+        (None, Some(proposal)) => ("New rule", proposal_detail(app, proposal, width)),
+        (None, None) => ("Rule", rule_detail(app, width)),
+    };
+    frame.render_widget(Paragraph::new(detail).block(pane(title.into(), false)).wrap(Wrap { trim: false }), right);
+}
+
+fn writing_detail(app: &App, asked: &str, width: usize) -> Text<'static> {
+    let name = app.writer.as_ref().map_or("the agent", |w| w.name.as_str());
+    let mut lines = vec![Line::styled(format!("Asking {name} for a rule"), fg(ACCENT).add_modifier(Modifier::BOLD))];
+    lines.extend(wrapped("asked", &format!("“{}”", asked.trim()), dim(), width));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "It writes the rule with examples of what it should stop and let through, and reaper tries them. This can take a minute or two.",
+        dim(),
+    ));
+    Text::from(lines)
+}
+
+fn proposal_detail(app: &App, proposal: &Proposal, width: usize) -> Text<'static> {
+    let (draft, report) = (&proposal.draft, &proposal.report);
+    let rule = &draft.rule;
+    let mut lines = vec![Line::styled(rule.id.clone(), fg(ACCENT).add_modifier(Modifier::BOLD))];
+    lines.extend(wrapped("asked", &format!("“{}”", proposal.asked.trim()), dim(), width));
+    let applies = match &draft.project {
+        None => "every project".to_string(),
+        Some(name) => {
+            let known = app.rules.config.projects.get(name).map(|p| &p.paths);
+            format!("{name} ({})", known.unwrap_or(&draft.paths).join(", "))
+        }
+    };
+    lines.extend(wrapped("applies", &applies, Style::new(), width));
+    let tools = rule.scope().map_or("all tools".to_string(), |tools| tools.join(", "));
+    lines.extend(wrapped("checked", &format!("{} · {tools}", checked(rule)), Style::new(), width));
+    lines.extend(rule_terms(rule, width));
+    lines.extend(match &rule.redirect {
+        Some(text) => wrapped("redirect", &format!("“{}”", text.trim()), fg(Color::Yellow), width),
+        None => wrapped("redirect", "none: the agent is only told to continue", dim(), width),
+    });
+    for (kind, stops) in [("stops", true), ("allows", false)] {
+        for (n, tried) in report.tried.iter().filter(|t| t.should_stop == stops).enumerate() {
+            let (mark, style, miss) = match (tried.passed(), stops) {
+                (true, _) => ("✓ ", fg(Color::Green), ""),
+                (false, true) => ("✗ ", fg(ACCENT), "  (let through)"),
+                (false, false) => ("✗ ", fg(ACCENT), "  (stopped)"),
+            };
+            let example = vec![Span::styled(mark, style), Span::raw(format!("{}{miss}", tried.example))];
+            lines.push(field(if n == 0 { kind } else { "" }, example));
+        }
+    }
+    if let Some(note) = &draft.note {
+        lines.extend(wrapped("note", note, dim(), width));
+    }
+    let issues =
+        report.problems.iter().map(|p| (Level::Error, p)).chain(report.warnings.iter().map(|w| (Level::Warn, w)));
+    for (level, text) in issues {
+        lines.push(Line::from(vec![level_mark(Some(level)), Span::raw(text.clone())]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(if report.ok() {
+        Line::styled(format!("Enter adds it to {}. Agents only ever hear the redirect.", tilde(&app.rules.path)), dim())
+    } else {
+        Line::styled("It can't go in as it is: n to describe it again, or e to write it yourself.", fg(ACCENT))
+    });
+    Text::from(lines)
 }
 
 fn problems(app: &App) -> Vec<Line<'static>> {
@@ -570,7 +670,10 @@ fn rule_list(frame: &mut Frame, area: Rect, app: &App) {
     let rows = app.rule_rows();
     if rows.is_empty() {
         let text = if app.rules.parsed {
-            Text::from(vec![Line::raw("No rules yet."), Line::styled("Press e to add some.", dim())])
+            Text::from(vec![
+                Line::raw("No rules yet."),
+                Line::styled("Press n to describe one, or e to write it yourself.", dim()),
+            ])
         } else {
             Text::from(vec![
                 Line::raw("Nothing to show until the syntax error is fixed."),
@@ -605,6 +708,15 @@ fn rule_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list(items, block), area, &mut state);
 }
 
+fn checked(rule: &Rule) -> &'static str {
+    match rule.checked_by() {
+        "pattern" => "pattern match, on every call",
+        "watcher" => "the watcher model",
+        "pattern+watcher" => "pattern first, then the watcher model",
+        _ => "nothing (needs match or judge)",
+    }
+}
+
 fn rule_detail(app: &App, width: usize) -> Text<'static> {
     let Some((place, rule)) = app.selected_rule() else {
         return Text::styled("Select a rule.", dim());
@@ -617,12 +729,7 @@ fn rule_detail(app: &App, width: usize) -> Text<'static> {
             format!("{name} ({paths})")
         }
     };
-    let checked = match rule.checked_by() {
-        "pattern" => "pattern match, on every call",
-        "watcher" => "the watcher model",
-        "pattern+watcher" => "pattern first, then the watcher model",
-        _ => "nothing (needs match or judge)",
-    };
+    let checked = checked(rule);
     let tools = rule.scope().map_or("all tools".to_string(), |tools| tools.join(", "));
     let on_kill = if rule.stops() {
         "stop the agent".to_string()
@@ -670,6 +777,24 @@ mod tests {
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_new_rule_shows_how_its_examples_went_before_it_goes_in() {
+        let mut app = fixture();
+        app.tab = Tab::Rules;
+        let snippet = "rule:\n  id: no-sudo\n  tools: [bash]\n  match: { command: '(^|[;&|(]\\s*)sudo\\b' }\n  redirect: Run it without elevated rights.\nstops: [sudo make install]\nallows: [cat sudoers.md, echo x; sudo -v]\n";
+        let draft = reaper_core::draft::read(snippet).unwrap();
+        let report = reaper_core::draft::check(&draft, &app.rules.text);
+        app.proposal = Some(Proposal { asked: "no sudo, ever".into(), draft, report });
+        let screen = render(&app, 120, 30);
+        assert!(screen.contains("stops     ✓ sudo make install"), "{screen}");
+        assert!(screen.contains("✗ echo x; sudo -v  (stopped)"), "{screen}");
+        assert!(screen.contains("It can't go in as it is"), "{screen}");
+        assert_eq!(screen.lines().last(), Some(" enter add this rule  n describe again  esc drop it  q quit"));
+
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(app.asking.is_none(), "the fixture has no agent to ask");
     }
 
     #[test]

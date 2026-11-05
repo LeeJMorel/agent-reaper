@@ -9,9 +9,14 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use reaper_core::draft;
 use reaper_core::lint::{Level, lint};
 use reaper_core::paths::{self, tilde};
 use reaper_core::rules::{ParseError, parse};
+
+/// How to write a rule (SKILL.md, beside Cargo.toml): the console's writer gets it as its
+/// instructions, and `reaper install claude-code` offers it to Claude Code as a skill.
+pub const SKILL: &str = include_str!("../SKILL.md");
 
 fn usage() -> String {
     format!(
@@ -25,6 +30,8 @@ usage:
   reaper uninstall AGENT         stop guarding them
   reaper lint [FILE]             check a rules file
   reaper rules [--json] [FILE]   show the rules (--json: for scripts)
+  reaper rules add [--check]     add the rule snippet on stdin, once its examples pass
+                                 (the reaper-rule skill; in the console, press n on the rules tab)
 
 used by agents, not by hand:
   reaper engine                  one JSON request on stdin (the pi extension, and reaper itself)
@@ -155,6 +162,9 @@ fn read_rules(args: &[String]) -> Result<(PathBuf, String), String> {
 }
 
 fn show_rules(args: &[String]) -> Result<ExitCode, String> {
+    if args.first().map(String::as_str) == Some("add") {
+        return add_rule(&args[1..]);
+    }
     let (path, text) = read_rules(args)?;
     let config = parse(&text).map_err(|e| format!("{}{}: {}", path.display(), where_(&e), e.message))?;
     if args.iter().any(|a| a == "--json") {
@@ -165,6 +175,36 @@ fn show_rules(args: &[String]) -> Result<ExitCode, String> {
         let scope = rule.scope().map_or("all tools".to_string(), |tools| tools.join(","));
         println!("{:<14} {:<22} {:<16} {scope}", place.unwrap_or("global"), rule.id, rule.checked_by());
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `reaper rules add [--check] [FILE]`: a rule snippet on stdin, tried on its examples and
+/// linted where it will live, then added to the rules file. reaper writes the file, so an
+/// agent asked for a rule never has to open it.
+fn add_rule(args: &[String]) -> Result<ExitCode, String> {
+    let mut snippet = String::new();
+    io::stdin().read_to_string(&mut snippet).map_err(|e| format!("can't read stdin: {e}"))?;
+    let draft = draft::read(&snippet)?;
+    let (path, text) = read_rules(args)?;
+    let report = draft::check(&draft, &text);
+    for tried in &report.tried {
+        let verdict = if tried.passed() { "ok  " } else { "FAIL" };
+        let kind = if tried.should_stop { "stops" } else { "allows" };
+        println!("{verdict} {kind:<6} {}", tried.example);
+    }
+    for warning in &report.warnings {
+        println!("warn  {warning}");
+    }
+    for problem in &report.problems {
+        println!("error {problem}");
+    }
+    let Some(new) = report.text.as_deref().filter(|_| report.ok()) else { return Ok(ExitCode::FAILURE) };
+    if args.iter().any(|a| a == "--check") {
+        println!("ok: {} can be added to {}", draft.rule.id, tilde(&path));
+        return Ok(ExitCode::SUCCESS);
+    }
+    draft::save(&path, new).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    println!("added {} to {}", draft.rule.id, tilde(&path));
     Ok(ExitCode::SUCCESS)
 }
 

@@ -49,6 +49,8 @@ pub struct Settings<'a> {
     /// Treat a watcher failure as a violation instead of letting the action through.
     pub kill_on_error: bool,
     pub timeout: Duration,
+    /// Free memory now, for rules that apply only when it runs short (`free`).
+    pub free: Option<u64>,
 }
 
 /// The ids in a watcher reply like `{"violated": ["a"]}`, tolerating text around the JSON.
@@ -82,7 +84,9 @@ pub fn check<'a>(
         ms: start.elapsed().as_millis() as u64,
         error,
     };
-    let all: Vec<&'a Rule> = global.iter().chain(project).copied().collect();
+    // Only rules in force can be broken, but the watcher's prompt lists them all, so its
+    // prefix stays the same as memory comes and goes.
+    let all: Vec<&'a Rule> = global.iter().chain(project).copied().filter(|r| r.in_force(settings.free)).collect();
 
     if let Some(hit) = all.iter().find(|r| r.judge.is_none() && r.matches(tool, args)) {
         return done(Some(hit), Tier::Pattern, true, None);
@@ -129,7 +133,7 @@ mod tests {
 
     impl Backend for Fake {
         fn complete(&self, prompt: &Prompt, _: Duration, _: u32) -> Result<String, String> {
-            self.calls.borrow_mut().push(prompt.action.clone());
+            self.calls.borrow_mut().push(prompt.prefix_id.clone());
             self.reply.clone()
         }
     }
@@ -145,7 +149,7 @@ mod tests {
     }
 
     fn settings(backend: &dyn Backend) -> Settings<'_> {
-        Settings { backend: Some(backend), kill_on_error: false, timeout: Duration::from_secs(1) }
+        Settings { backend: Some(backend), kill_on_error: false, timeout: Duration::from_secs(1), free: None }
     }
 
     const JUDGE: &str = "rules: [{ id: prod, judge: touching production, tools: [bash] }]";
@@ -172,6 +176,24 @@ mod tests {
         let again = check(&[], &rules, "fix bug", "bash", &args, &settings(&backend), &store);
         assert_eq!((again.tier, again.rule.map(|r| r.id.as_str())), (Tier::Cache, Some("prod")));
         assert_eq!(backend.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_rule_waiting_for_memory_to_run_short_leaves_the_prompt_alone() {
+        let config = parse(
+            "rules:\n  - { id: prod, judge: touching production, tools: [bash] }\n  - { id: suite, judge: running the whole test suite, tools: [bash], free: 4G }\n",
+        )
+        .unwrap();
+        let rules: Vec<&Rule> = config.rules.iter().collect();
+        let backend = fake(r#"{"violated":["suite"]}"#);
+        let args = json!({ "command": "pytest" });
+        let plenty = Settings { free: Some(12 << 30), ..settings(&backend) };
+        assert!(check(&rules, &[], "", "bash", &args, &plenty, &store("free1")).rule.is_none(), "not in force");
+        let short = Settings { free: Some(2 << 30), ..settings(&backend) };
+        let o = check(&rules, &[], "", "bash", &args, &short, &store("free2"));
+        assert_eq!(o.rule.map(|r| r.id.as_str()), Some("suite"));
+        let prefixes = backend.calls.borrow();
+        assert_eq!((prefixes.len(), &prefixes[0]), (2, &prefixes[1]), "the same prefix, so the cache still applies");
     }
 
     #[test]

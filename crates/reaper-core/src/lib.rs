@@ -2,6 +2,7 @@
 //! the state folded from it, where files live, idle timeouts, and memento mori. The engine
 //! and the console (crates/reaper) read rules and events through this crate.
 
+pub mod draft;
 pub mod events;
 pub mod idle;
 pub mod lint;

@@ -25,7 +25,8 @@ pub fn choose(live: &[Live], cap: Option<usize>, short_of_memory: bool) -> Vec<(
     chosen
 }
 
-fn available() -> Option<u64> {
+/// Free memory in bytes, from /proc/meminfo: `None` where there's none to read.
+pub fn available() -> Option<u64> {
     let info = fs::read_to_string("/proc/meminfo").ok()?;
     let kb = info.lines().find_map(|l| l.strip_prefix("MemAvailable:"))?.split_whitespace().next()?;
     kb.parse::<u64>().ok()?.checked_mul(1024)

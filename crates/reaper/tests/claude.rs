@@ -181,6 +181,8 @@ fn run(name: &str, strikes: u32) -> Outcome {
     // Exactly what a user runs, pointed at the sandboxed settings by CLAUDE_CONFIG_DIR.
     let installed = h.command(env!("CARGO_BIN_EXE_reaper")).args(["install", "claude-code", "--yes"]).output().unwrap();
     assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
+    // --yes takes the skill too; with it in place, Claude still never hears the rule.
+    assert!(h.claude_dir.join("skills/reaper-rule/SKILL.md").is_file());
 
     let output = h.command(claude()).args(["-p", TASK, "--permission-mode", "bypassPermissions"]).output().unwrap();
     assert!(

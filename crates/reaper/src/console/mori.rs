@@ -554,6 +554,11 @@ impl Pen<'_> {
         };
         let mut parts = vec![(number, style)];
         for mini in &strip.minis {
+            if mini.alive && mini.asking {
+                // Signalling: it needs the human.
+                parts.push(("!".into(), self.colors.ink(mini.hue).add_modifier(Modifier::BOLD)));
+                continue;
+            }
             let (glyph, rgb) = if !mini.alive {
                 ("†", DEAD)
             } else if mini.asleep {
