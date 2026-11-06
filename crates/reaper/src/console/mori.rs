@@ -8,8 +8,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use reaper_core::mori::{
-    BLOCK, DEAD, DUSK, Effect, Fit, Health, LAND, Label, REAPER, Rgb, Stage, Strip, WHITE, ansi256,
+    BLOCK, DEAD, DUSK, Effect, Fit, Health, LAND, Label, REAPER, Rgb, Stage, Strip, Talk, WHITE, ansi256,
 };
+use reaper_core::state::Chat;
 
 use super::app::App;
 use super::ui::rows;
@@ -76,19 +77,21 @@ const LIGHT: Rgb = Rgb(0xC8, 0xD4, 0xF4);
 const LIGHT_256: u8 = 61;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
-    let scene = app.mori.scene(app.mori_now(), area.width, area.height);
+    let now = app.mori_now();
+    let scene = app.mori.scene(now, area.width, area.height);
     app.mori_next.set(scene.next);
+    let chat = app.chat_open.then(|| app.mori.chat(now));
     let colors = app.colors;
     let buf = frame.buffer_mut();
     let mut pen = Pen { buf, area, colors, dim: false };
     let back = match &scene.stage {
-        Some(stage) => pen.stage(stage, app.prompt_open.then_some(app.prompt_scroll)),
+        Some(stage) => pen.stage(stage, chat.as_deref().map(|talk| (talk, app.chat_top))),
         None => {
             pen.empty(app.mori.sessions() > 0);
             0
         }
     };
-    app.prompt_back.set(back);
+    app.chat_back.set(back);
     pen.strips(&scene.strips);
 }
 
@@ -152,6 +155,34 @@ impl Canvas {
     fn ground(&self, x: i32) -> i32 {
         (2..self.h).find(|&y| self.get(x, y).0 == Px::Land).unwrap_or(self.h)
     }
+}
+
+/// A row of the chat: who starts talking on it, if anyone, what it says, how it's inked, and
+/// whether it's in the latest turn.
+struct Said {
+    who: Option<(&'static str, Rgb)>,
+    text: String,
+    ink: Ink,
+    bright: bool,
+}
+
+enum Ink {
+    /// Between turns.
+    Rule,
+    Words,
+    Call,
+    /// A call reaper stopped.
+    Stopped,
+}
+
+/// At most `room` characters, cut with "…".
+fn cut(text: &str, room: usize) -> String {
+    if text.chars().count() <= room {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(room.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 /// Whether a sprite pixel shows while it fades: 3 is solid, 0 is gone.
@@ -241,9 +272,9 @@ impl Pen<'_> {
         }
     }
 
-    /// With the prompts open, `Some` of how many rows back from the latest they're scrolled.
-    /// Returns how far back they go.
-    fn stage(&mut self, stage: &Stage, prompts: Option<usize>) -> usize {
+    /// With the chat open, `Some` of it and the row it's scrolled back to. Returns the row it
+    /// starts at at the latest.
+    fn stage(&mut self, stage: &Stage, chat: Option<(&[Talk], Option<usize>)>) -> usize {
         self.dim = stage.dim;
         let fit = &stage.fit;
         let (w, h) = (i32::from(self.area.width), 2 * i32::from(self.area.height));
@@ -420,11 +451,11 @@ impl Pen<'_> {
             self.put(x, 1, &title.text, style);
         }
 
-        // Opened, they cover the level; closed, the latest gives way to the title card and the
-        // narrator.
-        match (stage.prompts.last(), prompts) {
-            (Some(_), Some(back)) => return self.prompts(&stage.prompts, back),
-            (Some(latest), None) if stage.title.is_none() && said != Some(1) => {
+        // The chat, opened, covers the level; closed, the latest prompt gives way to the title
+        // card and the narrator.
+        match (chat, stage.prompts.last()) {
+            (Some((talk, top)), _) if !talk.is_empty() => return self.chat(talk, top),
+            (None, Some(latest)) if stage.title.is_none() && said != Some(1) => {
                 self.prompt_line(latest, stage.filming.is_some());
             }
             _ => {}
@@ -436,59 +467,96 @@ impl Pen<'_> {
     fn prompt_line(&mut self, prompt: &str, filming: bool) {
         let room = usize::from(self.area.width).saturating_sub(if filming { 10 } else { 2 });
         let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-        let text = if flat.chars().count() <= room {
-            flat
-        } else {
-            let mut cut: String = flat.chars().take(room.saturating_sub(1)).collect();
-            cut.push('…');
-            cut
-        };
-        self.put(1, 1, &text, self.faint(1));
+        self.put(1, 1, &cut(&flat, room), self.faint(1));
     }
 
-    /// From row 1 down, over the level: everything the human asked the session for, each in its
-    /// own lines, the latest at the bottom in white and the ones before faint over a rule. As
-    /// much as fits, `back` rows up from the end, with a scrollbar in the right margin when it
-    /// doesn't all fit. Returns how far back it goes.
-    fn prompts(&mut self, prompts: &[String], back: usize) -> usize {
+    /// From row 1 down, over the level: the followed session's conversation, oldest first. What
+    /// the human asked and the agents said keep their own line breaks, a call takes one line, and
+    /// one reaper stopped is in its red. Who's talking is in the margin, in their colour. Each
+    /// prompt starts a turn over a rule: the latest turn is bright, calls a little less, and the
+    /// turns before faint. As much as fits from row `top`, or at the latest, with a scrollbar in
+    /// the right margin when it doesn't all fit. Returns the row it starts at at the latest.
+    fn chat(&mut self, talk: &[Talk], top: Option<usize>) -> usize {
+        const YOU: (&str, Rgb) = ("you", WHITE);
         let width = usize::from(self.area.width).saturating_sub(2).max(1);
         let most = usize::from(self.area.height).saturating_sub(3).max(1);
-        // Each row, and whether it's from the latest.
-        let mut lines: Vec<(String, bool)> = Vec::new();
-        for (i, prompt) in prompts.iter().enumerate() {
-            let latest = i + 1 == prompts.len();
-            if i > 0 {
-                lines.push(("─".repeat(width), false));
+        let speaker = |t: &Talk| if matches!(t.line, Chat::Asked(_)) { YOU } else { (t.name, t.hue) };
+        let margin = talk.iter().map(|t| speaker(t).0.chars().count() + 2).max().unwrap_or(0);
+        let room = width.saturating_sub(margin).max(1);
+        let latest = talk.iter().rposition(|t| matches!(t.line, Chat::Asked(_))).unwrap_or(0);
+        let mut lines: Vec<Said> = Vec::new();
+        let mut talking = None;
+        for (i, t) in talk.iter().enumerate() {
+            let bright = i >= latest;
+            if matches!(t.line, Chat::Asked(_)) && !lines.is_empty() {
+                lines.push(Said { who: None, text: "─".repeat(width), ink: Ink::Rule, bright: false });
+                talking = None;
             }
             let start = lines.len();
-            for source in prompt.lines() {
-                match rows(source, width) {
-                    // One blank line between paragraphs, however many there were.
-                    rows if rows.is_empty() => {
-                        if lines.len() > start && lines.last().is_some_and(|(l, _)| !l.is_empty()) {
-                            lines.push((String::new(), latest));
+            let text = t.text();
+            match t.line {
+                Chat::Asked(_) | Chat::Said(_) => {
+                    for source in text.lines() {
+                        match rows(source, room) {
+                            // One blank line between paragraphs, however many there were.
+                            r if r.is_empty() => {
+                                if lines.len() > start && lines.last().is_some_and(|r| !r.text.is_empty()) {
+                                    lines.push(Said { who: None, text: String::new(), ink: Ink::Words, bright });
+                                }
+                            }
+                            r => lines.extend(r.into_iter().map(|text| Said {
+                                who: None,
+                                text,
+                                ink: Ink::Words,
+                                bright,
+                            })),
                         }
                     }
-                    rows => lines.extend(rows.into_iter().map(|row| (row, latest))),
+                    if lines.len() > start && lines.last().is_some_and(|r| r.text.is_empty()) {
+                        lines.pop();
+                    }
+                }
+                Chat::Called { .. } | Chat::Stopped { .. } => {
+                    let stopped = matches!(t.line, Chat::Stopped { .. });
+                    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let line = if stopped { format!("✗ {flat}") } else { flat };
+                    let ink = if stopped { Ink::Stopped } else { Ink::Call };
+                    lines.push(Said { who: None, text: cut(&line, room), ink, bright });
                 }
             }
-            if lines.len() > start && lines.last().is_some_and(|(l, _)| l.is_empty()) {
-                lines.pop();
+            // Their name starts what they say, unless they were the one talking already.
+            if lines.len() > start {
+                let who = speaker(t);
+                if talking != Some(who.0) {
+                    lines[start].who = Some(who);
+                }
+                talking = Some(who.0);
             }
         }
         let furthest = lines.len().saturating_sub(most);
-        let back = back.min(furthest);
-        let end = lines.len() - back;
-        let shown = &lines[end.saturating_sub(most)..end];
+        let top = top.map_or(furthest, |top| top.min(furthest));
+        let shown = &lines[top..(top + most).min(lines.len())];
         let thumb = (furthest > 0).then(|| {
             let len = (most * most / lines.len()).max(1);
-            let top = (furthest - back) * (most - len) / furthest;
-            top..top + len
+            let at = top * (most - len) / furthest;
+            at..at + len
         });
-        for (i, (line, latest)) in shown.iter().enumerate() {
+        for (i, said) in shown.iter().enumerate() {
             let row = 1 + i as i32;
-            let style = if *latest { self.ink(WHITE, 0.0, row) } else { self.faint(row) };
-            self.put(0, row, &format!(" {line:<width$} "), style);
+            let fade = |bright_by: f32| if said.bright { bright_by } else { 0.5 };
+            let dims = !said.bright && self.colors == Colors::Off;
+            let dimmed = |style: Style| if dims { style.add_modifier(Modifier::DIM) } else { style };
+            self.put(0, row, &" ".repeat(width + 2), Style::new());
+            let (x, ink) = match said.ink {
+                Ink::Rule => (1, self.faint(row)),
+                Ink::Words => (1 + margin, dimmed(self.ink(WHITE, fade(0.0), row))),
+                Ink::Call => (1 + margin, dimmed(self.ink(WHITE, fade(0.3), row))),
+                Ink::Stopped => (1 + margin, dimmed(self.ink(REAPER, fade(0.0), row))),
+            };
+            self.put(x as i32, row, &said.text, ink);
+            if let Some((name, hue)) = said.who {
+                self.put(1, row, name, dimmed(self.ink(hue, fade(0.0), row)));
+            }
             if thumb.as_ref().is_some_and(|t| t.contains(&i)) {
                 self.put(1 + width as i32, row, "┃", self.faint(row));
             }

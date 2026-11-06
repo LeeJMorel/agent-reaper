@@ -162,11 +162,13 @@ pub fn events(home: &Path) -> Vec<Value> {
     log.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
-/// The events' types in order, apart from prompts: an engine nobody waits for logs those,
-/// so they land wherever they land.
+/// The events' types in order, apart from the conversation: an engine nobody waits for logs
+/// prompts, so they land wherever they land, and what the agent says depends on the model.
 pub fn kinds(events: &[Value]) -> Vec<&str> {
-    events.iter().map(|e| e["type"].as_str().unwrap()).filter(|&k| k != "agent.prompted").collect()
+    events.iter().map(|e| e["type"].as_str().unwrap()).filter(|&k| !CONVERSATION.contains(&k)).collect()
 }
+
+pub const CONVERSATION: [&str; 2] = ["agent.prompted", "agent.said"];
 
 pub fn event<'a>(events: &'a [Value], kind: &str) -> Option<&'a Value> {
     events.iter().find(|e| e["type"] == kind)

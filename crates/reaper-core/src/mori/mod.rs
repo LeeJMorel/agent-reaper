@@ -17,10 +17,11 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::events::{DeathReason, Event, Kind, Tier};
 use crate::rules::Config;
-use crate::state::{Model, QUIET_FOR, Status, hands_back};
+use crate::state::{Chat, Model, QUIET_FOR, Status, hands_back};
 
 pub use cast::{BLOCK, DEAD, DUSK, HALO, LAND, REAPER, Rgb, WHITE, ansi256};
 pub use level::Fit;
+pub use lines::about;
 pub use scene::{Actor, Effect, Exit, FRAME, Health, Label, Mini, Narration, Rect, Scene, Stage, Strip, Title};
 pub use sprites::Sprite;
 
@@ -325,6 +326,32 @@ struct Hole {
     at: i64,
     actor: usize,
     spot: Spot,
+}
+
+/// A line of a session's conversation, and who it's with.
+#[derive(Debug, Clone, Copy)]
+pub struct Talk<'a> {
+    pub at: i64,
+    pub name: &'static str,
+    pub hue: Rgb,
+    /// Where they work: the paths they name are mostly inside it.
+    pub dir: Option<&'a str>,
+    pub line: &'a Chat,
+}
+
+impl Talk<'_> {
+    /// The line as the chat shows it: the words, or a call's tool and what it was about (its
+    /// command, its file), a path inside where they work relative to it.
+    pub fn text(&self) -> String {
+        match self.line {
+            Chat::Asked(words) | Chat::Said(words) => words.clone(),
+            Chat::Called { tool, args } | Chat::Stopped { tool, args } => {
+                let about = lines::about(args).unwrap_or_else(|| args.clone());
+                let inside = self.dir.and_then(|dir| about.strip_prefix(dir)?.strip_prefix('/'));
+                format!("{tool} {}", inside.unwrap_or(&about)).trim_end().to_string()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -720,11 +747,6 @@ impl Mori {
         self.view.chosen.is_none()
     }
 
-    /// What the human asked the session on the stage for, oldest first.
-    pub fn prompts(&self, now: i64) -> Vec<&str> {
-        self.shown(now).map(|s| self.prompted(s)).unwrap_or_default()
-    }
-
     /// What the human asked a session for, oldest first: its main agent, and whoever took over
     /// from it.
     fn prompted(&self, s: usize) -> Vec<&str> {
@@ -735,6 +757,26 @@ impl Mori {
             .collect();
         prompts.sort_by_key(|(at, _)| *at);
         prompts.into_iter().map(|(_, prompt)| prompt.as_str()).collect()
+    }
+
+    /// The conversation of the session on the stage, oldest first: what the human asked, and
+    /// what everyone in it said and did.
+    pub fn chat(&self, now: i64) -> Vec<Talk<'_>> {
+        let Some(s) = self.shown(now) else { return Vec::new() };
+        let mut talk: Vec<Talk> = (self.sessions[s].members.iter())
+            .filter_map(|&m| Some((&self.actors[m], self.model.agent(&self.actors[m].id)?)))
+            .flat_map(|(c, agent)| {
+                (agent.chat.iter()).map(|(at, line)| Talk {
+                    at: *at,
+                    name: c.name,
+                    hue: c.hue,
+                    dir: agent.dir.as_deref(),
+                    line,
+                })
+            })
+            .collect();
+        talk.sort_by_key(|t| t.at);
+        talk
     }
 
     pub fn follow_the_action(&mut self, now: i64) -> bool {
@@ -803,9 +845,9 @@ impl Mori {
             return;
         }
         self.model.apply(event);
-        // The model keeps what the human asked for; nobody moves for it, apart from putting a
-        // signal away: that's hearing back.
-        if matches!(event.kind, Kind::Prompted { .. }) {
+        // The model keeps what the human asked for and what the agent said; nobody moves for
+        // either, apart from putting a signal away: that's hearing back.
+        if matches!(event.kind, Kind::Prompted { .. } | Kind::Said { .. }) {
             if let Some(&a) = self.index.get(&event.agent) {
                 self.heard_back(a, event.at);
             }
@@ -841,7 +883,7 @@ impl Mori {
             Kind::Spawned { .. } => self.arrive(a, event.at),
             // Started over by the engine: it gets up with a clean slate.
             Kind::Revived => self.renew(a, event.at, Section::Revived),
-            Kind::Acted { tool } => {
+            Kind::Acted { tool, .. } => {
                 if self.actors[a].asleep {
                     self.wake(a, event.at);
                 }
@@ -867,7 +909,7 @@ impl Mori {
                 self.end(a, event.at);
                 return;
             }
-            Kind::Prompted { .. } | Kind::Unknown => {}
+            Kind::Prompted { .. } | Kind::Said { .. } | Kind::Unknown => {}
         }
         self.follow_action(s, event.at);
     }

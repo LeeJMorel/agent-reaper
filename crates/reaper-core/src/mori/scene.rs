@@ -2595,6 +2595,41 @@ mod tests {
     }
 
     #[test]
+    fn the_chat_is_what_everyone_in_the_session_was_asked_said_and_did() {
+        let mut a = mori(&[
+            spawn(0, "a", "m"),
+            spawn(1, "b", "m"),
+            event(10, "a", "agent.prompted", r#""prompt":"fix the tests""#),
+            sub(20, "a1", "a"),
+            event(30, "a1", "agent.acted", r#""tool":"Grep","args":"{\"path\":\"/w/src\",\"pattern\":\"login\"}""#),
+            event(35, "b", "agent.acted", r#""tool":"Bash","args":"{\"command\":\"ls\"}""#),
+            event(40, "a", "agent.acted", r#""tool":"Edit","args":"{\"file_path\":\"/w/src/login.rs\"}""#),
+            event(
+                50,
+                "a",
+                "agent.killed",
+                r#""tool":"Bash","rule":"r","tier":"pattern","strike":1,"final":false,"attempt":"{\"command\":\"rm -rf /\"}""#,
+            ),
+            event(60, "a", "agent.said", r#""text":"Fixed.""#),
+        ]);
+        a.choose(0);
+        let chat: Vec<(&str, String)> = a.chat(100).iter().map(|t| (t.name, t.text())).collect();
+        let (lead, helper) = (a.name("a").unwrap(), a.name("a1").unwrap());
+        assert_eq!(
+            chat,
+            [
+                (lead, "fix the tests".to_string()),
+                (helper, "Grep login".to_string()),
+                (lead, "Edit src/login.rs".to_string()),
+                (lead, "Bash rm -rf /".to_string()),
+                (lead, "Fixed.".to_string()),
+            ],
+            "only its own session, paths where they work cut off"
+        );
+        assert_eq!(a.actors.len(), 3, "saying something casts nobody");
+    }
+
+    #[test]
     fn a_session_quiet_for_half_a_day_leaves_until_it_does_something() {
         let quiet = crate::state::QUIET_FOR;
         let numbers = |m: &Mori, t| m.scene(t, 80, 22).strips.iter().map(|s| s.number).collect::<Vec<_>>();

@@ -1517,13 +1517,7 @@ const PATH_KEYS: [&str; 4] = ["path", "file_path", "filePath", "notebook_path"];
 /// What an agent tried, in plain words, for `{tried}`: "run git push --force", "open .env".
 /// `attempt` is the blocked call's arguments as logged: JSON, possibly cut short.
 pub fn gist(tool: &str, attempt: &str) -> Option<String> {
-    let args: Option<Value> = serde_json::from_str(attempt).ok();
-    let get = |keys: &[&str]| {
-        keys.iter().find_map(|key| match &args {
-            Some(args) => args.get(*key).and_then(Value::as_str).map(str::to_string),
-            None => raw_string(attempt, key),
-        })
-    };
+    let get = |keys: &[&str]| argument(attempt, keys);
     let file = |path: String| path.rsplit('/').find(|p| !p.is_empty()).unwrap_or(&path).to_string();
     let (verb, object) = match tool.to_lowercase().as_str() {
         "bash" => ("run", get(&["command"])?),
@@ -1538,6 +1532,34 @@ pub fn gist(tool: &str, attempt: &str) -> Option<String> {
     let room = 30 - verb.len() - 1;
     let object = cut(&object, room);
     (!object.is_empty()).then(|| format!("{verb} {object}"))
+}
+
+/// What a call was about, in full, from its arguments as logged (JSON, possibly cut short): its
+/// command, pattern, file, address or words.
+pub fn about(args: &str) -> Option<String> {
+    const KEYS: [&str; 11] = [
+        "command",
+        "pattern",
+        "query",
+        "url",
+        "path",
+        "file_path",
+        "filePath",
+        "notebook_path",
+        "description",
+        "skill",
+        "text",
+    ];
+    argument(args, &KEYS)
+}
+
+/// The first of `keys` that's a string in `args`, as logged.
+fn argument(args: &str, keys: &[&str]) -> Option<String> {
+    let parsed: Option<Value> = serde_json::from_str(args).ok();
+    keys.iter().find_map(|key| match &parsed {
+        Some(parsed) => parsed.get(*key).and_then(Value::as_str).map(str::to_string),
+        None => raw_string(args, key),
+    })
 }
 
 fn host(url: &str) -> String {
@@ -1708,6 +1730,16 @@ mod tests {
         assert!(read.iter().any(|l| l.contains("read the file")));
         let bash: Vec<String> = (0..40).filter_map(|s| choose(&ask(Some("bash")), &alone, s)).map(|l| l.0).collect();
         assert!(bash.iter().all(|l| !l.contains("read the file")), "{bash:?}");
+    }
+
+    #[test]
+    fn about_is_a_calls_command_or_file_in_full() {
+        assert_eq!(about(r#"{"command":"cargo test -p reaper","timeout":60000}"#).unwrap(), "cargo test -p reaper");
+        assert_eq!(about(r#"{"path":"src","pattern":"fn main"}"#).unwrap(), "fn main", "a search's pattern");
+        assert_eq!(about(r#"{"content":"x","file_path":"/w/a.rs"}"#).unwrap(), "/w/a.rs");
+        assert_eq!(about(r#"{"content":"cut off before the en"#), None);
+        assert_eq!(about(r#"{"command":"cat .env && echo \"cut"#).unwrap(), "cat .env && echo \"cut", "cut short");
+        assert_eq!(about(r#"{"todos":[]}"#), None);
     }
 
     #[test]

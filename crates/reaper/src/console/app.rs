@@ -88,13 +88,13 @@ pub struct App {
     /// When memento mori next wants a frame, as of the last one drawn.
     pub mori_next: Cell<Option<i64>>,
     pub colors: Colors,
-    /// Memento mori shows everything the followed session was asked, not just the start of the
-    /// latest.
-    pub prompt_open: bool,
-    /// Rows the open prompts are scrolled up from the latest.
-    pub prompt_scroll: usize,
-    /// How far up they go, as last drawn: 0 when they all fit.
-    pub prompt_back: Cell<usize>,
+    /// Memento mori shows the followed session's conversation over the level: everything it was
+    /// asked, and what its agents said and did.
+    pub chat_open: bool,
+    /// The first of its rows shown, scrolled back; `None` at the latest, following it.
+    pub chat_top: Option<usize>,
+    /// The first row shown at the latest, as last drawn: 0 when it all fits.
+    pub chat_back: Cell<usize>,
     /// The agents reaper is installed in, by name.
     pub guarded: Vec<&'static str>,
     /// The agent that writes rules from the human's own words, if there's one here.
@@ -134,9 +134,9 @@ impl App {
             mori: Mori::new(),
             mori_next: Cell::new(None),
             colors: Colors::detect(),
-            prompt_open: false,
-            prompt_scroll: 0,
-            prompt_back: Cell::new(0),
+            chat_open: false,
+            chat_top: None,
+            chat_back: Cell::new(0),
             guarded: Vec::new(),
             writer: None,
             asking: None,
@@ -328,21 +328,21 @@ impl App {
     /// Keys with their own meaning in memento mori. False for the rest, which work as anywhere.
     fn mori_key(&mut self, code: KeyCode) -> bool {
         let now = self.mori_now();
-        let scrolls = self.prompt_open && self.prompt_back.get() > 0;
+        let scrolls = self.chat_open && self.chat_back.get() > 0;
         match code {
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                self.prompt_scroll = 0;
+                self.chat_top = None;
                 self.mori.switch(1, now);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.prompt_scroll = 0;
+                self.chat_top = None;
                 self.mori.switch(-1, now);
             }
-            // The prompts cover the level, so there's nobody to pick while they're open.
-            KeyCode::Up | KeyCode::Char('k') if scrolls => self.scroll_prompts(1),
-            KeyCode::Down | KeyCode::Char('j') if scrolls => self.scroll_prompts(-1),
-            KeyCode::PageUp if scrolls => self.scroll_prompts(PAGE),
-            KeyCode::PageDown if scrolls => self.scroll_prompts(-PAGE),
+            // The chat covers the level, so there's nobody to pick while it's open.
+            KeyCode::Up | KeyCode::Char('k') if scrolls => self.scroll_chat(-1),
+            KeyCode::Down | KeyCode::Char('j') if scrolls => self.scroll_chat(1),
+            KeyCode::PageUp if scrolls => self.scroll_chat(-PAGE),
+            KeyCode::PageDown if scrolls => self.scroll_chat(PAGE),
             KeyCode::Up | KeyCode::Char('k') => self.mori.pick(1, now),
             KeyCode::Down | KeyCode::Char('j') => self.mori.pick(-1, now),
             KeyCode::Esc => {
@@ -357,8 +357,8 @@ impl App {
                 self.agent_sel = Some(id);
             }
             KeyCode::Char('p') => {
-                self.prompt_open = !self.prompt_open;
-                self.prompt_scroll = 0;
+                self.chat_open = !self.chat_open;
+                self.chat_top = None;
             }
             // A death for fun, played by stand-ins on a level of their own.
             KeyCode::Char('d') => {
@@ -369,10 +369,11 @@ impl App {
         true
     }
 
-    /// Up is back to the older ones.
-    fn scroll_prompts(&mut self, delta: isize) {
-        let back = self.prompt_back.get();
-        self.prompt_scroll = self.prompt_scroll.min(back).saturating_add_signed(delta).min(back);
+    /// Up is back to older rows; down to the latest follows it again.
+    fn scroll_chat(&mut self, delta: isize) {
+        let latest = self.chat_back.get();
+        let top = self.chat_top.unwrap_or(latest).min(latest).saturating_add_signed(delta);
+        self.chat_top = (top < latest).then_some(top);
     }
 
     fn step(&mut self, delta: isize) {

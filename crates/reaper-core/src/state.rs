@@ -36,6 +36,8 @@ pub struct Agent {
     pub label: Option<String>,
     /// What the human asked it for, and when, oldest first.
     pub prompts: Vec<(i64, String)>,
+    /// Its conversation, oldest first: the latest `CHAT` lines of it.
+    pub chat: VecDeque<(i64, Chat)>,
     pub status: Status,
     /// Dead, with its work waiting for the human: what they're to type to carry it on.
     pub waits_for: Option<String>,
@@ -48,6 +50,28 @@ pub struct Agent {
     pub strike: u32,
     /// Oldest first.
     pub recent: VecDeque<Event>,
+}
+
+/// A line of an agent's conversation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Chat {
+    /// The human asked it for something.
+    Asked(String),
+    /// It said something back.
+    Said(String),
+    /// It made a call: the tool, and its arguments as logged (JSON, possibly cut short).
+    Called { tool: String, args: String },
+    /// A call reaper stopped, likewise.
+    Stopped { tool: String, args: String },
+}
+
+impl Agent {
+    fn tell(&mut self, at: i64, line: Chat) {
+        if self.chat.len() == CHAT {
+            self.chat.pop_front();
+        }
+        self.chat.push_back((at, line));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +103,7 @@ pub enum WatcherHealth {
 }
 
 const RECENT: usize = 50;
+const CHAT: usize = 500;
 
 /// Nothing has happened in a session for this long: it most likely ended without a word
 /// (closed before reaper listened for that, crashed, killed). The views let it go until it
@@ -142,6 +167,7 @@ impl Model {
         if let Kind::Prompted { prompt } = &event.kind {
             if let Some(prompt) = written(prompt) {
                 agent.prompts.push((event.at, prompt.to_string()));
+                agent.tell(event.at, Chat::Asked(prompt.to_string()));
             }
             return;
         }
@@ -170,7 +196,8 @@ impl Model {
                     agent.status = Status::Idle;
                 }
             }
-            Kind::Acted { tool } => {
+            Kind::Acted { tool, args } => {
+                agent.tell(event.at, Chat::Called { tool: tool.clone(), args: args.clone() });
                 agent.actions += 1;
                 agent.last_tool = Some(tool.clone());
                 agent.status = if agent.parent.is_some() && hands_back(tool) { Status::Ended } else { Status::Working };
@@ -187,6 +214,7 @@ impl Model {
                 }
             }
             Kind::Killed { tool, rule, tier, strike, is_final, attempt, .. } => {
+                agent.tell(event.at, Chat::Stopped { tool: tool.clone(), args: attempt.clone() });
                 agent.kills += 1;
                 agent.strike = *strike;
                 agent.status = Status::Killed;
@@ -237,6 +265,7 @@ impl Model {
                     }
                 }
             }
+            Kind::Said { text } => agent.tell(event.at, Chat::Said(text.clone())),
             Kind::Idle | Kind::Asked | Kind::Reaped { .. } | Kind::Revived | Kind::Prompted { .. } | Kind::Unknown => {}
         }
     }
@@ -253,6 +282,7 @@ impl Model {
                 model: None,
                 label: None,
                 prompts: Vec::new(),
+                chat: VecDeque::new(),
                 waits_for: None,
                 status: Status::Idle,
                 first_at: event.at,
@@ -300,6 +330,27 @@ mod tests {
         assert_eq!(kill.rule, "no-violation-file");
         assert_eq!(kill.attempt, r#"{"command":"touch violation.txt"}"#);
         assert_eq!(kill.outcome, Outcome::Redirected("Create the marker file allowed.txt in the project root.".into()));
+    }
+
+    #[test]
+    fn an_agents_chat_is_what_it_was_asked_said_and_did_in_order() {
+        let mut model = fixture();
+        let id = "01a18e1b-7417-7499-8113-59ad5578e845";
+        let asked = format!(
+            r#"{{"at":1793385526400,"host":"pi","agent":"{id}","type":"agent.prompted","prompt":"Make a marker file."}}"#
+        );
+        model.apply(&parse_line(&asked).unwrap());
+        let chat: Vec<&Chat> = model.agent(id).unwrap().chat.iter().map(|(_, line)| line).collect();
+        assert_eq!(
+            chat,
+            [
+                &Chat::Stopped { tool: "bash".into(), args: r#"{"command":"touch violation.txt"}"#.into() },
+                &Chat::Called { tool: "bash".into(), args: r#"{"command":"touch allowed.txt"}"#.into() },
+                &Chat::Said("Created allowed.txt in the project root.".into()),
+                &Chat::Asked("Make a marker file.".into()),
+            ],
+            "as the log has them"
+        );
     }
 
     #[test]

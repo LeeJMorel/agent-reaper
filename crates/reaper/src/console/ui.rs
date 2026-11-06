@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use reaper_core::events::{DeathReason, Event, Kind, ReapReason, Verdict};
 use reaper_core::lint::Level;
+use reaper_core::mori::about;
 use reaper_core::paths::tilde;
 use reaper_core::rules::Rule;
 use reaper_core::state::{Agent, Kill, Outcome, Status, WatcherHealth};
@@ -316,16 +317,16 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
 /// Only the keys that do something just now, most useful first, so a narrow terminal loses
 /// the least useful.
 fn mori_keys(app: &App) -> Vec<(&'static str, &'static str)> {
-    let scrolls = app.prompt_open && app.prompt_back.get() > 0;
-    let mut keys = vec![("←→", "switch session"), ("↑↓", if scrolls { "scroll prompts" } else { "check on agent" })];
+    let scrolls = app.chat_open && app.chat_back.get() > 0;
+    let mut keys = vec![("←→", "switch session"), ("↑↓", if scrolls { "scroll chat" } else { "check on agent" })];
     if app.mori.picked().is_some() {
         keys.extend([("enter", "details"), ("esc", "deselect")]);
     } else if !app.mori.following_the_action() {
         // Back to showing whichever session is busy.
         keys.push(("esc", "auto-switch"));
     }
-    if !app.mori.prompts(app.mori_now()).is_empty() {
-        keys.push(("p", if app.prompt_open { "hide prompt" } else { "show prompt" }));
+    if !app.mori.chat(app.mori_now()).is_empty() {
+        keys.push(("p", if app.chat_open { "hide chat" } else { "show chat" }));
     }
     keys.extend([("q", "quit"), ("d", "demo a death")]);
     keys
@@ -560,17 +561,21 @@ fn agent_detail(app: &App, rows: usize, width: usize) -> Text<'static> {
     let recent: Vec<&Event> = a.recent.iter().rev().take(room).collect();
     for (i, event) in recent.into_iter().rev().enumerate() {
         let mut spans = vec![Span::styled(format!("{}  ", clock(event.at, &app.tz)), dim())];
-        spans.push(describe(event));
+        let room = width.saturating_sub(LABEL + spans[0].width());
+        spans.push(describe(event, room));
         lines.push(field(if i == 0 { "recent" } else { "" }, spans));
     }
     Text::from(lines)
 }
 
-fn describe(event: &Event) -> Span<'static> {
+/// One line, `room` wide at most: a command or a reply can run to pages.
+fn describe(event: &Event, room: usize) -> Span<'static> {
+    let flat = |text: &str| fit(&text.split_whitespace().collect::<Vec<_>>().join(" "), room);
     match &event.kind {
         Kind::Spawned { .. } => Span::raw("started"),
         Kind::Prompted { .. } => Span::raw("asked for something"),
-        Kind::Acted { tool } => Span::raw(format!("ran {tool}")),
+        Kind::Acted { tool, args } => Span::raw(flat(&format!("ran {tool} {}", about(args).unwrap_or_default()))),
+        Kind::Said { text } => Span::styled(flat(&format!("said: {text}")), dim()),
         Kind::Checked { tool, error: Some(error), .. } => {
             Span::styled(format!("check of {tool} failed: {error}"), fg(ACCENT))
         }
@@ -1072,10 +1077,10 @@ mod tests {
         assert!(screen.contains(&format!("▾ {piet}")), "{screen}");
         // At home, its turn over: a line about being home, not about work.
         assert!(screen.contains(&format!("{piet} was home already.")), "{screen}");
-        // At 80 columns, the demo death makes room for what picking adds.
+        // At 80 columns, the demo death and quitting make room for what picking adds.
         assert_eq!(
             screen.lines().last(),
-            Some(" ←→ switch session  ↑↓ check on agent  enter details  esc deselect  q quit"),
+            Some(" ←→ switch session  ↑↓ check on agent  enter details  esc deselect  p show chat"),
             "{screen}"
         );
 
@@ -1085,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sessions_latest_prompt_shows_on_one_line_and_p_opens_them_all() {
+    fn a_sessions_latest_prompt_shows_on_one_line_and_p_opens_the_chat() {
         let mut app = fixture();
         let piet = "01a18e1b-7417-7499-8113-59ad5578e845";
         let prompted = |at: i64, prompt: &str| {
@@ -1097,47 +1102,72 @@ mod tests {
         let long = format!("Make the tests pass.\n\n\n{}", "Then tidy up. ".repeat(150));
         events.insert(1, prompted(1_793_385_526_350, "Fix the login."));
         events.insert(2, prompted(1_793_385_526_400, &long));
+        // Nothing waits to play, so what's said next plays as soon as it's due.
+        events.retain(|e| e.at <= app.now);
         app.model = reaper_core::state::Model::default();
         app.model.apply_all(&events);
         app.mori.clear();
         app.mori.push(events);
         app.set_clock(app.now);
         app.tab = Tab::Mori;
+        let name = app.mori.name(piet).unwrap();
 
         let screen = render(&app, 80, 24);
         let rows: Vec<&str> = screen.lines().collect();
         assert!(rows[2].starts_with(" Make the tests pass. Then tidy up.") && rows[2].ends_with('…'), "{screen}");
         assert_eq!(rows[2].chars().count(), 79, "{screen}");
         assert_eq!(
-            rows[23], " ←→ switch session  ↑↓ check on agent  p show prompt  q quit  d demo a death",
+            rows[23], " ←→ switch session  ↑↓ check on agent  p show chat  q quit  d demo a death",
             "only keys that do something: {screen}"
         );
 
-        // Open, it starts at the end of the latest, and scrolls back to the start.
+        // Open, it starts at the latest: what the agent did, and said, after the human asked.
         app.on_key(key(KeyCode::Char('p')));
         let screen = render(&app, 80, 24);
         let rows: Vec<&str> = screen.lines().collect();
-        assert!(rows[20].starts_with(" tidy up. Then tidy up.") && rows[20].ends_with('┃'), "{screen}");
-        assert!(rows[2].contains("tidy up.") && !rows[2].ends_with('┃'), "{screen}");
+        assert!(rows[17].starts_with("       Then tidy up."), "{screen}");
+        assert!(rows[18].starts_with(&format!(" {name:<6}✗ bash touch violation.txt")), "who's talking: {screen}");
+        assert!(rows[19].starts_with("       bash touch allowed.txt"), "{screen}");
+        assert!(
+            rows[20].starts_with("       Created allowed.txt in the project root.") && rows[20].ends_with('┃'),
+            "{screen}"
+        );
         assert!(rows[21].is_empty(), "off the level: {screen}");
-        assert!(rows[23].contains("↑↓ scroll prompts") && rows[23].contains("p hide prompt"), "{screen}");
+        assert!(rows[23].contains("↑↓ scroll chat") && rows[23].contains("p hide chat"), "{screen}");
 
+        // Scrolled back to the start, new lines don't move it.
         app.on_key(key(KeyCode::PageUp));
         app.on_key(key(KeyCode::PageUp));
         let screen = render(&app, 80, 24);
         let rows: Vec<&str> = screen.lines().collect();
-        assert!(rows[2].starts_with(" Fix the login.") && rows[2].ends_with('┃'), "{screen}");
-        assert!(rows[3].starts_with(" ─────"), "a rule between prompts: {screen}");
-        assert!(rows[4].starts_with(" Make the tests pass.") && rows[4].ends_with('┃'), "its own lines: {screen}");
+        assert!(rows[2].starts_with(" you   Fix the login.") && rows[2].ends_with('┃'), "{screen}");
+        assert!(rows[3].starts_with(" ─────"), "a rule between turns: {screen}");
+        assert!(
+            rows[4].starts_with(" you   Make the tests pass.") && rows[4].ends_with('┃'),
+            "its own lines: {screen}"
+        );
         assert_eq!(rows[5].trim(), "┃", "one blank line between paragraphs: {screen}");
-        assert!(rows[6].starts_with(" Then tidy up."), "{screen}");
+        assert!(rows[6].starts_with("       Then tidy up."), "{screen}");
         assert!(!rows[20].ends_with('┃'), "{screen}");
+        let at = app.mori_now() + 1000;
+        let said = serde_json::json!({ "at": at, "host": "pi", "agent": piet, "type": "agent.said", "text": "Done." });
+        app.model.apply(&parse_line(&said.to_string()).unwrap());
+        app.mori.push([parse_line(&said.to_string()).unwrap()]);
+        app.set_clock(at);
+        let screen = render(&app, 80, 24);
+        assert!(screen.lines().nth(2).unwrap().starts_with(" you   Fix the login."), "{screen}");
 
-        // Closed and opened again, it's back at the latest.
+        // Down to the latest, it follows it again; closed and opened again, it's back there too.
+        app.on_key(key(KeyCode::End));
+        for _ in 0..40 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.chat_top, None);
+        app.on_key(key(KeyCode::PageUp));
         app.on_key(key(KeyCode::Char('p')));
         app.on_key(key(KeyCode::Char('p')));
         let screen = render(&app, 80, 24);
-        assert!(screen.lines().nth(20).unwrap().ends_with('┃'), "{screen}");
+        assert!(screen.lines().nth(20).unwrap().starts_with("       Done."), "{screen}");
 
         app.on_key(key(KeyCode::Char('1')));
         app.pane = Pane::Agents;
@@ -1145,6 +1175,7 @@ mod tests {
         assert_eq!(app.selected_agent().map(|a| a.id.as_str()), Some(piet));
         let screen = render(&app, 110, 28);
         assert!(screen.contains("prompt    Make the tests pass. Then tidy up."), "{screen}");
+        assert!(screen.contains("ran bash touch allowed.txt"), "{screen}");
     }
 
     #[test]

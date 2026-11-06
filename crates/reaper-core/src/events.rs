@@ -60,7 +60,15 @@ pub enum Kind {
     #[serde(rename = "agent.prompted")]
     Prompted { prompt: String },
     #[serde(rename = "agent.acted")]
-    Acted { tool: String },
+    Acted {
+        tool: String,
+        /// The call's arguments, each string cut short. Absent in logs from before it was recorded.
+        #[serde(default)]
+        args: String,
+    },
+    /// What the agent said back, cut short. A message reaper stops is `agent.killed` instead.
+    #[serde(rename = "agent.said")]
+    Said { text: String },
     #[serde(rename = "agent.checked")]
     Checked { tool: String, tier: Tier, ms: f64, verdict: Verdict, error: Option<String> },
     #[serde(rename = "agent.killed")]
@@ -275,6 +283,8 @@ mod tests {
         assert_eq!(old.kind, Kind::Redirected { rule: "r".into(), redirect: String::new() });
         let asked = parse_line(r#"{"at":1,"host":"claude-code","agent":"a","type":"agent.asked"}"#).unwrap();
         assert_eq!(asked.kind, Kind::Asked);
+        let acted = parse_line(r#"{"at":1,"host":"pi","agent":"a","type":"agent.acted","tool":"bash"}"#).unwrap();
+        assert_eq!(acted.kind, Kind::Acted { tool: "bash".into(), args: String::new() }, "logs from before");
         let revived = parse_line(r#"{"at":1,"host":"claude-code","agent":"a","type":"agent.revived"}"#).unwrap();
         assert_eq!(revived.kind, Kind::Revived);
         let took_over = parse_line(r#"{"at":1,"host":"pi","agent":"b","type":"agent.spawned","dir":"/w","after":"a"}"#);

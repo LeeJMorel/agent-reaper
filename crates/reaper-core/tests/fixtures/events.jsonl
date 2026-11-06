@@ -3,7 +3,8 @@
 {"at":1793385526435,"host":"pi","agent":"01a18e1b-7417-7499-8113-59ad5578e845","tool":"bash","type":"agent.killed","rule":"no-violation-file","tier":"watcher","strike":1,"final":false,"attempt":"{\"command\":\"touch violation.txt\"}"}
 {"at":1793385526437,"host":"pi","agent":"01a18e1b-7417-7499-8113-59ad5578e845","type":"agent.redirected","rule":"no-violation-file","redirect":"Create the marker file allowed.txt in the project root."}
 {"at":1793385526449,"host":"pi","agent":"01a18e1b-7417-7499-8113-59ad5578e845","tool":"bash","type":"agent.checked","tier":"watcher","ms":3,"verdict":"pass"}
-{"at":1793385526450,"host":"pi","agent":"01a18e1b-7417-7499-8113-59ad5578e845","tool":"bash","type":"agent.acted"}
+{"at":1793385526450,"host":"pi","agent":"01a18e1b-7417-7499-8113-59ad5578e845","tool":"bash","type":"agent.acted","args":"{\"command\":\"touch allowed.txt\"}"}
+{"at":1793385526460,"host":"pi","agent":"01a18e1b-7417-7499-8113-59ad5578e845","type":"agent.said","text":"Created allowed.txt in the project root."}
 {"at":1793385526466,"host":"pi","agent":"01a18e1b-7417-7499-8113-59ad5578e845","type":"agent.idle"}
 {"at":1793385526486,"host":"pi","agent":"01a18e1b-74d4-7499-8113-59ae26a82065","type":"agent.spawned","dir":"/work/strikes/project","project":"e2e","model":"m"}
 {"at":1793385526496,"host":"pi","agent":"01a18e1b-74d4-7499-8113-59ae26a82065","tool":"bash","type":"agent.checked","tier":"watcher","ms":2,"verdict":"violation"}

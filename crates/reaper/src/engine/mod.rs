@@ -28,6 +28,12 @@ use store::Store;
 use watcher::{Settings, Tier};
 
 const MAX_ATTEMPT: usize = 300;
+/// What an allowed call is logged with: each of its strings this long at most, so a file
+/// written whole doesn't crowd out its path, and all of them this long.
+const MAX_ARG: usize = 300;
+const MAX_ARGS: usize = 1000;
+/// What an agent said is logged this long at most.
+const MAX_SAID: usize = 2000;
 const DEFAULT_REDIRECT: &str = "Continue with the task.";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
 /// Claude Code starts for each check and took about 4 s with reaper's prompt.
@@ -244,6 +250,19 @@ fn resolve(dir: &Path, to: &str) -> PathBuf {
         }
     }
     out
+}
+
+/// A call's arguments as the log keeps them: canonical JSON, cut short (see `MAX_ARG`).
+fn logged(args: &Value) -> String {
+    fn cut(value: &Value) -> Value {
+        match value {
+            Value::String(s) => Value::String(s.chars().take(MAX_ARG).collect()),
+            Value::Array(items) => Value::Array(items.iter().map(cut).collect()),
+            Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), cut(v))).collect()),
+            other => other.clone(),
+        }
+    }
+    canonical(&cut(args)).chars().take(MAX_ARGS).collect()
 }
 
 /// The rule for a stuck agent: the same call made `repeats` times in a row. It is decided
@@ -473,8 +492,11 @@ impl Engine {
                     return Decision::Confirm { change };
                 }
                 // A message that passes isn't an action: nothing was done.
-                if !c.tool.eq_ignore_ascii_case(reaper_core::rules::MESSAGE) {
-                    self.event(&c.host, &c.agent, "agent.acted", json!({ "tool": c.tool }));
+                if c.tool.eq_ignore_ascii_case(reaper_core::rules::MESSAGE) {
+                    let text: String = c.args["text"].as_str().unwrap_or_default().chars().take(MAX_SAID).collect();
+                    self.event(&c.host, &c.agent, "agent.said", json!({ "text": text }));
+                } else {
+                    self.event(&c.host, &c.agent, "agent.acted", json!({ "tool": c.tool, "args": logged(&c.args) }));
                     self.changed(c, &args);
                 }
                 return Decision::Allow;
@@ -779,7 +801,29 @@ rules:
                 if rule == "bridge-schema" && redirect == "Keep to the bridge model in docs/schema.md.")
         );
         assert_eq!(engine.check(&says("The keys live in .env; I left them alone.")), Decision::Allow);
-        assert_eq!(sandbox.events(), ["agent.checked", "agent.killed"], "a message that passes logs nothing");
+        assert_eq!(
+            sandbox.events(),
+            ["agent.checked", "agent.killed", "agent.said"],
+            "a message that passes is no action"
+        );
+    }
+
+    #[test]
+    fn an_allowed_call_is_logged_with_its_arguments_cut_short() {
+        let sandbox = Sandbox::new("acted");
+        let engine = sandbox.engine("rules: []");
+        let whole = "x".repeat(5000);
+        engine.check(&call("write", json!({ "file_path": "/work/big.txt", "content": whole })));
+        engine.check(&call("message", json!({ "text": whole })));
+        let log = fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
+        let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let args: Value = serde_json::from_str(events[0]["args"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args,
+            json!({ "content": "x".repeat(MAX_ARG), "file_path": "/work/big.txt" }),
+            "the path outlives the file"
+        );
+        assert_eq!(events[1]["text"].as_str().unwrap().chars().count(), MAX_SAID);
     }
 
     #[test]

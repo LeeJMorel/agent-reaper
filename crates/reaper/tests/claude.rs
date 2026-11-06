@@ -250,6 +250,9 @@ fn a_violation_is_denied_and_the_agent_only_hears_the_redirect() {
         (Some(RULE_ID), Some("watcher"), Some(false))
     );
     assert!(killed["attempt"].as_str().unwrap().contains("touch violation.txt"));
+    let acted = event(&o.events, "agent.acted").expect("the allowed call was logged");
+    assert!(acted["args"].as_str().is_some_and(|a| a.contains("touch allowed.txt")), "{acted}");
+    assert!(event(&o.events, "agent.said").is_some_and(|s| s["text"].as_str().is_some_and(|t| !t.is_empty())));
     let redirected = event(&o.events, "agent.redirected").expect("a redirect was logged")["redirect"].clone();
     assert!(redirected.as_str().is_some_and(|r| r.starts_with(REDIRECT)), "{redirected}");
 

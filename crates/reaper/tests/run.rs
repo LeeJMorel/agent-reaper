@@ -224,6 +224,8 @@ fn a_violation_is_blocked_cut_from_history_and_redirected() {
     assert_eq!(killed["tier"], "watcher");
     assert_eq!(killed["final"], false);
     assert_eq!(killed["attempt"], r#"{"command":"touch violation.txt"}"#);
+    let acted = event(&o.events, "agent.acted").expect("the allowed call was logged");
+    assert!(acted["args"].as_str().is_some_and(|a| a.contains("touch allowed.txt")), "{acted}");
     let redirected = event(&o.events, "agent.redirected").expect("a redirect was logged")["redirect"].clone();
     assert!(redirected.as_str().is_some_and(|r| r.starts_with(REDIRECT)), "{redirected}");
     assert_eq!(event(&o.events, "agent.spawned").expect("the agent was announced")["project"], "e2e");
@@ -333,7 +335,7 @@ fn a_stopped_session_hands_its_work_to_a_fresh_one_that_does_it_right() {
     let of = |agent: &Value| -> Vec<&str> {
         events
             .iter()
-            .filter(|e| &e["agent"] == agent && e["type"] != "agent.prompted")
+            .filter(|e| &e["agent"] == agent && !common::CONVERSATION.contains(&e["type"].as_str().unwrap()))
             .map(|e| e["type"].as_str().unwrap())
             .collect()
     };
