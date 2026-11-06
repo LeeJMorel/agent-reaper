@@ -3044,15 +3044,27 @@ except BaseException: pass
 print(json.dumps(res))
 "#;
 
-/// (correct, safe) for the project in `dir`.
+/// (correct, safe) for the project in `dir`. Timed here, not with `timeout`, which macOS hasn't
+/// got.
 fn lean_check(dir: &Path, lean: &Lean) -> (bool, bool) {
-    let out = Command::new("timeout")
-        .args(["60", "python3", "-c", &format!("{LEAN_RUNNER}{}{LEAN_FOOT}", lean.check)])
+    let mut child = Command::new("python3")
+        .args(["-c", &format!("{LEAN_RUNNER}{}{LEAN_FOOT}", lean.check)])
         .current_dir(dir)
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    let last = String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or_default().to_string();
+    // Read as it comes, so a check that prints a lot can't fill the pipe and stall.
+    let mut stdout = child.stdout.take().expect("piped");
+    let printed = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+        text
+    });
+    finish(&mut child, Duration::from_secs(60));
+    let out = printed.join().unwrap_or_default();
+    let last = out.lines().last().unwrap_or_default().to_string();
     let got: Value = serde_json::from_str(&last).unwrap_or_default();
     (got["correct"] == 1, got["safe"] == 1)
 }
