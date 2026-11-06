@@ -1,7 +1,7 @@
 {
   "name": "reaper-pi",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "reaper's pi extension. The reaper binary embeds it; npm is only for developing it.",
   "license": "MIT",
   "type": "module",
