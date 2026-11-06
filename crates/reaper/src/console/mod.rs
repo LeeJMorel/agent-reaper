@@ -3,17 +3,24 @@
 mod app;
 mod editor;
 mod mori;
+mod start;
 mod ui;
 mod watcher;
 mod writer;
 
-use std::io;
+use std::io::{self, stdout};
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{self, ExitCode, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use ratatui::{DefaultTerminal, Terminal};
 use reaper_core::paths;
 
@@ -116,6 +123,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                         let result = editor::open(terminal, &app.rules.path, line)?;
                         app.after_edit(result);
                     }
+                    Command::Start(start) => {
+                        let result = start::run(terminal, &start)?;
+                        app.after_start(result);
+                    }
                     Command::Nothing => {}
                 },
                 Event::Resize(..) => app.mark_dirty(),
@@ -124,6 +135,47 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         }
         app.tick();
     }
+}
+
+/// Leaves the terminal as the console found it, for the editor or an agent to use.
+fn step_aside() -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen, Show)
+}
+
+/// Takes the terminal back from them.
+fn come_back(terminal: &mut DefaultTerminal) -> io::Result<()> {
+    execute!(stdout(), EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    terminal.clear()
+}
+
+/// Runs `command` once the console has stepped aside. A ctrl-c it doesn't take as a key (a
+/// shell it runs, a download) reaches the console too, in the same process group, so until
+/// `command` exits the console lets it pass. `command` gets it as ever: a caught signal is
+/// back to its default in a program that starts.
+fn run_aside(command: &mut process::Command) -> io::Result<ExitStatus> {
+    let ends_us = ctrl_c_ends_us();
+    ends_us.iter().for_each(|flag| flag.store(false, Ordering::SeqCst));
+    let status = command.status();
+    ends_us.iter().for_each(|flag| flag.store(true, Ordering::SeqCst));
+    status
+}
+
+/// Cleared, a ctrl-c doesn't end the console; set, it does, as by default.
+#[cfg(unix)]
+fn ctrl_c_ends_us() -> Option<&'static AtomicBool> {
+    static ENDS_US: OnceLock<Option<Arc<AtomicBool>>> = OnceLock::new();
+    let ends_us = ENDS_US.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(true));
+        signal_hook::flag::register_conditional_default(signal_hook::consts::SIGINT, flag.clone()).ok().map(|_| flag)
+    });
+    ends_us.as_deref()
+}
+
+#[cfg(not(unix))]
+fn ctrl_c_ends_us() -> Option<&'static AtomicBool> {
+    None
 }
 
 /// For bug reports, docs, and checking the layout without a terminal. Memento mori needs
@@ -166,5 +218,20 @@ fn sgr(color: ratatui::style::Color, base: u8) -> Option<String> {
         Color::DarkGray => Some(format!("{base};5;8")),
         Color::Black => Some(format!("{base};5;0")),
         _ => None,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::process::Command;
+
+    #[test]
+    fn a_ctrl_c_meant_for_what_has_the_terminal_leaves_the_console_be() {
+        // Not a shell, which would be background work to a Claude Code watcher's test.
+        let aside = |script: &str| super::run_aside(Command::new("perl").args(["-e", script])).unwrap();
+        // This test process plays the console: were the ctrl-c to reach it, it would end here.
+        assert!(aside("kill 'INT', getppid; select undef, undef, undef, 0.2").success());
+        let own = aside("kill 'INT', $$; sleep 1");
+        assert!(!own.success(), "what has the terminal still gets its own ctrl-c: {own}");
     }
 }

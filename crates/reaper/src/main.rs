@@ -51,6 +51,7 @@ console options:
   --at MS         memento mori at this time: ms since the epoch, or +MS/-MS from the newest event
   --session N     memento mori follows session N (in order of appearance)
 
+live (tab 1): s starts an agent here or where the selected one works, or picks that one up again.
 memento mori (tab 3): ←→ switch session, ↑↓ pick a character, enter shows it in the live tab,
 esc lets go (twice: back to following the action), d plays a death for fun.
 NO_COLOR is respected.

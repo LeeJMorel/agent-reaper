@@ -1,14 +1,11 @@
 //! Hands the terminal to the human's editor, and takes it back when they're done.
 
 use std::env;
-use std::io::{self, stdout};
+use std::io;
 use std::path::Path;
 use std::process::Command;
 
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::cursor::Show;
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 
 fn configured() -> String {
     for var in ["VISUAL", "EDITOR"] {
@@ -66,12 +63,9 @@ pub fn command(editor: &str, path: &Path, line: Option<usize>) -> (String, Vec<S
 pub fn open(terminal: &mut DefaultTerminal, path: &Path, line: Option<usize>) -> io::Result<Result<(), String>> {
     let (program, args) = command(&configured(), path, line);
 
-    disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, Show)?;
-    let status = Command::new(&program).args(&args).status();
-    execute!(stdout(), EnterAlternateScreen)?;
-    enable_raw_mode()?;
-    terminal.clear()?;
+    super::step_aside()?;
+    let status = super::run_aside(Command::new(&program).args(&args));
+    super::come_back(terminal)?;
 
     Ok(match status {
         Ok(s) if s.success() => Ok(()),

@@ -16,7 +16,7 @@ use reaper_core::paths::tilde;
 use reaper_core::rules::Rule;
 use reaper_core::state::{Agent, Kill, Outcome, Status, WatcherHealth};
 
-use super::app::{App, Pane, RuleRow, Tab, plural};
+use super::app::{App, Pane, Pick, RuleRow, Tab, plural};
 use super::mori;
 use super::watcher::Choice;
 use super::writer::Proposal;
@@ -46,7 +46,7 @@ fn fit(text: &str, width: usize) -> String {
 }
 
 /// Session ids share their leading (time-based) characters.
-fn short(id: &str) -> String {
+pub(super) fn short(id: &str) -> String {
     let chars: Vec<char> = id.chars().collect();
     chars[chars.len().saturating_sub(6)..].iter().collect()
 }
@@ -278,6 +278,7 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
         Line::styled(format!(" Can't read {}: {error}", tilde(app.events_path())), fg(ACCENT))
     } else {
         let keys = match app.tab {
+            Tab::Live if app.start_pick.is_some() => vec![("↑↓", "choose"), ("enter", "start"), ("esc", "cancel")],
             Tab::Live => {
                 vec![("1 2 3", "tabs"), ("tab", "switch pane"), ("↑↓", "select"), ("e", "edit rule"), ("q", "quit")]
             }
@@ -346,17 +347,52 @@ fn split(area: Rect, first: u16) -> [Rect; 2] {
 // ── live tab ────────────────────────────────────────────────────────────────
 
 fn live(frame: &mut Frame, area: Rect, app: &App) {
-    let [lists, detail] = Layout::vertical([Constraint::Min(6), Constraint::Length(10)]).areas(area);
+    let starting = app.start_pick.as_ref().map(|pick| {
+        let intro = "It gets this terminal, and the console comes back when it exits.";
+        pick_lines("Start an agent", intro, pick, |start| (start.name.clone(), "", vec![start.about.clone()]))
+    });
+    let tall = starting.as_ref().map_or(10, |lines| (lines.len() as u16 + 2).max(10));
+    let [lists, detail] = Layout::vertical([Constraint::Min(6), Constraint::Length(tall)]).areas(area);
     let [left, right] = split(lists, 40);
     agents(frame, left, app);
     kills(frame, right, app);
 
     let (rows, width) = (detail.height.saturating_sub(2) as usize, detail.width.saturating_sub(2) as usize);
-    let text = match app.pane {
-        Pane::Agents => agent_detail(app, rows, width),
-        Pane::Kills => kill_detail(app, width),
+    let (title, text) = match (starting, app.pane) {
+        (Some(lines), _) => ("Start", Text::from(lines)),
+        (None, Pane::Agents) => ("Detail", agent_detail(app, rows, width)),
+        (None, Pane::Kills) => ("Detail", kill_detail(app, width)),
     };
-    frame.render_widget(Paragraph::new(text).block(pane("Detail".into(), false)).wrap(Wrap { trim: false }), detail);
+    frame.render_widget(Paragraph::new(text).block(pane(title.into(), false)).wrap(Wrap { trim: false }), detail);
+}
+
+/// A pick under its heading: each choice's name, the selected one marked and any `tag` after
+/// it, and what's said about it on the lines under.
+fn pick_lines<T>(
+    heading: &str,
+    intro: &str,
+    pick: &Pick<T>,
+    show: impl Fn(&T) -> (String, &'static str, Vec<String>),
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(heading.to_string(), fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Line::styled(intro.to_string(), dim()),
+        Line::raw(""),
+    ];
+    for (i, choice) in pick.choices.iter().enumerate() {
+        let (name, tag, about) = show(choice);
+        let here = i == pick.at;
+        let mut spans = vec![
+            Span::styled(if here { "› " } else { "  " }, fg(ACCENT)),
+            Span::styled(name, if here { bold() } else { Style::new() }),
+        ];
+        if !tag.is_empty() {
+            spans.push(Span::styled(format!("  ({tag})"), dim()));
+        }
+        lines.push(Line::from(spans));
+        lines.extend(about.into_iter().map(|line| Line::styled(format!("    {line}"), dim())));
+    }
+    lines
 }
 
 fn agents(frame: &mut Frame, area: Rect, app: &App) {
@@ -647,33 +683,19 @@ fn rules(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn watcher_detail(app: &App) -> Text<'static> {
-    let Some((choices, at)) = &app.watcher_pick else { return Text::default() };
+    let Some(pick) = &app.watcher_pick else { return Text::default() };
     let now = app.rules.config.watcher.as_ref();
-    let mut lines = vec![
-        Line::styled("Choose the watcher", fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Line::styled("It judges the rules that have a judge, in every project. Pattern rules don't need it.", dim()),
-        Line::raw(""),
-    ];
     let backup = |choice: &Choice| {
         let first = choice.watcher.as_ref().and_then(|w| w.fallback.first());
-        first.and_then(|f| choices.iter().find(|c| c.is(Some(f)))).map(|c| c.name.clone())
+        first.and_then(|f| pick.choices.iter().find(|c| c.is(Some(f)))).map(|c| c.name.clone())
     };
-    for (i, choice) in choices.iter().enumerate() {
-        let here = i == *at;
-        let mut name = vec![
-            Span::styled(if here { "› " } else { "  " }, fg(ACCENT)),
-            Span::styled(choice.name.clone(), if here { bold() } else { Style::new() }),
-        ];
-        if choice.is(now) {
-            name.push(Span::styled("  (now)", dim()));
-        }
-        lines.push(Line::from(name));
-        lines.push(Line::styled(format!("    {}", choice.about), dim()));
-        if let Some(backup) = backup(choice) {
-            lines.push(Line::styled(format!("    When it can't answer: {backup}."), dim()));
-        }
-    }
-    if choices.len() == 1 {
+    let intro = "It judges the rules that have a judge, in every project. Pattern rules don't need it.";
+    let mut lines = pick_lines("Choose the watcher", intro, pick, |choice| {
+        let mut about = vec![choice.about.clone()];
+        about.extend(backup(choice).map(|backup| format!("When it can't answer: {backup}.")));
+        (choice.name.clone(), if choice.is(now) { "now" } else { "" }, about)
+    });
+    if pick.choices.len() == 1 {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             "Neither Claude Code nor Ollama is here. To use another watcher, press e and set it in the file.",
@@ -991,7 +1013,7 @@ mod tests {
         let choice = |name: &str, watcher| Choice { name: name.into(), about: "About it.".into(), watcher };
         let choices =
             vec![choice("Claude Code · claude-haiku-5-5", Some(claude)), choice("Ollama · qwen3:4b", Some(ollama))];
-        app.watcher_pick = Some((choices, 0));
+        app.watcher_pick = Some(Pick { choices, at: 0 });
         let screen = render(&app, 110, 28);
         for expected in [
             "› Claude Code · claude-haiku-5-5",
@@ -999,6 +1021,27 @@ mod tests {
             "qwen3:4b  (now)",
             "enter use it",
         ] {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn starting_an_agent_is_picked_in_the_detail_pane_and_otherwise_unmentioned() {
+        use super::super::start::Start;
+        let mut app = fixture();
+        let screen = render(&app, 110, 28);
+        assert!(!screen.contains("start"), "s stays out of the footer:\n{screen}");
+        let start = |name: &str, about: &str| Start { name: name.into(), about: about.into(), ..Default::default() };
+        let choices = vec![
+            start("Resume 2a8206", "Its pi session in /w/b, where it left off."),
+            start("Claude Code", "A new session in /w."),
+            start("pi", "A new session in /w."),
+        ];
+        app.start_pick = Some(Pick { choices, at: 0 });
+        let screen = render(&app, 110, 28);
+        for expected in
+            ["Start an agent", "› Resume 2a8206", "where it left off.", "  Claude Code", "  pi", "enter start"]
+        {
             assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
         }
     }

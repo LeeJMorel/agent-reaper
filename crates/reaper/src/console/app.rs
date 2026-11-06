@@ -1,6 +1,7 @@
 //! Console state and key handling. Drawing lives in `ui.rs` and reads from here.
 
 use std::cell::Cell;
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,8 +22,10 @@ use reaper_core::state::{Agent, Kill, Model, QUIET_FOR, Status};
 use reaper_core::tail::{Tail, Update};
 
 use super::mori::Colors;
+use super::start::{self, Start};
 use super::watcher::{self, Choice};
 use super::writer::{Proposal, Writer};
+use crate::hosts::claude_code;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -42,6 +45,28 @@ pub enum Command {
     Nothing,
     Quit,
     Edit { line: Option<usize> },
+    Start(Start),
+}
+
+/// A short list to choose one from: the watcher, or the agent to start.
+pub struct Pick<T> {
+    pub choices: Vec<T>,
+    pub at: usize,
+}
+
+impl<T> Pick<T> {
+    /// ↑↓ move, esc lets go. Enter takes the pick out of `slot`, for the caller to act on.
+    fn key(slot: &mut Option<Self>, code: KeyCode) -> Option<Self> {
+        let pick = slot.as_mut()?;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => pick.at = pick.at.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => pick.at = (pick.at + 1).min(pick.choices.len().saturating_sub(1)),
+            KeyCode::Esc => *slot = None,
+            KeyCode::Enter => return slot.take(),
+            _ => {}
+        }
+        None
+    }
 }
 
 pub struct Notice {
@@ -63,6 +88,18 @@ const MORI_LAG: i64 = 350;
 /// A dead agent leaves the agent list this long after it died, as its session leaves memento
 /// mori; a closed session's agents, this long after it closed.
 const DEAD_FOR: i64 = 60_000;
+/// How long after a Claude Code the console started exits it looks for word that it was
+/// reaped: its watcher writes that just after.
+const REAPED_WITHIN: i64 = 10_000;
+
+/// A Claude Code the console started. (`reaper run` asks by itself whether to resume pi.)
+struct Started {
+    start: Start,
+    /// When it was started, to the ms: a reaping from before is no news.
+    since: i64,
+    /// Once it has exited, when the console stops looking.
+    until: Option<i64>,
+}
 
 pub struct App {
     pub tab: Tab,
@@ -106,7 +143,12 @@ pub struct App {
     /// A written rule, tried, waiting for the human to add it or drop it.
     pub proposal: Option<Proposal>,
     /// Choosing the watcher: what this machine has, and the one selected.
-    pub watcher_pick: Option<(Vec<Choice>, usize)>,
+    pub watcher_pick: Option<Pick<Choice>>,
+    /// Choosing an agent to start, or the selected one to resume.
+    pub start_pick: Option<Pick<Start>>,
+    /// The Claude Code the console last started, while it may yet turn out to have been reaped.
+    /// Then it's offered again, as `reaper run` offers pi.
+    started: Option<Started>,
     /// A fixed memento mori clock, for frames printed by `--dump` and for tests.
     clock: Option<i64>,
     dirty: bool,
@@ -143,6 +185,8 @@ impl App {
             writing: None,
             proposal: None,
             watcher_pick: None,
+            start_pick: None,
+            started: None,
             clock: None,
             dirty: true,
         };
@@ -259,6 +303,8 @@ impl App {
             self.dirty = true;
         }
 
+        self.offer_resume(start::choices);
+
         let now = self.mori_now();
         let played = self.mori.advance(now);
         if self.tab == Tab::Mori && (played || self.mori_next.get().is_some_and(|t| t <= now)) {
@@ -275,15 +321,34 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Command::Quit;
         }
+        // Once the human does anything, a reaping that turns up later is theirs to notice.
+        if self.started.as_ref().is_some_and(|s| s.until.is_some()) {
+            self.started = None;
+        }
         if self.asking.is_some() {
             self.type_key(key.code);
             self.dirty = true;
             return Command::Nothing;
         }
         if self.watcher_pick.is_some() {
-            self.pick_key(key.code);
+            if let Some(pick) = Pick::key(&mut self.watcher_pick, key.code) {
+                self.set_watcher(pick);
+            }
             self.dirty = true;
             return Command::Nothing;
+        }
+        if self.start_pick.is_some() {
+            self.dirty = true;
+            let Some(mut pick) = Pick::key(&mut self.start_pick, key.code) else { return Command::Nothing };
+            let start = pick.choices.swap_remove(pick.at);
+            // Whatever it said is old news by the time the console is back.
+            self.notice = None;
+            self.started = (start.host == claude_code::HOST).then(|| Started {
+                start: start.clone(),
+                since: Timestamp::now().as_millisecond(),
+                until: None,
+            });
+            return Command::Start(start);
         }
         if self.tab == Tab::Mori && self.mori_key(key.code) {
             self.dirty = true;
@@ -312,6 +377,7 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.step(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.step(isize::MAX),
             KeyCode::Char('e') => return self.edit(),
+            KeyCode::Char('s') if self.tab == Tab::Live => self.open_start(start::choices),
             KeyCode::Char('n') if self.tab == Tab::Rules => self.new_rule(),
             KeyCode::Char('w') if self.tab == Tab::Rules => self.open_watcher(watcher::choices),
             KeyCode::Enter if self.tab == Tab::Rules && self.proposal.is_some() => self.add_proposal(),
@@ -483,25 +549,13 @@ impl App {
         let current = self.rules.config.watcher.as_ref();
         let choices = choices(current);
         let at = choices.iter().position(|c| c.is(current)).unwrap_or(0);
-        self.watcher_pick = Some((choices, at));
-    }
-
-    fn pick_key(&mut self, code: KeyCode) {
-        let Some((choices, at)) = self.watcher_pick.as_mut() else { return };
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => *at = at.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => *at = (*at + 1).min(choices.len() - 1),
-            KeyCode::Esc => self.watcher_pick = None,
-            KeyCode::Enter => self.set_watcher(),
-            _ => {}
-        }
+        self.watcher_pick = Some(Pick { choices, at });
     }
 
     /// Writes the chosen watcher in. What happens when it can't answer (`onError`) stays as
     /// the human set it; how long it may take goes back to the default for its kind.
-    fn set_watcher(&mut self) {
-        let Some((choices, at)) = self.watcher_pick.take() else { return };
-        let choice = &choices[at];
+    fn set_watcher(&mut self, pick: Pick<Choice>) {
+        let (choices, choice) = (&pick.choices, &pick.choices[pick.at]);
         let mut picked = choice.watcher.clone();
         if let (Some(w), Some(old)) = (picked.as_mut(), self.rules.config.watcher.as_ref()) {
             w.on_error.clone_from(&old.on_error);
@@ -523,6 +577,69 @@ impl App {
             (Some(_), None) => format!("Watcher: {}.", choice.name),
         };
         self.notify(said, false);
+    }
+
+    /// Agents to start in the console's directory, after the selected one when it can be
+    /// resumed.
+    fn open_start(&mut self, choices: fn(Option<&Agent>, &Path) -> Vec<Start>) {
+        let selected = self.selected_agent().filter(|_| self.pane == Pane::Agents);
+        let Ok(here) = env::current_dir() else {
+            return self.notify("The directory the console was opened in is gone.", true);
+        };
+        let choices = choices(selected, &here);
+        if choices.is_empty() {
+            return self.notify("There's no agent here to start.", true);
+        }
+        self.start_pick = Some(Pick { choices, at: 0 });
+    }
+
+    /// Back from an agent: it couldn't start, or it may yet turn out to have been reaped.
+    pub fn after_start(&mut self, result: Result<(), String>) {
+        self.dirty = true;
+        match result {
+            Err(e) => {
+                self.started = None;
+                self.notify(e, true);
+            }
+            Ok(()) => {
+                if let Some(started) = self.started.as_mut() {
+                    started.until = Some(Timestamp::now().as_millisecond() + REAPED_WITHIN);
+                }
+            }
+        }
+    }
+
+    /// The Claude Code the console started, reaped: selected in the live tab, with the pick
+    /// open on resuming it.
+    fn offer_resume(&mut self, choices: fn(Option<&Agent>, &Path) -> Vec<Start>) {
+        let Some(Started { start, since, until: Some(until) }) = &self.started else { return };
+        if self.now > *until {
+            self.started = None;
+            return;
+        }
+        let ours = |a: &&Agent| {
+            let here =
+                a.host == start.host && a.parent.is_none() && a.dir.as_deref().map(Path::new) == Some(&start.dir);
+            here && start.resumes.as_ref().map_or(a.first_at >= *since, |id| &a.id == id)
+        };
+        let Some(it) = self.model.agents.iter().filter(ours).max_by_key(|a| a.first_at) else { return };
+        match it.status {
+            Status::Reaped if it.last_at >= *since => {}
+            Status::Ended if it.last_at >= *since => {
+                self.started = None;
+                return;
+            }
+            _ => return,
+        }
+        let id = it.id.clone();
+        self.started = None;
+        (self.tab, self.pane, self.agent_sel) = (Tab::Live, Pane::Agents, Some(id.clone()));
+        self.open_start(choices);
+        if self.start_pick.as_ref().is_some_and(|pick| pick.choices[0].resumes.as_ref() == Some(&id)) {
+            self.notify("It was reaped to free what it held. Enter picks it up where it left off.", false);
+        } else {
+            self.start_pick = None;
+        }
     }
 
     fn edit(&mut self) -> Command {
@@ -853,7 +970,7 @@ pub mod tests {
         let mut app = App::new(rules.clone(), dir.join("events.jsonl"));
         app.tab = Tab::Rules;
         app.open_watcher(here);
-        assert_eq!(app.watcher_pick.as_ref().map(|(_, at)| *at), Some(1), "the example's Ollama watcher");
+        assert_eq!(app.watcher_pick.as_ref().map(|pick| pick.at), Some(1), "the example's Ollama watcher");
         app.on_key(key(KeyCode::Up));
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.watcher_pick.is_some(), "q doesn't quit from here");
@@ -873,6 +990,86 @@ pub mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Enter));
         assert!(app.rules.config.watcher.is_none(), "turned off");
+    }
+
+    #[test]
+    fn s_offers_the_selected_session_back_then_new_ones_and_starts_the_choice() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::Char('s')));
+        let pick = app.start_pick.as_ref().expect("s opens the pick on the live tab");
+        assert!(!pick.choices.iter().any(|s| s.name.starts_with("Resume")), "the kill log has focus: nobody to resume");
+        assert_eq!(app.on_key(key(KeyCode::Char('q'))), Command::Nothing, "q doesn't quit from here");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.start_pick.is_none());
+
+        fn here(selected: Option<&Agent>, dir: &Path) -> Vec<Start> {
+            let start = |name: String, dir: &Path| Start { name, dir: dir.into(), ..Default::default() };
+            let resume = selected.map(|a| start(format!("Resume {}", a.id), Path::new("/w")));
+            resume.into_iter().chain([start("pi".into(), dir)]).collect()
+        }
+        let reaped = app.model.agents.iter().find(|a| a.status == Status::Reaped).unwrap().id.clone();
+        app.pane = Pane::Agents;
+        app.agent_sel = Some(reaped.clone());
+        app.open_start(here);
+        let names: Vec<String> = app.start_pick.as_ref().unwrap().choices.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, [format!("Resume {reaped}"), "pi".into()]);
+        app.on_key(key(KeyCode::Down));
+        let Command::Start(start) = app.on_key(key(KeyCode::Enter)) else { panic!("enter starts the choice") };
+        assert_eq!((start.name.as_str(), start.dir), ("pi", env::current_dir().unwrap()));
+        assert!(app.start_pick.is_none());
+    }
+
+    #[test]
+    fn a_claude_code_started_here_and_reaped_is_offered_back_on_return() {
+        fn here(selected: Option<&Agent>, dir: &Path) -> Vec<Start> {
+            let resumes = selected.filter(|a| a.status == Status::Reaped).map(|a| a.id.clone());
+            let resume = resumes.map(|id| Start { name: "Resume".into(), resumes: Some(id), ..Default::default() });
+            resume
+                .into_iter()
+                .chain([Start { name: "Claude Code".into(), dir: dir.into(), ..Default::default() }])
+                .collect()
+        }
+        // At `dt` ms from the clock's time, not the fixture's: it's when it was started.
+        let event = |app: &mut App, dt: i64, agent: &str, kind: &str, fields: &str| {
+            let at = Timestamp::now().as_millisecond() + dt;
+            let line = format!(r#"{{"at":{at},"host":"claude-code","agent":"{agent}","type":"{kind}"{fields}}}"#);
+            app.model.apply(&reaper_core::events::parse_line(&line).unwrap());
+        };
+        let claude = Start { agent: "Claude Code", host: "claude-code", dir: "/w".into(), ..Default::default() };
+        let mut app = fixture();
+        app.start_pick = Some(Pick { choices: vec![claude.clone()], at: 0 });
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::Start(claude.clone()));
+        event(&mut app, 1, "other", "agent.spawned", r#","dir":"/x""#);
+        event(&mut app, 1, "new", "agent.spawned", r#","dir":"/w""#);
+        event(&mut app, 2, "new", "agent.reaped", r#","idle":300000"#);
+        app.offer_resume(here);
+        assert!(app.start_pick.is_none(), "not while it has the terminal");
+        app.after_start(Ok(()));
+        event(&mut app, 3, "other", "agent.reaped", r#","idle":300000"#);
+        app.offer_resume(here);
+        let pick = app.start_pick.as_ref().expect("offered back once the console is");
+        assert_eq!(pick.choices[pick.at].resumes.as_deref(), Some("new"));
+        assert_eq!((app.tab, app.pane), (Tab::Live, Pane::Agents));
+        assert_eq!(app.selected_agent().map(|a| a.id.as_str()), Some("new"));
+        assert!(app.notice.as_ref().is_some_and(|n| n.text.ends_with("where it left off.")));
+
+        app.on_key(key(KeyCode::Esc));
+        app.start_pick = Some(Pick { choices: vec![claude.clone()], at: 0 });
+        app.on_key(key(KeyCode::Enter));
+        event(&mut app, 4, "later", "agent.spawned", r#","dir":"/w""#);
+        app.after_start(Ok(()));
+        app.on_key(key(KeyCode::Char('2')));
+        event(&mut app, 5, "later", "agent.reaped", r#","idle":300000"#);
+        app.offer_resume(here);
+        assert!(app.start_pick.is_none() && app.tab == Tab::Rules, "a key pressed first: left to the human");
+
+        event(&mut app, -60_000, "old", "agent.spawned", r#","dir":"/w""#);
+        event(&mut app, -50_000, "old", "agent.reaped", r#","idle":300000"#);
+        app.start_pick = Some(Pick { choices: vec![Start { resumes: Some("old".into()), ..claude }], at: 0 });
+        app.on_key(key(KeyCode::Enter));
+        app.after_start(Ok(()));
+        app.offer_resume(here);
+        assert!(app.start_pick.is_none(), "it never came back, so the reaping on show is the old one");
     }
 
     #[test]
