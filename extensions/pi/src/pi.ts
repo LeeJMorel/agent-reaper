@@ -11,7 +11,8 @@ import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@eare
  *   2. cut      — at `turn_end`, `context_edit` entries drop the attempt from model context.
  *                 They are append-only: the session file keeps the original, labelled. Only
  *                 the tail changes, so the provider's cached prefix stays valid.
- *   3. redirect — a `custom_message` with the rule's positive instruction, and `continue: true`
+ *   3. redirect — a `custom_message` with the rule's positive instruction, and `continue: true`;
+ *                 the ones since the human's last prompt again after the context is compacted
  *   4. stop     — at the strike limit the run is terminated instead of redirected
  *   5. reap     — a session left idle (finished, nothing typed, no dialog open) for the time
  *                 the engine names is shut down, freeing what it holds. Its conversation is
@@ -417,6 +418,17 @@ export function reaper(ask: Ask = askReaper) {
         ],
         continue: true,
       }
+    })
+
+    // The summary can drop what the agent was told, while the rules still hold: it hears the
+    // redirects again, after the summary, without starting a turn of its own.
+    pi.on("session_compact", async (_event, ctx) => {
+      const id = await agent(ctx)
+      const reply = await ask<{ restate?: string }>({ op: "compacted", host: HOST, agent: id }).catch((e: Error) =>
+        warn(ctx, e.message),
+      )
+      if (reply?.restate)
+        pi.sendMessage({ customType: "reaper.redirect", content: reply.restate, display: true }, { triggerTurn: false })
     })
 
     pi.on("agent_settled", async (_event, ctx) => {

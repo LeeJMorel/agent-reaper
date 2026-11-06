@@ -538,6 +538,12 @@ impl Engine {
                 s.pressure += share;
                 s.blocked = askable.then(|| (rule.id.clone(), call.clone()));
                 s.asking = None;
+                // Going in circles is about one call, gone once the context is compacted.
+                if let Some(redirect) =
+                    rule.redirect.as_ref().filter(|r| rule.id != looping.id && !s.redirects.contains(r))
+                {
+                    s.redirects.push(redirect.clone());
+                }
                 (*n, s.pressure)
             })
             .unwrap_or((1, share));
@@ -598,6 +604,23 @@ impl Engine {
                 s.team.asked.clear();
             });
         }
+    }
+
+    /// The agent's context was compacted. The summary can drop what reaper told it (summaries
+    /// of real sessions dropped what not to touch about six times as often as what to build,
+    /// arXiv 2610.31778), and restating a dropped constraint after compaction cut violations
+    /// (arXiv 2608.11242). Its redirects since the human's last prompt, to hear again; `None`
+    /// if it had none.
+    pub fn compacted(&self, host: &str, agent: &str) -> Option<String> {
+        let redirects = self.store.session(host, agent).redirects;
+        if redirects.is_empty() {
+            return None;
+        }
+        let mut text = String::from("Carried over from earlier in this task:\n");
+        for redirect in redirects {
+            text += &format!("\n- {redirect}");
+        }
+        Some(text)
     }
 
     /// `reaper ask "<why>"`: the agent asks the person to allow, once, the call reaper just
@@ -761,6 +784,26 @@ rules:
             Decision::Kill { is_final: true, .. }
         ));
         assert_eq!(engine.check(&call("bash", json!({ "command": "ls" }))), Decision::Allow);
+    }
+
+    #[test]
+    fn compacted_an_agent_hears_again_what_it_was_told_since_the_last_prompt() {
+        let sandbox = Sandbox::new("compacted");
+        let engine = sandbox.engine(
+            "strikes: 9\nrepeats: 2\nrules:\n  - { id: push, match: { command: 'git push -f' }, redirect: Open a pull request. }\n  - { id: prod, match: { command: prod }, redirect: Use staging. }\n  - { id: quiet, match: { command: rm } }\n",
+        );
+        let run = |command: &str| engine.check(&call("bash", json!({ "command": command })));
+        assert_eq!(engine.compacted("test", "s1"), None, "nothing told, nothing to tell again");
+        for command in ["git push -f a", "psql prod", "git push -f b", "rm x", "make", "make"] {
+            run(command);
+        }
+        // Each once, oldest first; going in circles and the default redirect are left out.
+        assert_eq!(
+            engine.compacted("test", "s1").as_deref(),
+            Some("Carried over from earlier in this task:\n\n- Open a pull request.\n- Use staging.")
+        );
+        assert!(engine.prompted("test", "s1", "Now update the docs."));
+        assert_eq!(engine.compacted("test", "s1"), None, "a new task starts the list over");
     }
 
     #[test]

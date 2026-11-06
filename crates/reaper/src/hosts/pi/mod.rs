@@ -8,6 +8,8 @@
 //!       (plus "problem" when the rules on disk can't be used)
 //!   {"op":"warm","host":…,"agent":…,"dir":…,"goal":…}  → {"ok":true}, once the watcher has
 //!     the session's prefix: the human asked for something, so the prompt is logged too
+//!   {"op":"compacted","host":…,"agent":…}  → {"ok":true,"restate"?:…}, what reaper told the
+//!     agent since the human's last prompt, for it to hear again now that its context was compacted
 //!   {"op":"event","host":"pi","agent":…,"type":"agent.idle",…fields}  → {"ok":true}
 //!     (agent.spawned and agent.idle add "reapAfterMs" while idle sessions are reaped: a
 //!     session starts out idle, and goes idle when its turn ends; for agent.reaped,
@@ -153,6 +155,13 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
             engine.warm(&PathBuf::from(text(request, "dir")), &goal);
             json!({ "ok": true })
         }
+        Some("compacted") => {
+            let mut reply = json!({ "ok": true });
+            if let Some(told) = engine.compacted(host, &text(request, "agent")) {
+                reply["restate"] = told.into();
+            }
+            reply
+        }
         _ => json!({ "error": "unknown op" }),
     }
 }
@@ -171,6 +180,23 @@ mod tests {
         assert_eq!(
             reply(&engine, &request),
             json!({ "kind": "kill", "rule": "push", "redirect": "Open a PR.", "strike": 1, "final": true, "reason": "strikes" })
+        );
+    }
+
+    #[test]
+    fn compacted_a_session_hears_again_what_it_was_told() {
+        let sandbox = Sandbox::new("pi-compacted");
+        let engine =
+            sandbox.engine("strikes: 3\nrules: [{ id: push, match: { command: push }, redirect: Open a PR. }]");
+        let compacted = json!({ "op": "compacted", "agent": "s" });
+        assert_eq!(reply(&engine, &compacted), json!({ "ok": true }));
+        reply(
+            &engine,
+            &json!({ "op": "check", "session": "s", "agent": "s", "dir": "/w", "tool": "bash", "args": { "command": "git push" }, "goal": "" }),
+        );
+        assert_eq!(
+            reply(&engine, &compacted),
+            json!({ "ok": true, "restate": "Carried over from earlier in this task:\n\n- Open a PR." })
         );
     }
 

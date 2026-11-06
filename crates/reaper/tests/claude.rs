@@ -522,6 +522,39 @@ fn a_stopped_session_compacted_carries_on_with_a_clean_slate() {
     assert!(after.contains(STUBBORN) && after.contains(REDIRECT), "{after}");
 }
 
+/// A session reaper redirected, compacted by the human: the summary needn't keep the way it was
+/// told to go, so it hears that again after it. Never the rule.
+#[test]
+fn compacted_a_redirected_session_hears_the_redirect_again() {
+    if !has_terminal() {
+        return;
+    }
+    let h = Home::new("compact-redirect", "strikes: 3");
+    returning(&h);
+    let line = format!("'{}' '{TASK}' {MANUAL}; echo claude exited", claude().display());
+    let mut terminal = Terminal::open(h.command(SCRIPT), &line);
+    common::wait_until("it to follow the redirect", || h.project.join("allowed.txt").exists());
+    terminal.screen.wait_for("Done.", 1);
+    terminal.press(b"/compact\r");
+    let summarized = || h.seen.lock().unwrap().iter().any(|r| r.contains("Your task is to create a detailed summary"));
+    common::wait_until("the summary", summarized);
+    terminal.press(b"go on\r");
+    let told = || h.seen.lock().unwrap().iter().any(|r| r.contains("Carried over from earlier in this task"));
+    common::wait_until("the redirect told again", told);
+    terminal.press(b"/exit\r");
+    terminal.screen.wait_for("claude exited", 1);
+    let screen = terminal.close();
+
+    assert!(!h.project.join("violation.txt").exists(), "{screen}");
+    let requests = h.seen.lock().unwrap();
+    let after = requests.iter().find(|r| r.contains("Carried over from earlier in this task")).unwrap();
+    assert!(after.contains("The marker files for this project were being set up."), "after the summary: {after}");
+    assert!(after.contains(REDIRECT) && after.contains("go on"), "{after}");
+    for request in requests.iter() {
+        assert!(!request.contains(RULE_TEXT) && !request.contains(RULE_ID), "Claude saw the rule: {request}");
+    }
+}
+
 /// Claude Code in a git worktree of its own (`--worktree`): a session that starts the work and
 /// then keeps breaking a rule is stopped, and after `/clear` the fresh one is told where the
 /// half-done work is: the worktree, its branch, and how to see what isn't committed there.

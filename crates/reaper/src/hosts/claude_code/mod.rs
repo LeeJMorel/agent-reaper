@@ -331,6 +331,13 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
             announce(event["model"].as_str(), after.as_deref());
             // A new session takes memory: idle pi sessions make room if it's short.
             engine.relieve(false);
+            // Compacted, not by reaper: the summary may have dropped what reaper told it.
+            if event["source"] == "compact" && !compacted {
+                let told = engine.compacted(HOST, agent)?;
+                return Some(
+                    json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": told } }),
+                );
+            }
             let work = engine.take_over(HOST, session, after.as_deref()?)?;
             // Only Claude Code run by a program sends a hook's first message, and only as it
             // starts; otherwise the handoff waits in context for the human's.
@@ -602,8 +609,29 @@ mod tests {
         // A clean slate: the next slip is a first strike again, not the end.
         let again = reply_in(&engine, &pre_tool_use("psql prod"), "claude-vscode").unwrap();
         assert_eq!(again, deny("Use the staging database."), "{again}");
-        // Compacting any other time is just compacting.
-        assert_eq!(reply_in(&engine, &compact, "claude-vscode"), None);
+        // Compacting any other time is just compacting, and it hears again the way it was told.
+        let again = reply_in(&engine, &compact, "claude-vscode").unwrap();
+        assert_eq!(again, compacted("Use the staging database."));
+    }
+
+    fn compacted(redirect: &str) -> Value {
+        let told = format!("Carried over from earlier in this task:\n\n- {redirect}");
+        json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": told } })
+    }
+
+    #[test]
+    fn compacted_it_hears_again_the_way_it_was_told_to_go_and_never_the_rule() {
+        let sandbox = Sandbox::new("cc-compacted");
+        let engine = sandbox.engine(RULES);
+        engine.prompted(HOST, "s1", "Load the fixtures.");
+        let compact = hook("SessionStart", "s1", json!({ "source": "compact" }));
+        assert_eq!(reply(&engine, &compact), None, "nothing to tell again");
+        reply(&engine, &pre_tool_use("psql prod"));
+        let out = reply(&engine, &compact).unwrap();
+        assert_eq!(out, compacted("Use the staging database."));
+        assert!(!out.to_string().contains("no-prod"), "the rule id never reaches Claude");
+        engine.prompted(HOST, "s1", "Now the docs.");
+        assert_eq!(reply(&engine, &compact), None, "the human's next task starts over");
     }
 
     #[test]

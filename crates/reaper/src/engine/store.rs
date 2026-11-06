@@ -47,6 +47,10 @@ pub struct Session {
     /// What the agent asked the person for with `reaper ask`: that rule, that call, and why.
     #[serde(default)]
     pub asking: Option<(String, String, String)>,
+    /// The redirects it was given since the human's last prompt, oldest first, each once.
+    /// Compacting its context can drop them while the rules still hold, so it hears them again.
+    #[serde(default)]
+    pub redirects: Vec<String>,
     /// What the human asked it for, oldest first: the first and the latest few. One carrying
     /// on a dead session's work starts with that session's.
     #[serde(default)]

@@ -22,6 +22,8 @@ const RULE_ID: &str = "no-violation-file";
 const RULE_TEXT: &str = "Creating a file named violation.txt.";
 const REDIRECT: &str = "Create the marker file allowed.txt in the project root.";
 const SCHEMA_REDIRECT: &str = "Follow docs/schema.md for every entity and relation.";
+/// The model's summary when pi compacts, which keeps nothing of what reaper said.
+const SUMMARY: &str = "The marker files for this project were being set up.";
 
 /// One run at a time: the first one fetches pi, the rest reuse it.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -67,6 +69,10 @@ fn model(seen: &Mutex<Seen>, request: &Value) -> common::Response {
         return common::json(watcher_reply(request, RULE_ID, "violation.txt"));
     }
     seen.lock().unwrap().agent.push(Value::Array(messages.clone()).to_string());
+    // Compacting: pi asks for a summary of the conversation.
+    if system.starts_with("You are a context summarization assistant") {
+        return sse(completion(Some(SUMMARY), None));
+    }
     let last = messages.last().cloned().unwrap_or(Value::Null);
     let said = text_of(&last["content"]);
     let task = messages.iter().find(|m| m["role"] == "user").map(|m| text_of(&m["content"])).unwrap_or_default();
@@ -362,6 +368,38 @@ fn a_stopped_session_hands_its_work_to_a_fresh_one_that_does_it_right() {
 fn open(h: &Home, task: &str) -> Terminal {
     let line = format!("exec '{}' run -- --model mock/m --offline '{task}'", env!("CARGO_BIN_EXE_reaper"));
     Terminal::open(h.command(SCRIPT), &line)
+}
+
+/// A session reaper redirected, compacted by the human: the summary needn't keep the way it was
+/// told to go, so it hears that again after it. Never the rule.
+#[test]
+fn compacted_a_redirected_session_hears_the_redirect_again() {
+    if !has_terminal() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let h = Home::new("compact-redirect", "strikes: 3");
+    // pi keeps the latest 20k tokens as they are, so a short session has nothing to compact.
+    fs::write(h.pi_dir.join("settings.json"), r#"{ "compaction": { "keepRecentTokens": 1 } }"#).unwrap();
+    let mut terminal = open(&h, TASK);
+    wait_until("it to follow the redirect", || h.project.join("allowed.txt").exists());
+    terminal.screen.wait_for("Done.", 1);
+    terminal.press(b"/compact\r");
+    wait_until("the summary", || h.sessions().contains(SUMMARY));
+    terminal.press(b"go on\r");
+    let told = || h.seen.lock().unwrap().agent.iter().any(|r| r.contains("Carried over from earlier in this task"));
+    wait_until("the redirect told again", told);
+    terminal.press(b"\x04");
+    terminal.close();
+
+    assert!(!h.project.join("violation.txt").exists());
+    let seen = h.seen.lock().unwrap();
+    let after = seen.agent.iter().find(|r| r.contains("Carried over from earlier in this task")).unwrap();
+    assert!(after.contains(SUMMARY), "after the summary: {after}");
+    assert!(after.contains(REDIRECT) && after.contains("go on"), "{after}");
+    for request in &seen.agent {
+        assert!(!request.contains(RULE_TEXT) && !request.contains(RULE_ID), "the agent saw the rule: {request}");
+    }
 }
 
 /// An interactive session: the human asks once, then walks away. reaper shuts the idle

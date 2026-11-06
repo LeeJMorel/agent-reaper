@@ -53,9 +53,13 @@ gets nudged and then killed.
 Why hide the rules? Because telling a model "don't" works less well than you'd hope. In one
 study, models told not to bring up a topic still did: two open models as often as when told
 nothing, one of them more often, and even GPT-4 in one reply out of eight. Naming the thing
-can put it on the model's mind. [docs/background.md](docs/background.md) has the evidence,
-what reaper has measured so far, and the terms researchers use for all this (in short, a
-runtime enforcement monitor).
+can put it on the model's mind. Rules files fare no better with coding agents. With a
+project's ban on AI contributions copied into AGENTS.md, Claude Code didn't decline the
+banned work once in 30 tries. And in real Claude Code sessions, compacting the context
+dropped over a third of users' "don't touch X" rules, against 6% of what they'd asked it to
+build. reaper's rules aren't in the agent's context, so compaction can't drop them.
+[docs/background.md](docs/background.md) has the evidence, what reaper has measured so far,
+and the terms researchers use for all this (in short, a runtime enforcement monitor).
 
 ## Install
 
@@ -105,7 +109,7 @@ Each rule describes a violation privately and says what to do instead.
 |---|---|
 | `match` | Regexes over the call's arguments: `command` (each command the shell runs, and again with `sudo`, `timeout`, `uv run`, `python -m` and the like taken off, so `^pytest\b` fires on `cd api && uv run pytest` and not on `cat pytest.ini`), `script` (the whole shell command, for a pipe or a loop), `path` (any file read or written), `content` (the text written, never the text an edit replaces), or `"*"` for all of them as sent. Deterministic and instant. |
 | `judge` | A plain-English description, decided by the watcher model. |
-| `redirect` | The only thing the agent ever hears. Write it as an instruction, not a prohibition; `reaper lint` flags redirects that say "don't". |
+| `redirect` | The only thing the agent ever hears. Write it as an instruction, not a prohibition; `reaper lint` flags redirects that say "don't" or open with "if". After the agent's context is compacted, it hears the redirects it got since your last prompt again. |
 | `tools` | Only check these tools. `message` means what the agent says: only rules that list it look at replies, judged by their `text`. |
 | `action: stop` | Terminate on the first violation instead of redirecting. |
 | `strikes` | How many times an agent may break this rule, if not the global `strikes`. |

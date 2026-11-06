@@ -33,8 +33,40 @@ Recent agent research manages caches inside model servers, not agent processes; 
 nothing that evicts whole agent sessions, so the reaping half is reaper's own.
 
 **Why the rules stay hidden.** reaper's rules are code-owned, not prompt-owned [5]: they're
-enforced at the tool call and never stated to the agent. Recent evidence bears on that, none
-of it from agents making tool calls:
+enforced at the tool call and never stated to the agent. A rule in AGENTS.md, CLAUDE.md or
+`.claude/rules/` is prompt-owned: it's text in the agent's context. Studies of coding agents
+find such rules often go unfollowed, and get lost when the context is compacted:
+
+- Bans in an instructions file go unheeded. Across 106 issues from open-source repositories
+  with rules for AI contributions, none of four coding agents declined the work in a
+  repository that bans AI contributions. With the ban copied word for word into AGENTS.md
+  (imported by CLAUDE.md), Claude Code on Sonnet 4.6 declined in 0 of 30 runs, and the best
+  agent in 3 of 30. Rules that add a step, such as disclosing AI use, mostly recovered with a
+  reminder, the quoted rule or one round of feedback; the ban reached at most 23%, after
+  feedback naming the broken clause [10].
+- Wording a rule as a prohibition can lower compliance. The same requirement, appended to
+  AGENTS.md or CLAUDE.md, was met in 71.6% of Claude Code sessions on claude-sonnet-5 when
+  written directly ("Add the comment … to every Python function you add or modify") and in
+  17.3% when written as "Never add or modify a Python function without the comment …". On
+  claude-opus-5 the gap wasn't significant [11]. reaper's redirect is the direct kind, and
+  `reaper lint` flags one that says "don't" or opens with "if": conditional wording was
+  followed less than direct wording in every setup where wording made a significant
+  difference [11].
+- A long policy in context loses to requests in the environment. Given handbooks of 20 to
+  124 pages, the best of 30 model configurations passed every check in 36.2% of trials.
+  Agents let an unauthorized request override the policy, and failing runs quoted the
+  handbook and cited the sections they claimed to follow. The authors write that their
+  results "support enforcing hard controls outside the model, compiling policies into
+  deterministic tool-call guards" [12].
+- Compaction drops what not to do. In 44 real Claude Code sessions, compaction summaries
+  dropped 36.8% of users' scope exclusions ("don't touch X") and 6.2% of their feature
+  requirements [13]. An agent told not to delete emails until the user said so deleted
+  without approval in 30 of 100 sessions after compaction and in none before. In 28 of the
+  30 the summary had dropped the rule, and restating it after compaction cut the 30 to 13 [14].
+  reaper checks every call against the rules file, so no summary can lose a rule, and after a
+  compaction the agent hears the redirects it got since the person's last prompt again.
+
+Earlier evidence comes from models answering in text, not agents making tool calls:
 
 - Telling a model "don't" works unevenly, and can backfire. Told not to discuss a topic,
   OpenHermes-13B brought it up as often as with no instruction (34% both) and OpenHermes-7B
@@ -83,6 +115,10 @@ as specified. That shows the mechanisms work, not that they help.
   reaper telling the agent the rule (ablation). Run interleaved in random order.
 - **Tasks**: 15–20, each with automated checks for "done correctly" and "rule broken",
   frozen before any data is collected, and audited by hand on a random sample.
+- **Where rules files fail**, reported apart because they were picked for it: a teammate's
+  note asking for the shortcut [12], a prompt asking for an applied migration to be edited
+  [10], and a long session compacted before its late tasks [13, 14]
+  (`eval_rules_against_conflicting_requests`, and `REAPER_EVAL_COMPACT=1` with Claude Code).
 - **Analysis**: rates with Wilson 95% intervals; task as a stratum or random effect
   (Cochran–Mantel–Haenszel, or mixed-effects logistic regression); risk differences with
   intervals; Holm correction across hypotheses. About 100 runs per arm gives 80% power for a
@@ -124,3 +160,24 @@ The harness is `crates/reaper/tests/eval.rs`
    Admission Control for Agent Operating Systems.* AgenticOS Workshop, SOSP 2026.
    [arXiv:2609.00275](https://arxiv.org/abs/2609.00275). A simulation with risk priced in
    money; the budget denies the next action rather than stopping agents.
+10. W. Yang, R. He, M. Zhou. *A First Look at Coding Agents' Compliance with AI Contribution
+    Rules in Open-Source Communities.* 2026.
+    [arXiv:2607.26819](https://arxiv.org/abs/2607.26819). Simple issues only, one clause per
+    kind of rule; obeying a ban means turning down the user's task.
+11. R. Tsuchida, Y. Fan, K. Shimari, R. G. Kula, K. Matsumoto. *Do Coding Agents Follow
+    AGENTS.md? The Effect of Policy Wording on Instruction Compliance.* 2026.
+    [arXiv:2611.04367](https://arxiv.org/abs/2611.04367). One policy (a marker comment), one
+    text per wording, 86 tasks from 10 repositories.
+12. L. Panavas et al. *HANDBOOK.md: A Benchmark for Long-Context Agentic Instruction
+    Following.* Workshop on Agent Behavior, COLM 2026.
+    [arXiv:2607.25398](https://arxiv.org/abs/2607.25398). Policies far longer than a rules
+    file; compaction didn't trigger at these task lengths.
+13. J. Salle, H. Bhatnagar, M. Bethge, S. Abdelnabi, M. Andriushchenko. *Benchmarks Are
+    Surprisingly Compaction-Friendly.* 2026.
+    [arXiv:2610.31778](https://arxiv.org/abs/2610.31778). Constraints extracted and judged by
+    an LLM; a second judge found more lost overall (24.5% against 19%), with scope exclusions
+    and process instructions still far above feature requirements.
+14. Z. Wang, Y. Zhang, D. Lee, N. Baracaldo, Y. Yang. *Lost in Context Compaction: When LLM
+    Systems Drop Side Constraints.* 2026.
+    [arXiv:2608.11242](https://arxiv.org/abs/2608.11242). The inbox experiment uses one model,
+    gpt-oss-120b.

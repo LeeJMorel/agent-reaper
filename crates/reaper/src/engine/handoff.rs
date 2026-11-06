@@ -48,6 +48,8 @@ impl Engine {
             // that took over is theirs now, to be handed on again if it dies.
             s.took_over = None;
             s.handoff = None;
+            // What it was told on the way to the last task needn't be told again for this one.
+            s.redirects.clear();
         });
         self.revive(host, agent);
         true

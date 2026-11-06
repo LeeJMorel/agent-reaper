@@ -25,6 +25,10 @@ pub struct Issue {
 /// Phrasings that hand the agent a "don't" to fixate on.
 const NEGATIVE: &str = r"\b(don'?t|do not|never|avoid|stop|must not|mustn'?t|cannot|can'?t|shouldn'?t|should not|not allowed|forbidden|prohibited|instead of|refrain)\b";
 
+/// An opening condition: agents follow conditional instructions least, and a redirect is only
+/// sent once the rule has fired, so the condition already holds.
+const CONDITIONAL: &str = r"^\W*(if|when|whenever|unless|in case)\b";
+
 const ACTIONS: &[&str] = &["redirect", "stop"];
 const KINDS: &[&str] = &["openai", "anthropic", "claude-code"];
 
@@ -43,6 +47,7 @@ fn echoes(redirect: &str, secret: &str) -> bool {
 
 struct Linter {
     negative: Regex,
+    conditional: Regex,
     issues: Vec<Issue>,
 }
 
@@ -124,6 +129,17 @@ impl Linter {
                         let word = &redirect[m.range()];
                         self.push(Level::Warn, p, id, format!("redirect says \"{word}\": phrase it as what to do"));
                     }
+                    if let Some(m) = self.conditional.find(redirect) {
+                        let word = redirect[m.range()].trim_start_matches(|c: char| !c.is_alphanumeric());
+                        self.push(
+                            Level::Warn,
+                            p,
+                            id,
+                            format!(
+                                "redirect opens with \"{word}\": it's only sent once the rule fires, so say what to do"
+                            ),
+                        );
+                    }
                     if rule.judge.as_deref().is_some_and(|judge| echoes(redirect, judge)) {
                         self.push(
                             Level::Warn,
@@ -140,8 +156,11 @@ impl Linter {
 }
 
 pub fn lint(config: &Config) -> Vec<Issue> {
-    let mut l =
-        Linter { negative: Regex::with_flags(NEGATIVE, "i").expect("NEGATIVE is a valid regex"), issues: Vec::new() };
+    let mut l = Linter {
+        negative: Regex::with_flags(NEGATIVE, "i").expect("NEGATIVE is a valid regex"),
+        conditional: Regex::with_flags(CONDITIONAL, "i").expect("CONDITIONAL is a valid regex"),
+        issues: Vec::new(),
+    };
 
     for (place, rule) in config.all_rules() {
         l.rule(rule, place.unwrap_or("global"));
@@ -267,11 +286,15 @@ rules:
   - { id: b, judge: "editing files in the generated client folder", redirect: "Leave the generated client folder alone; edit the schema." }
   - { id: c, match: { command: "(" }, redirect: Use the script. }
   - { id: c, match: { command: y }, redirect: Run the tests. }
+  - { id: d, match: { command: z }, redirect: "If you need data, use the local database." }
+  - { id: e, match: { command: w }, redirect: "Use the local database, even if it's slower." }
 "#,
             )
             .unwrap(),
         );
         assert!(messages(&issues, "a").contains("Don't"));
+        assert!(messages(&issues, "d").contains("opens with \"If\""));
+        assert_eq!(messages(&issues, "e"), "");
         assert!(messages(&issues, "b").contains("repeats"));
         assert!(messages(&issues, "c").contains("not a valid regex"));
         assert!(issues.iter().any(|i| i.message == "duplicate rule id"));
