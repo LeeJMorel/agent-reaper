@@ -1,6 +1,6 @@
 ---
 name: reaper-rule
-description: Write a rule for reaper, the guard that stops coding agents from doing what their person doesn't want. Use when someone asks for a reaper rule, or wants agents stopped, blocked or kept from doing something.
+description: Write a rule for reaper, the guard that stops coding agents from doing what their person doesn't want. Use when someone asks for a reaper rule, wants agents stopped, blocked or kept from doing something, or wants the "don't"s in their CLAUDE.md, AGENTS.md or .claude/rules moved into reaper.
 ---
 
 # Writing a reaper rule
@@ -106,6 +106,22 @@ folder level, `**` any depth).
   that must hold every time.
 - If the request is unclear, pick the reading that prevents the harm while stopping the
   least, and say what you assumed in `note`.
+
+## Rules already in an instructions file
+
+When the person asks to move the "don't"s in CLAUDE.md, AGENTS.md or `.claude/rules/` into
+reaper:
+
+- Read those files and list each line that forbids something an agent does: a command it
+  runs, a file it touches, what it writes. How to build, test or lay out the code stays where
+  it is.
+- Draft one rule per line, as above, with its own examples, and check and add each the usual
+  way.
+- Once a rule is in, offer to take its line out of the file, and take it out only when the
+  person agrees. While it's there, every agent still reads the "don't".
+
+When a rule you add for any other reason says the same as a line in one of those files, offer
+to take that line out too.
 
 ## In a working session
 
