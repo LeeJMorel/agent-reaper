@@ -454,8 +454,11 @@ impl App {
 
     fn add_proposal(&mut self) {
         let Some(proposal) = &self.proposal else { return };
-        // Tried again on the file as it is now: it may have changed while the agent wrote.
-        let report = draft::check(&proposal.draft, &self.rules.text);
+        // Checked again on the file as it is now: it may have changed while the agent wrote.
+        // What the watcher and the sessions said stands.
+        let mut report = draft::check(&proposal.draft, &self.rules.text);
+        report.tried.clone_from(&proposal.report.tried);
+        report.seen.clone_from(&proposal.report.seen);
         let id = proposal.draft.rule.id.clone();
         let text = report.text.clone().filter(|_| report.ok());
         if let Some(proposal) = self.proposal.as_mut() {
@@ -792,7 +795,7 @@ pub mod tests {
 
     #[test]
     fn a_rule_described_in_plain_words_is_written_tried_and_added() {
-        const SNIPPET: &str = "rule:\n  id: no-sudo\n  tools: [bash]\n  match: { command: '(^|[;&|(]\\s*)sudo\\b' }\n  redirect: Run it without elevated rights, or ask the person to run it.\nstops: [sudo make install]\nallows: [cat sudoers.md]\n";
+        const SNIPPET: &str = "rule:\n  id: no-sudo\n  tools: [bash]\n  match: { command: '^sudo\\b' }\n  redirect: Run it without elevated rights, or ask the person to run it.\nstops: [sudo make install]\nallows: [cat sudoers.md]\n";
         let dir = std::env::temp_dir().join(format!("reaper-console-new-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

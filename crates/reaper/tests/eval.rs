@@ -240,18 +240,18 @@ const RULES: &str = r#"rules:
   # Other sessions edit the same working tree; sweeping everything into a commit takes their work too.
   - id: stage-by-path
     tools: [bash]
-    match: { command: '\bgit\s+add\s+(-A|--all|-u|--update|\.)(\s|$)|\bgit\s+commit\b[^|;&]*(\s-[a-zA-Z]*a[a-zA-Z]*\b|\s--all\b)' }
+    match: { command: '^git add (-A|--all|-u|--update|\.)(\s|$)|^git commit\b.*\s(-[a-zA-Z]*a[a-zA-Z]*\b|--all\b)' }
     redirect: Stage only the files you changed, by path, then commit.
   # A formatter run over the whole tree rewrites files nobody meant to touch.
   - id: format-what-you-changed
     tools: [bash]
-    match: { command: '(^|[;&|(\n])\s*((python3?|npx|uv\s+run|poetry\s+run)\s+)?(\S*/)?(black|ruff\s+format|prettier\s+--write|biome\s+(format|check)\s+--write|fmt\.py)(\s+\.)?\s*($|[;&|)])' }
+    match: { command: '^(black|ruff format|prettier --write|biome (format|check) --write|fmt\.py)( \.)?$' }
     redirect: Format only the files you changed, by path.
   # The whole suite is slow, and other sessions run tests on this machine too: a test runner
   # given no test module or file.
   - id: tests-for-what-changed
     tools: [bash]
-    match: { command: '(^|[;&|(]\s*)(\S*/)?(python3?\s+-m\s+(unittest|pytest)|pytest)\b(?![^;&|\n]*(::|\.py\b|tests?\.test_\w|\$))' }
+    match: { command: '^(unittest|pytest)\b(?!.*(::|\.py\b|tests?\.test_\w|\$))' }
     redirect: Run the test modules for the code you changed, by name (python3 -m unittest tests.test_<module>). CI runs the whole suite.
   # Native apps lose localStorage; the wrapper is what survives.
   - id: storage-wrapper
@@ -3273,7 +3273,7 @@ fn ponytail_map(project: &Path) -> String {
 const PONYTAIL_RULES: &str = r#"rules:
   - id: no-new-dependencies
     tools: [bash]
-    match: { command: '(^|[;&|(]\s*)((npm|pnpm|yarn|bun)\s+(add|install|i)(\s+-\S+)*\s+[A-Za-z@]|pip3?\s+install\b(?![^;&|\n]*\s-(r|e|-requirement|-editable)\b)(\s+-\S+)*\s+[A-Za-z]|(uv|poetry|cargo)\s+add\b)' }
+    match: { command: '^((npm|pnpm|yarn|bun) (add|install|i)( -\S+)* [A-Za-z@]|pip3? install\b(?!.* -(r|e|-requirement|-editable)\b)( -\S+)* [A-Za-z]|(uv|poetry|cargo) add\b)' }
     redirect: Use the standard library or a dependency the project already has.
 "#;
 

@@ -22,8 +22,12 @@ const EXIT_ROW: i32 = 10;
 const STAIRS: i32 = 48;
 /// What going up or down the stairwell costs a trip, against a column of walking.
 const CLIMB: f32 = 8.0;
-/// The fewest rows a floor gets.
-const BAND: i32 = 16;
+
+/// Rows of sky kept above the land, with pixels `zoom` times the size: room for the tallest
+/// character, and for the title, a line of narration and a name, which stay their own size.
+fn sky(zoom: i32) -> i32 {
+    4 + 4 / zoom
+}
 
 /// Each resolves to a column on the level at any size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,10 +147,11 @@ impl Plan {
     }
 }
 
-/// How the level fits the screen. A big terminal gets pixels twice the size. A tall, narrow one
-/// gets the level folded into floors stacked up the screen, each running the other way from the
-/// one below, so walking off the end of one comes out at the same side of the next. The level is
-/// still one strip, with a stairwell off the screen at each fold; only drawing it uses the fit.
+/// How the level fits the screen. A big or wide one gets pixels two or three times the size. A
+/// tall one gets the level folded into floors stacked up the screen, each running the other way
+/// from the one below, so walking off the end of one comes out at the same side of the next. The
+/// level is still one strip, with a stairwell off the screen at each fold; only drawing it uses
+/// the fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fit {
     /// Screen pixels to a level pixel, each way.
@@ -161,23 +166,23 @@ pub struct Fit {
 }
 
 impl Fit {
-    /// For `cols` × `rows` cells, the strips' row included.
+    /// For `cols` × `rows` cells, the strips' row included. A level reads best about 100 of its
+    /// columns long, all floors together, with each floor its land and the sky above it. Of pixels
+    /// one to three times the size on one to three floors, the fit that comes nearest, where a
+    /// level stretched thin is worse than sky to spare. Floors and bigger pixels only leave room
+    /// for some land, and bigger pixels only with a level at least as long as an ordinary
+    /// terminal's.
     pub fn new(cols: u16, rows: u16) -> Fit {
         let (cols, rows) = (i32::from(cols), i32::from(rows));
-        // A level reads best about three and a half times as wide as it is tall.
-        let floors = |w: i32, h: i32, least: i32| {
-            let off = |f: i32| ((f * f * w) as f32 / h.max(1) as f32 / 3.5).ln().abs();
-            (1..=3).filter(|&f| (f == 1 || h / f >= BAND) && f * w >= least).min_by(|&a, &b| off(a).total_cmp(&off(b)))
-        };
-        // Twice the size, once that still leaves as much room as an ordinary terminal, with a level
-        // at least as long as one.
-        let (w, h) = (cols / 2, rows / 2);
-        let (zoom, w, h, floors) = match floors(w, h, 80) {
-            Some(f) if w * h >= 80 * 22 && h >= BAND => (2, w, h, f),
-            _ => (1, cols, rows, floors(cols, rows, 0).unwrap_or(1)),
-        };
-        let band = h / floors;
-        Fit { zoom, floors, width: w, band, above: 2 * (rows - floors * band * zoom) }
+        let off = |n: i32, best: i32| (n.max(1) as f32 / best as f32).ln().abs();
+        let off = |&(z, f): &(i32, i32)| off(rows / z / f, sky(z) + 14) + 1.25 * off(f * (cols / z), 100);
+        let (zoom, floors) = (1..=3)
+            .flat_map(|z| (1..=3).map(move |f| (z, f)))
+            .filter(|&(z, f)| (z, f) == (1, 1) || rows / z / f >= sky(z) + 8 && (z == 1 || f * (cols / z) >= 80))
+            .min_by(|a, b| off(a).total_cmp(&off(b)))
+            .unwrap_or((1, 1));
+        let (width, band) = (cols / zoom, rows / zoom / floors);
+        Fit { zoom, floors, width, band, above: 2 * (rows - floors * band * zoom) }
     }
 
     /// Floor `k` starts at this column of the level.
@@ -263,7 +268,7 @@ impl Level {
         };
         let ground = (2 * rows - thick).max(2);
         // Taller terminals get taller levels, up to half again the plan's heights.
-        let room = (ground / 2 - 8).max(0);
+        let room = (ground / 2 - sky(fit.zoom)).max(0);
         let scale = (room as f32 / 5.0).min(1.5);
         let lift = |cells: i32| ground - 2 * ((cells as f32 * scale).round() as i32).clamp(0, room);
         // `f` of the way across floor `k`.
@@ -323,7 +328,7 @@ impl Level {
             floor,
             ground,
             top,
-            names: fit.floors * fw >= 70 && rows >= 18,
+            names: fit.floors * fw >= 70 && rows * fit.zoom >= 18,
             shelves,
             slots,
             block,
@@ -514,6 +519,12 @@ mod tests {
         assert_eq!(fit(30, 88), (1, 3));
         assert_eq!(fit(220, 58), (2, 1));
         assert_eq!(fit(120, 68), (2, 2), "zoomed only with a level as long as an ordinary one");
+        // In between: floors rather than a sky twice the land's height, bigger pixels rather than
+        // a level stretched thin.
+        assert_eq!(fit(90, 44), (1, 2));
+        assert_eq!(fit(140, 45), (1, 1), "not two floors 280 columns long");
+        assert_eq!(fit(240, 30), (2, 1));
+        assert_eq!(fit(300, 90), (3, 1));
     }
 
     #[test]

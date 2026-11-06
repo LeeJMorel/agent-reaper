@@ -16,7 +16,7 @@ snippet:
 rule:
   id: whole-test-suite
   tools: [bash]
-  match: { command: '(^|[;&|(]\s*)(npx |uv run |python3? -m )?(pytest|vitest|jest)\b(?![^;&|]*(::|\.(py|[jt]sx?)\b|\$))' }
+  match: { command: '^(pytest|vitest|jest)\b(?!.*(::|\.(py|[jt]sx?)\b|\$))' }
   redirect: Run the test files for the code you changed.
 stops:
   - pytest
@@ -37,11 +37,13 @@ folder level, `**` any depth).
 ## How it's checked
 
 - `match`: regexes over the action's arguments. Use it whenever the thing shows in the command
-  or the file path. Keys: `command` for shell commands, `path` for the file an agent reads or
-  writes, `content` for the text it writes (a new file, or an edit's new text, never the text
-  it replaces), `"*"` for any argument. `path` and `content` work whichever agent it is. In
-  examples, an edit is `{ tool: edit, path: …, new_string: … }`. Patterns are JavaScript regexes,
-  searched anywhere in the text, and every key listed must match.
+  or the file path. Keys: `command` for shell commands (see below), `script` for the whole
+  shell command at once (only for a pattern across commands, such as a pipe or a loop), `path`
+  for the file an agent reads or writes, `content` for the text it writes (a new file, or an
+  edit's new text, never the text it replaces), `"*"` for any argument as sent. `path` and
+  `content` work whichever agent it is. In examples, an edit is
+  `{ tool: edit, path: …, new_string: … }`. Patterns are JavaScript regexes, searched anywhere
+  in the text, and every key listed must match.
 - `judge`: a plain-English description of the bad action, decided by a small model (the
   watcher). Use it only for meaning a pattern can't see, such as "Connecting to, querying or
   migrating a production database." Describe the action itself, not a rule about it. It needs
@@ -51,14 +53,19 @@ folder level, `**` any depth).
 
 ## Command patterns
 
-- Fire when the program runs, never when it's only mentioned. Anchor it to the start of a
-  command: the start of the text, or just after `;`, `&`, `|` or `(`, which is
-  `(^|[;&|(]\s*)`. Allow the launchers that matter before it (`npx `, `uv run `,
-  `python3? -m `). Without the anchor, `cat pytest.ini`, `grep pytest` and `pgrep -f pytest`
-  break the rule.
-- Put `\b` after a program's name and `\s+` between words.
-- "Without naming a file" is a lookahead over the rest of that command: `(?![^;&|]*\.py\b)`.
-  Treat `$f` and similar variables as file names: a loop over files is fine.
+- reaper tries a `command` pattern on each command the shell would run, one at a time: the
+  parts between `;`, `&&`, `||`, `|` and line breaks, and what runs inside `$( )`, backticks
+  and `bash -c '…'`. Quotes are taken off and words are joined by single spaces. Comments
+  aren't commands, and a heredoc counts as part of the command it's fed to.
+- Each command is tried again with what runs it taken off the front: `sudo`, `env`,
+  `VAR=value`, `timeout 60`, `nice`, `xargs`, `npx`, `pnpm exec`, `uv run`, `poetry run`,
+  `python -m`, a program's directory (`./venv/bin/pytest`) and git's own options
+  (`git -C repo`).
+- So start the pattern with `^` and the program, and put `\b` after its name: `^pytest\b`
+  fires on `uv run pytest` and `cd api && pytest -x`, and never on `cat pytest.ini`,
+  `grep pytest` or a commit message that mentions it.
+- "Without naming a file" is a lookahead over the rest of the command: `(?!.*\.py\b)`. Treat
+  `$f` and similar variables as file names: a loop over files is fine.
 - Options can take a value: in `pytest -n 2 --dist loadgroup`, `loadgroup` is a value, not a
   test path.
 - Write patterns in single quotes. A single quote inside one is written twice: `''`.
@@ -77,12 +84,17 @@ folder level, `**` any depth).
 
 ## Examples
 
-- `stops`: three to five actions the rule must stop.
+- `stops`: three to five actions the rule must stop, one of them behind a wrapper or on a later
+  line of a longer command.
 - `allows`: three to five near misses it must let through, above all reading, searching for
-  or checking on the same thing (`cat`, `grep`, `ls`, `pgrep`).
+  or checking on the same thing (`cat`, `grep`, `ls`, `pgrep`), and writing about it (a commit
+  message).
 - A string is a shell command. For files, write `{ tool: write, path: src/generated/api.ts }`.
-- reaper tries every example against the pattern before the rule is added. For `judge` rules
-  the examples are shown to the person but not tried.
+- reaper tries every example before the rule is added: on the pattern, and for a `judge` rule
+  on the watcher too, when there is one.
+- reaper also runs a pattern rule over the person's recent sessions and says how many of their
+  agents' calls it would have stopped, with a few of them. If one is something the person
+  would want to go through, narrow the pattern.
 
 ## Everything else
 
@@ -98,7 +110,8 @@ folder level, `**` any depth).
 ## In a working session
 
 If you're an agent and your person asks for a rule while you work: show them the snippet,
-check it with `reaper rules add --check <<'EOF'` … `EOF`, and once they agree, add it with
-`reaper rules add <<'EOF'` … `EOF`. reaper puts it in its rules file for you. To change a rule,
-take it out with `reaper rules remove <id>`, which your person is asked to allow, and add the
-new version. reaper's own files are off limits to agents.
+check it with `reaper rules add --check <<'EOF'` … `EOF`, show them what it would have stopped
+in their sessions, and once they agree, add it with `reaper rules add <<'EOF'` … `EOF`. reaper puts it in its rules file for you. To change a rule,
+give the new version the same id and add it with `reaper rules add --replace`: it takes the old
+one's place, and your person is asked to allow it. `reaper rules remove <id>` takes one out, also
+with their say. reaper's own files are off limits to agents.

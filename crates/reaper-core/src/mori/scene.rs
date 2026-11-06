@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::cast::{self, DEAD, Personality, REAPER, Rgb, Shape, WHITE};
+use super::cast::{self, DEAD, HALO, Personality, REAPER, Rgb, Shape, WHITE};
 use super::level::{Fit, Leg, Level, Spot};
 use super::lines::{Section, When};
 use super::sprites::{self, BASKET, BLADE, BUNNY, FRAME as GUILLOTINE, GRENADE, GRIM, PIN, SAUCER, Sprite, WOLF};
@@ -17,6 +17,10 @@ use crate::state::Status;
 
 /// How often to redraw while something moves.
 pub const FRAME: i64 = 50;
+
+/// Death scenes play this many times slower than their times below, so the narrator's line can
+/// be read while one plays.
+pub(super) const SLOW: i64 = 2;
 
 /// How long names stay up after a character arrives, is stopped, or the stage changes.
 const NAME_FOR: i64 = 4000;
@@ -34,8 +38,6 @@ const BLOOD: Rgb = Rgb(0xC4, 0x1E, 0x2C);
 /// Blood once the scene is over, dried dark into the ground.
 const DRIED: Rgb = Rgb(0x4E, 0x16, 0x1E);
 const WATER: Rgb = Rgb(0x9C, 0xC8, 0xEE);
-/// The gold at the edge of the holy hand grenade's blast, and the halo of the enlightened.
-const HALO: Rgb = Rgb(0xF5, 0xE6, 0xA0);
 const BEAM: Rgb = Rgb(0xB8, 0xF0, 0xC8);
 /// A smoke signal's puffs: pale, and never the grey of the dead.
 const SMOKE: Rgb = Rgb(0xE4, 0xE0, 0xEE);
@@ -237,6 +239,9 @@ pub enum Effect {
         clip: i32,
     },
     Pixels(Vec<(i32, i32, Rgb)>),
+    /// Light across the sky, showing only where there's sky: each pixel how strong it is,
+    /// from 0 (just sky) to 1.
+    Light(Vec<(i32, i32, f32)>),
     /// What a strike draws up out of a character for a moment: a pale wisp of its own colour.
     Wisp {
         pixels: Vec<(i32, i32)>,
@@ -460,8 +465,8 @@ impl Mori {
 
     /// The line playing now in session `s`: among the lines still showing, a newer one takes
     /// over if it matters at least as much, or answers a key press. Nothing queues. A death's
-    /// line doesn't fade: it stays up until the session says anything newer, which takes over
-    /// whatever it is, and then it's done.
+    /// line doesn't fade: until it has been read only another death or a key press takes over,
+    /// and after that it stays up until the session says anything newer, and then it's done.
     fn moment(&self, s: usize, pace: &mut Pace) -> Option<Moment> {
         let session = &self.sessions[s];
         let now = pace.now;
@@ -473,17 +478,22 @@ impl Mori {
         moments.extend(nudge.as_ref());
         moments.sort_by_key(|m| m.at);
         let said = |after: i64| moments.iter().any(|n| n.at > after && n.at <= now);
+        let reading = |m: &Moment| m.lasts() && now < m.at + life(&m.text);
         let mut current: Option<&Moment> = None;
         for &m in &moments {
             if m.at > now {
                 pace.at(m.at);
                 continue;
             }
-            let over = if m.lasts() { said(m.at) } else { now >= m.at + life(&m.text) };
+            if reading(m) && said(m.at) {
+                pace.at(m.at + life(&m.text));
+            }
+            let over = if m.lasts() { !reading(m) && said(m.at) } else { now >= m.at + life(&m.text) };
             if over || m.quiet && picked.is_some_and(|p| p != m.actor) {
                 continue;
             }
-            if current.is_none_or(|c| m.view || m.prio >= c.prio || c.lasts()) {
+            let wins = |c: &Moment| if reading(c) { m.lasts() } else { m.prio >= c.prio || c.lasts() };
+            if current.is_none_or(|c| m.view || wins(c)) {
                 current = Some(m);
             }
         }
@@ -1016,7 +1026,7 @@ impl<'a> Build<'a> {
                     moving = true;
                 }
             }
-            Act::Die(method) => return self.die(c, a, method, e, to, beat.to),
+            Act::Die(method) => return self.die(c, a, method, e / SLOW, to, beat.to),
         }
         if moving {
             self.pace.moving();
@@ -1041,8 +1051,8 @@ impl<'a> Build<'a> {
         let mut held = top;
 
         match signal {
-            // A lamp at its feet switches on, its beam reaches up, and there in the sky is a disc
-            // of light with the character's own outline in it.
+            // A lamp at its feet switches on, a cone of light reaches up across the sky, and at
+            // the top of it is a disc of light with the character's own outline in it.
             Signal::Searchlight => {
                 const SWITCH: i64 = 250;
                 const REACH: i64 = 600;
@@ -1052,26 +1062,44 @@ impl<'a> Build<'a> {
                 let lens = (if out > 0 { lx + 1 } else { lx }, ground - 1);
                 pixels.extend([(lx, ground, LAMP), (lx + 1, ground, LAMP)]);
                 pixels.push((lens.0, lens.1, if t < SWITCH { LAMP } else { HALO }));
+                // The disc hangs toward the middle of the level, just under the health bar, the
+                // beam leaning further over the higher it has to go.
                 let r = (w.max(h) + 1) / 2 + 2;
-                let (dx, dy) = ((x + w / 2 + out * (w + r + 4)).clamp(left + r, (right - 1 - r).max(left + r)), 4 + r);
-                let steps = (dx - lens.0).abs().max(lens.1 - dy - r).max(1);
-                let reach = (steps as f32 * progress(t, SWITCH, REACH)) as i32;
-                for i in (2..=reach).step_by(2) {
-                    let p = i as f32 / steps as f32;
-                    pixels.push((lerp(lens.0, dx, p), lerp(lens.1, dy + r, p), HALO.dim(0.75)));
-                }
+                let dy = 7 + r;
+                let lean = (w + r + 4).max((lens.1 - dy) / 2);
+                let dx = (x + w / 2 + out * lean).clamp(left + r, (right - 1 - r).max(left + r));
                 let lit = lerp(0, r, progress(t, SWITCH + REACH, GROW));
-                let (sx, sy) = (dx - w / 2, dy - h / 2);
-                for py in dy - lit..=dy + lit {
-                    for px in dx - lit..=dx + lit {
-                        if lit > 0 && (px - dx).pow(2) + (py - dy).pow(2) <= lit * lit + lit {
-                            // Its outline is the sky, left dark in the light.
-                            if !((sx..sx + w).contains(&px) && (sy..sy + h).contains(&py)) {
-                                pixels.push((px, py, HALO));
-                            }
+                let disc = |px: i32, py: i32| lit > 0 && (px - dx).pow(2) + (py - dy).pow(2) <= lit * lit + lit;
+                // The beam widens from the lens to the width of the disc, brightest near the lamp.
+                let reach = progress(t, SWITCH, REACH);
+                let (ax, ay) = ((dx - lens.0) as f32, (dy - lens.1) as f32);
+                let len = (ax * ax + ay * ay).sqrt().max(1.0);
+                let mut light = Vec::new();
+                for py in dy - r..lens.1 {
+                    for px in lens.0.min(dx - r)..=lens.0.max(dx + r) {
+                        let (vx, vy) = ((px - lens.0) as f32, (py - lens.1) as f32);
+                        let along = (vx * ax + vy * ay) / (len * len);
+                        let off = (vx * ay - vy * ax).abs() / len;
+                        if along > 0.0 && along <= reach && off <= 0.5 + along * r as f32 && !disc(px, py) {
+                            light.push((px, py, 0.5 - 0.3 * along));
                         }
                     }
                 }
+                let (sx, sy) = (dx - w / 2, dy - h / 2);
+                for py in dy - lit - 1..=dy + lit + 1 {
+                    for px in dx - lit - 1..=dx + lit + 1 {
+                        // Its outline is the sky, left dark in the light, and the disc glows.
+                        if disc(px, py) && !((sx..sx + w).contains(&px) && (sy..sy + h).contains(&py)) {
+                            pixels.push((px, py, HALO));
+                        } else if lit > 0
+                            && !disc(px, py)
+                            && (px - dx).pow(2) + (py - dy).pow(2) <= (lit + 1).pow(2) + lit + 1
+                        {
+                            light.push((px, py, 0.45));
+                        }
+                    }
+                }
+                self.effects.push(Effect::Light(light));
                 moving = t < SWITCH + REACH + GROW;
             }
             // A little fire beside it, and three puffs of smoke, one after another.
@@ -1774,7 +1802,7 @@ impl<'a> Build<'a> {
                     })
                 };
                 let prev = nth.checked_sub(1).and_then(|n| neighbour(n, true));
-                let next = neighbour(nth + 1, false).and_then(|o| o.death).map(|d| d.at - me);
+                let next = neighbour(nth + 1, false).and_then(|o| o.death).map(|d| (d.at - me) / SLOW);
                 let from = prev.map_or((left - sw, 4), |p| hover(self.rest(p, p.spot)));
                 let saucer = match e {
                     _ if next.is_some_and(|n| e >= n) => None,
@@ -2133,7 +2161,7 @@ mod tests {
             let start = a.actors[0].death.unwrap().at;
             let stood = stage(&a, start - 1).actors[0].clone();
             assert_eq!(stood.x, level(&a).x(Spot::Centre, 0, stood.w), "{m:?}: plays in the middle");
-            let after = stage(&a, start + 6000);
+            let after = stage(&a, start + super::super::LAST_SCENE * SLOW);
             let actor = &after.actors[0];
             assert_eq!(actor.label, Some(Label::Epitaph(m.epitaph())), "{m:?}");
             assert!(actor.grave && actor.fill == DEAD && !actor.alive, "{m:?}");
@@ -2142,7 +2170,7 @@ mod tests {
             let bloody = !after.stains.is_empty();
             assert_eq!(bloody, !matches!(m, Method::Enlightened), "{m:?} and blood");
             assert!(after.stains.iter().all(|s| s.2 != BLOOD), "{m:?}: dried once it's over");
-            let during: Vec<Stage> = (start..start + 3500).step_by(100).map(|t| stage(&a, t)).collect();
+            let during: Vec<Stage> = (start..start + 3500 * SLOW).step_by(100).map(|t| stage(&a, t)).collect();
             assert!(during.iter().any(|s| !s.effects.is_empty() || s.actors[0].h != stood.h), "{m:?} plays a scene");
             if m == Method::Floor {
                 assert!(actor.bottom > stood.bottom, "down in the hole: {actor:?} {stood:?}");
@@ -2173,7 +2201,7 @@ mod tests {
             let start = a.actors[0].death.unwrap().at;
             let at = |t| a.scene(t, TALL.0, TALL.1).stage.expect("followed");
             assert_eq!(level.span(at(start).actors[0].x).0, 0, "{m:?}: on the bottom floor");
-            for t in (start..start + 6000).step_by(50) {
+            for t in (start..start + 6000 * SLOW).step_by(50) {
                 let s = at(t);
                 let (left, right) = level.span(s.actors[0].x);
                 let pixels = s.effects.iter().flat_map(|e| -> Vec<(i32, i32)> {
@@ -2185,6 +2213,7 @@ mod tests {
                             })
                             .collect(),
                         Effect::Pixels(pixels) => pixels.iter().map(|&(x, y, _)| (x, y)).collect(),
+                        Effect::Light(pixels) => pixels.iter().map(|&(x, y, _)| (x, y)).collect(),
                         Effect::Wisp { pixels, .. } => pixels.clone(),
                     }
                 });
@@ -2208,7 +2237,7 @@ mod tests {
                 _ => None,
             })
         };
-        let frames: Vec<Stage> = (start..start + 6000).step_by(50).map(|t| stage(&a, t)).collect();
+        let frames: Vec<Stage> = (start..start + 6000 * SLOW).step_by(50).map(|t| stage(&a, t)).collect();
         let mut said = Vec::new();
         for s in &frames {
             let me = &s.actors[0];
@@ -2242,12 +2271,15 @@ mod tests {
             let m = helpers[0];
             assert!(super::super::GROUP.contains(&m), "{m:?}");
             let starts: Vec<i64> = (1..4).map(|k| a.actors[k].death.unwrap().at).collect();
-            assert!(starts.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= 2000), "one after another: {starts:?}");
+            assert!(
+                starts.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= 2000 * SLOW),
+                "one after another: {starts:?}"
+            );
             if seen.contains(&m) {
                 continue;
             }
             seen.push(m);
-            let after = stage(&a, starts[2] + 4000);
+            let after = stage(&a, starts[2] + 4000 * SLOW);
             for (k, actor) in after.actors[1..].iter().enumerate() {
                 let epitaph = (k == 0).then_some(Label::Epitaph(m.epitaph()));
                 assert_eq!(actor.label, epitaph, "{m:?}: one epitaph, on the first to go");
@@ -2361,7 +2393,7 @@ mod tests {
         assert!(s.strips[1].line.is_some(), "a death gets a line beside the strip");
         assert!(s.strips[1].followed && s.stage.unwrap().number == 2, "and takes the stage while it plays");
         assert!(early.scene(400, 80, 22).stage.unwrap().title.is_some(), "with a title card as it moves there");
-        assert!(early.scene(death + 9_000, 80, 22).strips[0].followed, "then the stage goes back");
+        assert!(early.scene(death + super::super::DYING + 1000, 80, 22).strips[0].followed, "then the stage goes back");
         let mut mine = early.clone();
         mine.switch(1, death + 100);
         assert!(mine.scene(death + 200, 80, 22).strips[0].followed, "the human switching takes it back at once");
@@ -2621,6 +2653,19 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_who_left_frees_its_exit_for_the_next() {
+        let mut lines = vec![spawn(0, "a", "m")];
+        for i in 0..10 {
+            let (at, id) = (1000 + i * 20_000, format!("s{i}"));
+            lines.extend([sub(at, &id, "a"), acted(at + 1000, &id, "Read"), event(at + 2000, &id, "agent.idle", "")]);
+        }
+        let a = mori(&lines);
+        assert!(a.actors[1..].iter().all(|c| c.k == 1), "each in the place the last one left");
+        let late = mori(&[spawn(0, "a", "m"), sub(1000, "s1", "a"), sub(1100, "s2", "a")]);
+        assert_eq!(late.actors.iter().map(|c| c.k).collect::<Vec<_>>(), [0, 1, 2], "everyone still here keeps theirs");
+    }
+
+    #[test]
     fn a_death_can_be_played_for_fun_and_clears_itself_away() {
         let mut a = mori(&[spawn(0, "a", "m"), acted(500, "a", "Read")]);
         for (k, expected) in [Method::Scythe, Method::Blade, Method::Floor].into_iter().enumerate() {
@@ -2632,9 +2677,9 @@ mod tests {
             let c = &stage.actors[0];
             assert_eq!(c.x + c.w / 2, 40, "dropped into the middle");
             assert_eq!(stage.title.unwrap().text, format!("rehearsal · {}", expected.epitaph()));
-            let after = a.scene(now + 6000, 80, 22).stage.unwrap();
+            let after = a.scene(now + 10_000, 80, 22).stage.unwrap();
             assert!(after.actors.iter().all(|c| c.label == Some(Label::Epitaph(expected.epitaph()))), "{expected:?}");
-            let line = a.scene(now + 6000, 80, 22).stage.unwrap().narration.expect("the death is told");
+            let line = a.scene(now + 10_000, 80, 22).stage.unwrap().narration.expect("the death is told");
             assert_eq!(line.shown, line.text.chars().count(), "typed out");
             let start = a.actors.last().unwrap().death.unwrap().at;
             assert!(start - now >= 2000, "a beat before it starts");
@@ -2727,6 +2772,27 @@ mod tests {
         assert_ne!(answer.text, death.text);
         let after = line(&a, start + 70_000);
         assert!(after.as_ref().is_none_or(|n| n.text != death.text), "it doesn't come back: {after:?}");
+    }
+
+    #[test]
+    fn a_death_line_is_read_before_anything_but_a_key_press_takes_over() {
+        let a = mori(&[
+            spawn(0, "otto", "m"),
+            killed(100, "otto", "pattern", 3, true, "x"),
+            died(101, "otto", "r", "strikes"),
+            took_over(4_000, "heir", "otto"),
+        ]);
+        let start = a.actors[a.index["otto"]].death.unwrap().at;
+        let death = stage(&a, start + 100).narration.expect("told").text;
+        let read = start + life(&death);
+        assert!(read > 4_000, "the newcomer speaks while it's being read");
+        assert_eq!(stage(&a, read - 100).narration.unwrap().text, death, "the newcomer waits");
+        assert!(a.scene(read - 100, SIZE.0, SIZE.1).next.is_some_and(|t| t <= read), "drawn again when it's read");
+        let took = a.sessions[0].moments.iter().find(|m| m.section == Section::TookOver).unwrap();
+        assert_eq!(stage(&a, read + 100).narration.unwrap().text, took.text, "then the newcomer has its say");
+        let mut asked = a.clone();
+        asked.pick(1, start + 1_000);
+        assert_ne!(stage(&asked, start + 1_100).narration.unwrap().text, death, "a key press answers at once");
     }
 
     #[test]

@@ -67,6 +67,8 @@ pub fn ansi256(rgb: Rgb) -> Option<u8> {
     match rgb {
         REAPER => Some(167),
         DEAD => Some(59),
+        // The nearest is a peach.
+        HALO => Some(229),
         _ => HUES.iter().position(|&h| h == rgb).map(|i| HUES_256[i]),
     }
 }
@@ -77,6 +79,8 @@ pub const REAPER: Rgb = Rgb(0xE5, 0x48, 0x4D);
 pub const DEAD: Rgb = Rgb(0x5B, 0x5F, 0x66);
 /// A flash of light, and paper.
 pub const WHITE: Rgb = Rgb(0xF2, 0xF0, 0xE8);
+/// Gold light: a searchlight's disc, the holy hand grenade's blast, the halo of the enlightened.
+pub const HALO: Rgb = Rgb(0xF5, 0xE6, 0xA0);
 
 /// The sky behind every level, which memento mori paints itself so it looks the same on any
 /// terminal: dusk, from the top of memento mori down to the horizon.

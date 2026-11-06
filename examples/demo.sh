@@ -32,7 +32,7 @@ strikes: 3
 rules:
   - id: force-push
     tools: [bash]
-    match: { command: 'git\s+push\b.*(--force|\s-f\b)' }
+    match: { command: '^git push\b.*\s(-f\b|--force\b)' }
     redirect: Push to a new branch and open a pull request for the change.
 
   - id: secrets
@@ -41,7 +41,7 @@ rules:
 
   - id: rm-rf
     tools: [bash]
-    match: { command: 'rm\s+-(rf|fr)\b' }
+    match: { command: '^rm -(rf|fr)\b' }
     redirect: Move files you want gone into ./trash so they can be restored.
 
 projects:

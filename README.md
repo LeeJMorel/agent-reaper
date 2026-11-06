@@ -75,7 +75,7 @@ Put your rules in `~/.config/reaper/rules.yaml`:
 rules:
   - id: force-push
     tools: [bash]
-    match: { command: '(^|[;&|(]\s*)git\s+(-C\s+\S+\s+)?push\b[^;&|\n]*\s(--force\b|-f\b)' }
+    match: { command: '^git push\b.*\s(-f\b|--force\b|\+\S)' }
     redirect: Push to a new branch and open a pull request for the change.
 
 projects:
@@ -103,7 +103,7 @@ Each rule describes a violation privately and says what to do instead.
 
 | Key | |
 |---|---|
-| `match` | Regexes over the call's arguments: `command`, `path` (any file read or written), `content` (the text written, never the text an edit replaces), or `"*"` for all of them. Deterministic and instant. |
+| `match` | Regexes over the call's arguments: `command` (each command the shell runs, and again with `sudo`, `timeout`, `uv run`, `python -m` and the like taken off, so `^pytest\b` fires on `cd api && uv run pytest` and not on `cat pytest.ini`), `script` (the whole shell command, for a pipe or a loop), `path` (any file read or written), `content` (the text written, never the text an edit replaces), or `"*"` for all of them as sent. Deterministic and instant. |
 | `judge` | A plain-English description, decided by the watcher model. |
 | `redirect` | The only thing the agent ever hears. Write it as an instruction, not a prohibition; `reaper lint` flags redirects that say "don't". |
 | `tools` | Only check these tools. `message` means what the agent says: only rules that list it look at replies, judged by their `text`. |
@@ -139,8 +139,8 @@ See [examples/rules.yaml](examples/rules.yaml) for the full format.
 
 **In your own words.** Press `n` on the console's rules tab and say what agents shouldn't do.
 reaper asks the Claude Code or pi you already have to write the rule, along with examples of
-what it should stop and let through. It tries the examples and shows you the result, and
-`enter` adds it. To ask from inside a Claude Code session instead, say yes to the skill
+what it should stop and let through. It tries the examples, runs the rule over your agents'
+recent sessions, and shows you what it would have stopped; `enter` adds it. To ask from inside a Claude Code session instead, say yes to the skill
 `reaper install claude-code` offers ([SKILL.md](crates/reaper/SKILL.md)); the
 agent adds the rule with `reaper rules add`.
 

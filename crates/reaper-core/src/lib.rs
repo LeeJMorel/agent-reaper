@@ -9,6 +9,7 @@ pub mod lint;
 pub mod mori;
 pub mod paths;
 pub mod rules;
+pub mod shell;
 pub mod state;
 pub mod tail;
 

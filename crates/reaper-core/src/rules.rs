@@ -10,9 +10,18 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
 
+use crate::shell;
+
 /// What the agent says (its replies), checked as if it were a call to a tool of this name with
 /// one argument, `text`. Only rules that list it in `tools` ever see a message.
 pub const MESSAGE: &str = "message";
+
+/// A shell command's argument. Its patterns are tried on each command it runs (see `shell`).
+pub const COMMAND: &str = "command";
+
+/// The whole shell command, for a pattern across commands (a pipe, a loop), less what isn't
+/// commands: comments, and heredocs fed to anything but a shell (see `shell::script`).
+pub const SCRIPT: &str = "script";
 
 /// Tools a judge-only rule covers when it doesn't list any: reads and searches skip the watcher.
 pub const MUTATING_TOOLS: &[&str] =
@@ -292,21 +301,47 @@ impl Rule {
     }
 
     /// Whether every `match` entry hits the tool's arguments (a JSON object). Patterns are
-    /// JavaScript regexes, searched anywhere in the value; `*` tests every argument.
+    /// JavaScript regexes, searched anywhere in the value; `*` tests every argument as sent.
+    /// `command` is tried on each command the shell would run, in each of its forms (see
+    /// `shell`), and `script` on the whole shell command, for patterns across commands.
     /// A rule without `match` never matches here (it is the watcher's to judge).
     pub fn matches(&self, tool: &str, args: &Value) -> bool {
         let Some(patterns) = &self.pattern else { return false };
         if !self.applies_to(tool) {
             return false;
         }
+        let runs = std::cell::OnceCell::new();
+        let runs = || {
+            runs.get_or_init(|| {
+                let text = args.get(COMMAND).and_then(Value::as_str).unwrap_or_default();
+                shell::commands(text).iter().flat_map(|words| shell::forms(words)).collect::<Vec<_>>()
+            })
+        };
         patterns.iter().all(|(key, pattern)| {
             let hit = |value: &Value| search(pattern, &arg_text(value));
-            if key == "*" {
-                args.as_object().is_some_and(|args| args.values().any(hit))
-            } else {
-                args.get(key).is_some_and(hit)
+            match key.as_str() {
+                "*" => args.as_object().is_some_and(|args| args.values().any(hit)),
+                COMMAND => runs().iter().any(|form| search(pattern, form)),
+                // A tool with an argument of its own by that name keeps it.
+                SCRIPT => match (args.get(SCRIPT), args.get(COMMAND).and_then(Value::as_str)) {
+                    (Some(own), _) => hit(own),
+                    (None, Some(command)) => search(pattern, &shell::script(command)),
+                    (None, None) => false,
+                },
+                _ => args.get(key).is_some_and(hit),
             }
         })
+    }
+}
+
+impl Rule {
+    /// The command in a shell command that the `command` pattern fires on, as it was written,
+    /// for showing a person why.
+    pub fn fires_on(&self, args: &Value) -> Option<String> {
+        let pattern = self.pattern.as_ref()?.get(COMMAND)?;
+        let text = args.get(COMMAND)?.as_str()?;
+        let words = shell::commands(text).into_iter().find(|w| shell::forms(w).iter().any(|f| search(pattern, f)))?;
+        Some(words.join(" "))
     }
 }
 
@@ -698,6 +733,57 @@ projects:
         assert!(!rules[0].matches(MESSAGE, &said), "a rule over every argument stays off messages");
         assert!(rules[1].matches(MESSAGE, &said));
         assert!(rules[1].applies_to("Edit") && !rules[1].applies_to("bash"));
+    }
+
+    #[test]
+    fn a_command_pattern_fires_when_the_program_runs_and_not_when_it_is_mentioned() {
+        let rule =
+            &parse(r"rules: [{ id: push, tools: [bash], match: { command: '^git push\b.*\s(-f\b|--force\b|\+\S)' } }]")
+                .unwrap()
+                .rules[0];
+        let stops = |command: &str| rule.matches("bash", &json!({ "command": command }));
+        for run in [
+            "git push -f",
+            "cd repo && git push --force",
+            "cd repo\ngit push --force origin main",
+            "timeout 60 git push -f",
+            "sudo git push -f",
+            "env GIT_TRACE=1 git push -f",
+            "GIT_TRACE=1 git push -f",
+            "git -c core.x=y push -f",
+            "git -C ../app push -f",
+            "bash -c 'git push -f'",
+            "echo `git push -f`",
+            "git push origin +main",
+            "/usr/bin/git push -f",
+            "git commit -m \"$(cat <<'EOF'\nIt's done\nEOF\n)\" && git push -f",
+        ] {
+            assert!(stops(run), "{run}");
+        }
+        for mention in [
+            "git status",
+            "git push origin feature",
+            "cat <<'EOF' > notes.md\nRun: cd x && git push -f\nEOF",
+            "git commit -m 'document why; git push -f is banned'",
+            "grep -rn 'git push -f' docs",
+            "ls # git push -f later",
+        ] {
+            assert!(!stops(mention), "{mention}");
+        }
+    }
+
+    #[test]
+    fn a_script_pattern_sees_the_whole_command_as_sent() {
+        let rule = &parse(r"rules: [{ id: piped, match: { script: '\|\s*tail\b', run_in_background: 'true' } }]")
+            .unwrap()
+            .rules[0];
+        assert!(rule.matches("Bash", &json!({ "command": "make test 2>&1 | tail -5", "run_in_background": true })));
+        assert!(!rule.matches("Bash", &json!({ "command": "make test 2>&1 | tail -5" })));
+        assert!(!rule.matches("Bash", &json!({ "command": "make test > log", "run_in_background": true })));
+        let written = json!({ "command": "cat > ci.sh <<'EOF'\nmake | tail\nEOF", "run_in_background": true });
+        assert!(!rule.matches("Bash", &written), "a file being written isn't the command");
+        let own = &parse(r"rules: [{ id: s, match: { script: '^deploy' } }]").unwrap().rules[0];
+        assert!(own.matches("mcp_run", &json!({ "script": "deploy all", "command": "x" })), "a tool's own script");
     }
 
     #[test]

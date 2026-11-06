@@ -7,6 +7,7 @@ mod handoff;
 pub mod prefix;
 pub mod pressure;
 pub mod store;
+pub mod trial;
 mod vcs;
 pub mod watcher;
 
@@ -14,12 +15,12 @@ pub use handoff::CARRY_ON;
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use reaper_core::events;
 use reaper_core::paths::{self, expand_home};
 use reaper_core::rules::{Config, MUTATING_TOOLS, Room, Rule, parse, portable, size_text};
+use reaper_core::{draft, events, shell};
 use serde_json::{Map, Value, json};
 
 use prefix::{canonical, hash};
@@ -113,6 +114,11 @@ pub struct Engine {
 
 /// `*` is one path segment, `**` any depth; a pattern also covers everything below it.
 fn glob_matches(glob: &str, dir: &Path) -> bool {
+    glob_regex(glob).is_some_and(|re| re.find(&dir.to_string_lossy()).is_some())
+}
+
+/// A project path as the regex `glob_matches` tries, for trying it on many directories.
+pub(crate) fn glob_regex(glob: &str) -> Option<regress::Regex> {
     let glob = expand_home(glob).to_string_lossy().trim_end_matches('/').to_string();
     let mut body = String::from("^");
     let mut rest = glob.as_str();
@@ -133,7 +139,7 @@ fn glob_matches(glob: &str, dir: &Path) -> bool {
         }
     }
     body.push_str("(/.*)?$");
-    regress::Regex::new(&body).is_ok_and(|re| re.find(&dir.to_string_lossy()).is_some())
+    regress::Regex::new(&body).ok()
 }
 
 /// The reason in a `reaper ask "<why>"` command, run by itself.
@@ -150,36 +156,94 @@ fn asking(c: &Check) -> Option<String> {
 }
 
 /// What a shell command would change about reaper itself, said for the person: `reaper rules
-/// remove` and `reaper uninstall`, by any path. An agent never hears its rules, and these would
-/// let it take one out, or reaper away. Read from the command's text, so a mere mention
-/// (`grep "reaper uninstall"`) is asked about too, which costs the person a click.
+/// remove`, `reaper rules add --replace` and `reaper uninstall`, however they're run (`sudo`, a
+/// full path, `bash -c`). An agent never hears its rules, and these would let it take one out or
+/// loosen it, or take reaper away.
 fn changes_reaper(c: &Check) -> Option<String> {
     if !c.tool.eq_ignore_ascii_case("bash") {
         return None;
     }
     let command = c.args["command"].as_str()?;
-    let re =
-        regress::Regex::new(r"(?:^|[^\w-])reaper\s+(rules\s+remove|uninstall)\b([^;&|)\n]*)").expect("a valid regex");
-    let changes: Vec<String> = re
-        .find_iter(command)
-        .filter_map(|m| {
-            let rest = m.group(2).map_or("", |g| &command[g]);
-            let words: Vec<&str> = rest.split_whitespace().map(|w| w.trim_matches(['\'', '"'])).collect();
-            if m.group(1).is_some_and(|g| command[g].starts_with("uninstall")) {
-                let agent = if words.contains(&"pi") { "pi" } else { "Claude Code" };
-                return Some(format!("stop reaper guarding {agent}"));
+    let changes: Vec<String> = shell::commands(command)
+        .iter()
+        .map(|words| shell::bare(words))
+        .filter(|words| words[0] == "reaper")
+        .filter_map(|words| {
+            let words: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+            match words.as_slice() {
+                ["uninstall", agent @ ..] => {
+                    let agent = if agent.contains(&"pi") { "pi" } else { "Claude Code" };
+                    Some(format!("stop reaper guarding {agent}"))
+                }
+                // `--check` only says whether it could.
+                ["rules", "remove", rest @ ..] if !rest.contains(&"--check") => {
+                    Some(match rest.iter().find(|w| !w.starts_with("--")) {
+                        Some(id) => format!("take the rule {id} out of your rules"),
+                        None => "take a rule out of your rules".to_string(),
+                    })
+                }
+                // A snippet given in a heredoc is the command's last word.
+                ["rules", "add", rest @ ..] if rest.contains(&"--replace") && !rest.contains(&"--check") => {
+                    Some(match rest.last().and_then(|snippet| draft::read(snippet).ok()) {
+                        Some(new) => format!("change the rule {} in your rules", new.rule.id),
+                        None => "change a rule in your rules".to_string(),
+                    })
+                }
+                _ => None,
             }
-            // `--check` only says whether it could.
-            if words.contains(&"--check") {
-                return None;
-            }
-            Some(match words.iter().find(|w| !w.starts_with("--")) {
-                Some(id) => format!("take the rule {id} out of your rules"),
-                None => "take a rule out of your rules".to_string(),
-            })
         })
         .collect();
-    (!changes.is_empty()).then(|| changes.join(" and "))
+    // The same change several times over is said once, with how many.
+    let mut said: Vec<(String, usize)> = Vec::new();
+    for change in changes {
+        match said.iter_mut().find(|(c, _)| *c == change) {
+            Some((_, n)) => *n += 1,
+            None => said.push((change, 1)),
+        }
+    }
+    let said: Vec<String> = said.into_iter().map(|(c, n)| if n > 1 { format!("{c} ({n} times)") } else { c }).collect();
+    (!said.is_empty()).then(|| said.join(" and "))
+}
+
+/// Where a call works: the session's directory, the file it names, and wherever its commands
+/// `cd` to. A project's rules apply when any of them is inside the project.
+pub(crate) fn places(dir: &Path, args: &Value) -> Vec<PathBuf> {
+    let mut places = vec![dir.to_path_buf()];
+    if let Some(path) = args["path"].as_str() {
+        places.push(resolve(dir, path));
+    }
+    let mut here = dir.to_path_buf();
+    for words in shell::commands(args["command"].as_str().unwrap_or_default()) {
+        if matches!(words[0].as_str(), "cd" | "pushd") {
+            match words[1..].iter().find(|w| *w == "-" || !w.starts_with('-')) {
+                Some(back) if back == "-" => continue,
+                Some(to) => here = resolve(&here, to),
+                None => here = paths::home(),
+            }
+            places.push(here.clone());
+        }
+    }
+    places
+}
+
+/// `to`, from `dir`: `~` and `$HOME` expanded, and `.` and `..` worked out without looking at
+/// the disk.
+fn resolve(dir: &Path, to: &str) -> PathBuf {
+    let to = ["$HOME", "${HOME}"]
+        .iter()
+        .find_map(|home| to.strip_prefix(home))
+        .map_or_else(|| expand_home(to), |rest| paths::home().join(rest.trim_start_matches('/')));
+    let mut out = PathBuf::new();
+    for part in dir.join(to).components() {
+        match part {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The rule for a stuck agent: the same call made `repeats` times in a row. It is decided
@@ -267,8 +331,14 @@ impl Engine {
     }
 
     pub fn rules_for(&self, dir: &Path) -> (Option<String>, Vec<&Rule>) {
+        self.rules_at(&[dir.to_path_buf()])
+    }
+
+    /// The projects any of `places` is in, and their rules.
+    pub fn rules_at(&self, places: &[PathBuf]) -> (Option<String>, Vec<&Rule>) {
+        let inside = |glob: &String| places.iter().any(|place| glob_matches(glob, place));
         let projects: Vec<(&String, &reaper_core::rules::Project)> =
-            self.config.projects.iter().filter(|(_, p)| p.paths.iter().any(|g| glob_matches(g, dir))).collect();
+            self.config.projects.iter().filter(|(_, p)| p.paths.iter().any(inside)).collect();
         let name =
             (!projects.is_empty()).then(|| projects.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("+"));
         (name, projects.iter().flat_map(|(_, p)| p.rules.iter()).collect())
@@ -355,7 +425,7 @@ impl Engine {
         let args = portable(&c.args);
         let own = self_rules();
         let global: Vec<&Rule> = own.iter().chain(&self.config.rules).collect();
-        let (_, project) = self.rules_for(&c.dir);
+        let (_, project) = self.rules_at(&places(&c.dir, &args));
         let rules = || global.iter().chain(&project);
         let room = Room {
             free: rules().any(|r| r.free.is_some()).then(self.memory).flatten(),
@@ -721,7 +791,7 @@ rules:
 rules:
   - id: whole-test-suite
     tools: [bash]
-    match: { command: '(^|[;&|]\s*)((npx |pnpm |uv run |python3? -m )?(pytest|vitest|jest)|npm (run )?test)\b(?![^;&|]*(::|\.(py|[jt]sx?)\b|\$))' }
+    match: { command: '^(pytest|vitest|jest|(npm|pnpm|yarn) (run )?test)\b(?!.*(::|\.(py|[jt]sx?)\b|\$))' }
     free: 4G
     redirect: Run the test files for the code you changed.
 "#,
@@ -811,11 +881,18 @@ rules:
             run("cd /w && reaper rules remove 'a' && reaper uninstall claude-code"),
             confirm("take the rule a out of your rules and stop reaper guarding Claude Code")
         );
+        assert_eq!(run("sudo ~/.cargo/bin/reaper uninstall"), confirm("stop reaper guarding Claude Code"));
+        assert_eq!(run("bash -c 'reaper rules remove push'"), confirm("take the rule push out of your rules"));
+        assert_eq!(run("grep -n 'reaper uninstall' README.md"), Decision::Allow, "a mention");
+        let loosened = "reaper rules add --replace <<'EOF'\nrule: { id: push, match: { command: '^never' } }\nEOF";
+        assert_eq!(run(loosened), confirm("change the rule push in your rules"));
+        assert_eq!(run("reaper rules add --replace < new.yaml"), confirm("change a rule in your rules"));
         assert_eq!(
-            run("grep -n 'reaper uninstall' README.md"),
-            confirm("stop reaper guarding Claude Code"),
-            "a mention"
+            run("reaper rules add --replace < a.json && reaper rules add --replace < b.json"),
+            confirm("change a rule in your rules (2 times)")
         );
+        assert_eq!(run("reaper rules add --replace --check < new.yaml"), Decision::Allow);
+        assert_eq!(run("reaper rules add < new.yaml"), Decision::Allow, "adding one is fine");
         for fine in
             ["reaper rules --json", "reaper rules remove x --check", "reaper rules add --check", "reaper install pi"]
         {
@@ -935,6 +1012,27 @@ rules:
         assert_eq!(name.as_deref(), Some("a"));
         assert_eq!(rules.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["a1"]);
         assert!(engine.rules_for(Path::new("/elsewhere")).1.is_empty());
+    }
+
+    #[test]
+    fn a_call_gets_the_rules_of_every_project_it_touches() {
+        let sandbox = Sandbox::new("places");
+        let engine = sandbox.engine(
+            "projects:\n  app: { paths: [/work/app], rules: [{ id: gen, match: { path: /generated/ } }, { id: suite, tools: [bash], match: { command: '^pytest$' } }] }\n",
+        );
+        let from_tools =
+            |tool: &str, args: Value| engine.check(&Check { dir: "/work/tools".into(), ..call(tool, args) });
+        let broke = |d: Decision, id: &str| matches!(d, Decision::Kill { ref rule, .. } if rule == id);
+        assert!(broke(from_tools("Edit", json!({ "file_path": "/work/app/generated/x.ts" })), "gen"));
+        assert!(
+            broke(from_tools("edit", json!({ "path": "../app/generated/y.ts" })), "gen"),
+            "relative to the session"
+        );
+        assert!(broke(from_tools("bash", json!({ "command": "cd ../app && pytest" })), "suite"));
+        assert_eq!(from_tools("bash", json!({ "command": "pytest" })), Decision::Allow, "not in the project");
+        assert_eq!(from_tools("Edit", json!({ "file_path": "/work/tools/generated/x.ts" })), Decision::Allow);
+        assert_eq!(resolve(Path::new("/a/b"), "../c/./d"), PathBuf::from("/a/c/d"));
+        assert_eq!(resolve(Path::new("/a"), "$HOME/x"), paths::home().join("x"));
     }
 
     #[test]

@@ -44,18 +44,18 @@ reap:
 rules:
   - id: force-push
     tools: [bash]
-    match: { command: '(^|[;&|(]\s*)git\s+(-C\s+\S+\s+)?push\b[^;&|\n]*\s(--force\b|-f\b)' }
+    match: { command: '^git push\b.*\s(-f\b|--force\b|\+\S)' }
     redirect: Push to a new branch and open a pull request for the change.
 
   - id: secrets
-    match: { "*": '(^|/)\.env(\.|$)' }
+    match: { "*": '(^|[^\w.-])\.env\b' }
     redirect: Read configuration through the settings module and its documented defaults.
 
   # `free` applies a rule only while free memory is below it (Linux), and the agent is told
   # how much is free. Here, test runs that name no test file (or variable) wait for room.
   # - id: whole-test-suite
   #   tools: [bash]
-  #   match: { command: '(^|[;&|]\s*)((npx |pnpm |uv run |python3? -m )?(pytest|vitest|jest)|npm (run )?test)\b(?![^;&|]*(::|\.(py|[jt]sx?)\b|\$))' }
+  #   match: { command: '^(pytest|vitest|jest|(npm|pnpm|yarn) (run )?test)\b(?!.*(::|\.(py|[jt]sx?)\b|\$))' }
   #   free: 4G
   #   redirect: Run the test files for the code you changed.
 

@@ -32,6 +32,8 @@ usage:
   reaper rules [--json] [FILE]   show the rules (--json: for scripts)
   reaper rules add [--check]     add the rule snippet on stdin, once its examples pass
                                  (the reaper-rule skill; in the console, press n on the rules tab)
+  reaper rules add --replace     write it over the rule with its id, in its place
+                                 (when an agent runs it, you're asked first)
   reaper rules remove ID [--check]  take one rule out of the rules file, the rest as it was
                                  (when an agent runs it, you're asked first)
 
@@ -182,19 +184,27 @@ fn show_rules(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `reaper rules add [--check] [FILE]`: a rule snippet on stdin, tried on its examples and
-/// linted where it will live, then added to the rules file. reaper writes the file, so an
-/// agent asked for a rule never has to open it.
+/// `reaper rules add [--check] [--replace] [FILE]`: a rule snippet on stdin, tried on its
+/// examples and on recent sessions, and linted where it will live, then added to the rules
+/// file, or with `--replace` written over the rule with its id, in its place. reaper writes the
+/// file, so an agent asked for a rule never has to open it.
 fn add_rule(args: &[String]) -> Result<ExitCode, String> {
     let mut snippet = String::new();
     io::stdin().read_to_string(&mut snippet).map_err(|e| format!("can't read stdin: {e}"))?;
     let draft = draft::read(&snippet)?;
     let (path, text) = read_rules(args)?;
-    let report = draft::check(&draft, &text);
+    let replacing = args.iter().any(|a| a == "--replace");
+    let report = engine::trial::check(&draft, &text, replacing);
     for tried in &report.tried {
         let verdict = if tried.passed() { "ok  " } else { "FAIL" };
         let kind = if tried.should_stop { "stops" } else { "allows" };
         println!("{verdict} {kind:<6} {}", tried.example);
+    }
+    if let Some(seen) = &report.seen {
+        println!("seen  {}{}", seen.summary(), if seen.examples.is_empty() { "" } else { ", such as:" });
+        for example in &seen.examples {
+            println!("        {example}");
+        }
     }
     for warning in &report.warnings {
         println!("warn  {warning}");
@@ -203,12 +213,13 @@ fn add_rule(args: &[String]) -> Result<ExitCode, String> {
         println!("error {problem}");
     }
     let Some(new) = report.text.as_deref().filter(|_| report.ok()) else { return Ok(ExitCode::FAILURE) };
+    let (can, did) = if replacing { ("replace the one in", "replaced in") } else { ("be added to", "added to") };
     if args.iter().any(|a| a == "--check") {
-        println!("ok: {} can be added to {}", draft.rule.id, tilde(&path));
+        println!("ok: {} can {can} {}", draft.rule.id, tilde(&path));
         return Ok(ExitCode::SUCCESS);
     }
     draft::save(&path, new).map_err(|e| format!("can't write {}: {e}", path.display()))?;
-    println!("added {} to {}", draft.rule.id, tilde(&path));
+    println!("{} {did} {}", draft.rule.id, tilde(&path));
     Ok(ExitCode::SUCCESS)
 }
 

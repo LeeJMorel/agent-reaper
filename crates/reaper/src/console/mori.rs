@@ -70,6 +70,11 @@ fn nearest_256(Rgb(r, g, b): Rgb) -> u8 {
 /// gradient would turn grey near the horizon, the colour of the dead.
 const DUSK_256: [u8; 3] = [17, 17, 18];
 
+/// A searchlight's beam, mixed into the dusk: a cool light, since a warm one mixed into the
+/// blue comes out grey. On 256-colour terminals, one blue a step up from the sky.
+const LIGHT: Rgb = Rgb(0xC8, 0xD4, 0xF4);
+const LIGHT_256: u8 = 61;
+
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let scene = app.mori.scene(app.mori_now(), area.width, area.height);
     app.mori_next.set(scene.next);
@@ -98,6 +103,8 @@ enum Px {
     Body,
     /// A strike's wisp, out of the character for a moment.
     Wisp,
+    /// A searchlight's beam, where it crosses the sky.
+    Light,
 }
 
 /// Pixels for one frame: one per column, two per row.
@@ -125,6 +132,18 @@ impl Canvas {
         for dy in 0..fit.zoom {
             for dx in 0..fit.zoom {
                 self.set(sx + dx, sy + dy, px, rgb);
+            }
+        }
+    }
+
+    /// Light over level pixel (`x`, `y`), if there's sky there: `strength` of the way from the
+    /// sky to the light.
+    fn light(&mut self, fit: &Fit, x: i32, y: i32, strength: f32) {
+        let Some((sx, sy)) = fit.pixel(x, y) else { return };
+        for (px, py) in (0..fit.zoom).flat_map(|dy| (0..fit.zoom).map(move |dx| (sx + dx, sy + dy))) {
+            if (0..self.w).contains(&px) && (0..self.h).contains(&py) && self.get(px, py).0 == Px::Sky {
+                let sky = self.get(px, py).1;
+                self.set(px, py, Px::Light, sky.mix(LIGHT, strength));
             }
         }
     }
@@ -301,6 +320,7 @@ impl Pen<'_> {
                 Effect::Pixels(pixels) => {
                     pixels.iter().for_each(|&(x, y, rgb)| canvas.paint(fit, x, y, Px::Body, rgb));
                 }
+                Effect::Light(pixels) => pixels.iter().for_each(|&(x, y, strength)| canvas.light(fit, x, y, strength)),
                 Effect::Wisp { pixels, hue } => {
                     pixels.iter().for_each(|&(x, y)| canvas.paint(fit, x, y, Px::Wisp, *hue));
                 }
@@ -543,6 +563,7 @@ impl Pen<'_> {
                 let (top, bottom) = (canvas.get(col, 2 * row), canvas.get(col, 2 * row + 1));
                 let color = |(px, rgb): (Px, Rgb), y: i32| match px {
                     Px::Sky | Px::Crack => self.sky_color(y),
+                    Px::Light if self.colors == Colors::Ansi256 => Color::Indexed(LIGHT_256),
                     _ => self.colors.color(rgb),
                 };
                 let (t, b) = (color(top, 2 * row), color(bottom, 2 * row + 1));
@@ -640,7 +661,7 @@ fn glyph(top: Px, bottom: Px) -> &'static str {
         (Px::Body, Px::Body) => "█",
         (Px::Body, _) => "▀",
         (_, Px::Body) => "▄",
-        (Px::Exit | Px::Wisp, _) | (_, Px::Exit | Px::Wisp) => "░",
+        (Px::Exit | Px::Wisp | Px::Light, _) | (_, Px::Exit | Px::Wisp | Px::Light) => "░",
         (Px::Crack, _) | (_, Px::Crack) => "▼",
         (Px::Block, _) | (_, Px::Block) => "▒",
         (Px::Land, Px::Land) => "▓",
@@ -680,6 +701,7 @@ fn wrap(text: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reaper_core::mori::HALO;
 
     #[test]
     fn the_256_palette_matches_the_skill_table() {
@@ -695,6 +717,7 @@ mod tests {
             (Rgb(0x5D, 0x6B, 0xD8), 62),
             (REAPER, 167),
             (DEAD, 59),
+            (HALO, 229),
         ] {
             assert_eq!(paint(rgb), Color::Indexed(index), "{rgb:?}");
         }
@@ -702,8 +725,22 @@ mod tests {
         assert_eq!(nearest_256(Rgb(0, 0, 0)), 16);
         assert_eq!(nearest_256(Rgb(0x80, 0x80, 0x80)), 244);
         assert_eq!(nearest_256(Rgb(0xff, 0xff, 0xff)), 231);
-        // The sky never takes the colour of the dead.
+        // The sky never takes the colour of the dead, and nor does light across it.
         assert!(!DUSK_256.contains(&59));
+        assert_ne!(LIGHT_256, 59);
+    }
+
+    #[test]
+    fn light_shows_only_where_there_is_sky() {
+        let fit = Fit::new(80, 24);
+        let sky = Rgb(0x14, 0x18, 0x30);
+        let mut canvas = Canvas { w: 80, h: 48, pixels: vec![(Px::Sky, sky); 80 * 48] };
+        canvas.paint(&fit, 10, 20, Px::Land, LAND);
+        canvas.light(&fit, 10, 20, 0.5);
+        canvas.light(&fit, 11, 20, 0.5);
+        let at = |x| fit.pixel(x, 20).map(|(sx, sy)| canvas.get(sx, sy)).unwrap();
+        assert_eq!(at(10), (Px::Land, LAND), "the land stays dark");
+        assert_eq!(at(11), (Px::Light, sky.mix(LIGHT, 0.5)));
     }
 
     #[test]

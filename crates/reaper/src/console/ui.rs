@@ -721,6 +721,12 @@ fn proposal_detail(app: &App, proposal: &Proposal, width: usize) -> Text<'static
             lines.push(field(if n == 0 { kind } else { "" }, example));
         }
     }
+    if let Some(seen) = &report.seen {
+        lines.extend(wrapped("seen", &seen.summary(), Style::new(), width));
+        for example in &seen.examples {
+            lines.push(field("", vec![Span::styled(example.clone(), dim())]));
+        }
+    }
     if let Some(note) = &draft.note {
         lines.extend(wrapped("note", note, dim(), width));
     }
@@ -885,7 +891,7 @@ mod tests {
     fn a_new_rule_shows_how_its_examples_went_before_it_goes_in() {
         let mut app = fixture();
         app.tab = Tab::Rules;
-        let snippet = "rule:\n  id: no-sudo\n  tools: [bash]\n  match: { command: '(^|[;&|(]\\s*)sudo\\b' }\n  redirect: Run it without elevated rights.\nstops: [sudo make install]\nallows: [cat sudoers.md, echo x; sudo -v]\n";
+        let snippet = "rule:\n  id: no-sudo\n  tools: [bash]\n  match: { command: '^sudo\\b' }\n  redirect: Run it without elevated rights.\nstops: [sudo make install]\nallows: [cat sudoers.md, echo x; sudo -v]\n";
         let draft = reaper_core::draft::read(snippet).unwrap();
         let report = reaper_core::draft::check(&draft, &app.rules.text);
         app.proposal = Some(Proposal { asked: "no sudo, ever".into(), draft, report });

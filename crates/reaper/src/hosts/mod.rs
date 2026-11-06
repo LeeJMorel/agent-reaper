@@ -2,6 +2,7 @@
 //! and carries out the decisions as far as the tool allows.
 
 pub mod claude_code;
+pub mod history;
 pub mod pi;
 
 use std::env;

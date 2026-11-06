@@ -1,6 +1,6 @@
 //! Asks an agent the human already has (Claude Code, else pi) to write a rule from their own
 //! words. It gets reaper's rule-writing skill as its only instructions and no tools, so all it
-//! can do is answer. Its snippet is checked like any other (`draft::check`), and goes back to
+//! can do is answer. Its snippet is checked like any other (`trial::check`), and goes back to
 //! it once with whatever failed.
 
 use std::path::Path;
@@ -12,6 +12,7 @@ use reaper_core::rules::parse;
 use serde_json::Value;
 
 use crate::SKILL;
+use crate::engine::trial;
 use crate::hosts::{first_line, headless, on_path, pi::release};
 
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -55,7 +56,7 @@ impl Writer {
             let reply = (self.ask)(&prompt)?;
             let failures = match draft::read(&reply) {
                 Ok(draft) => {
-                    let report = draft::check(&draft, rules);
+                    let report = trial::check(&draft, rules, false);
                     let failures = report.failures();
                     let proposal = Proposal { asked: asked.to_string(), draft, report };
                     if failures.is_empty() {
@@ -129,7 +130,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    const GOOD: &str = "```yaml\nrule:\n  id: no-sudo\n  tools: [bash]\n  match: { command: '(^|[;&|(]\\s*)sudo\\b' }\n  redirect: Run it without elevated rights, or ask the person to run it.\nstops: [sudo rm -rf build, ls && sudo make install]\nallows: [cat sudoers.md, grep sudo README.md]\n```";
+    const GOOD: &str = "```yaml\nrule:\n  id: no-sudo\n  tools: [bash]\n  match: { command: '^sudo\\b' }\n  redirect: Run it without elevated rights, or ask the person to run it.\nstops: [sudo rm -rf build, ls && sudo make install]\nallows: [cat sudoers.md, grep sudo README.md]\n```";
 
     fn writer(replies: &[&str]) -> (Writer, Arc<Mutex<Vec<String>>>) {
         let prompts = Arc::new(Mutex::new(Vec::new()));

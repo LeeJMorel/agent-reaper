@@ -19,7 +19,7 @@ use crate::events::{DeathReason, Event, Kind, Tier};
 use crate::rules::Config;
 use crate::state::{Model, QUIET_FOR, Status, hands_back};
 
-pub use cast::{BLOCK, DEAD, DUSK, LAND, REAPER, Rgb, WHITE, ansi256};
+pub use cast::{BLOCK, DEAD, DUSK, HALO, LAND, REAPER, Rgb, WHITE, ansi256};
 pub use level::Fit;
 pub use scene::{Actor, Effect, Exit, FRAME, Health, Label, Mini, Narration, Rect, Scene, Stage, Strip, Title};
 pub use sprites::Sprite;
@@ -27,6 +27,7 @@ pub use sprites::Sprite;
 use cast::{HUES, NAMES, PERSONALITIES, Personality, Shape};
 use level::{PILE, Plan, Spot};
 use lines::{Ask, Section, Slots, When};
+use scene::SLOW;
 
 /// The rule the engine adds to protect reaper's own files.
 const SELF_RULE: &str = "reaper.self";
@@ -44,7 +45,7 @@ const STICK: i64 = 15_000;
 /// long enough to see the graves, then they're cleared away.
 const GONE: i64 = 60_000;
 /// A rehearsal clears itself away once its scene has played and its line been read.
-const REHEARSAL_GONE: i64 = 12_000;
+const REHEARSAL_GONE: i64 = 16_000;
 /// Someone done for good (a subagent whose work is done, everyone in a closed session) leaves
 /// this long after they're home; a closed session leaves with the last of them.
 const DEPART: i64 = 2_000;
@@ -52,7 +53,10 @@ const DEPART: i64 = 2_000;
 const TEAM_LINE_AFTER: i64 = 800;
 /// A death anywhere has the stage this long from when its scene begins: the scene, the grave,
 /// its line read. Then the stage goes back.
-const DYING: i64 = 8_000;
+const DYING: i64 = 14_000;
+/// The longest a death scene takes at its own times, the holy hand grenade's. It plays `SLOW`
+/// times slower.
+const LAST_SCENE: i64 = 5300;
 /// A kill this recent still colours what a picked character thinks about.
 const JUST_KILLED: i64 = 60_000;
 /// Quiet lines (working, waiting) come at least this far apart in a session.
@@ -201,7 +205,7 @@ impl Method {
 
     /// Between one in a line and the next. The visitors take one at a time.
     fn spacing(self) -> i64 {
-        match self {
+        SLOW * match self {
             Method::Saucer => 1700,
             _ => LINE,
         }
@@ -210,7 +214,7 @@ impl Method {
     /// How long into the scene the floor under it goes, for the deaths that leave a hole.
     fn hole(self) -> Option<i64> {
         match self {
-            Method::Floor => Some(GIVE),
+            Method::Floor => Some(GIVE * SLOW),
             _ => None,
         }
     }
@@ -293,7 +297,7 @@ impl Act {
             Act::Split => SPLIT,
             Act::Sleep => 900,
             Act::Wake => 500,
-            Act::Die(_) => 3600,
+            Act::Die(_) => LAST_SCENE * SLOW,
             Act::Rise => 500,
         }
     }
@@ -346,7 +350,8 @@ struct Character {
     shape: Shape,
     who: Personality,
     session: usize,
-    /// Its place among the session's members, which spreads out characters sharing a spot.
+    /// Its place among the session's members, which spreads out characters sharing a spot and
+    /// lines up their exits. Someone who has left frees theirs for the next to arrive.
     k: usize,
     parent: Option<usize>,
     /// The one whose work it took over: it died, and reaper started this one in its place.
@@ -953,6 +958,10 @@ impl Mori {
             None => Shape::for_model(model.as_deref()),
         };
         let who = PERSONALITIES[(h >> 40) as usize % PERSONALITIES.len()];
+        let members = &self.sessions[s].members;
+        let k = (0..)
+            .find(|&k| !members.iter().any(|&m| self.actors[m].k == k && self.here(m, event.at)))
+            .unwrap_or(members.len());
         // A subagent lands near whoever spawned it; the loner, across the gap from everyone.
         let spot = match parent {
             Some(p) => match self.actors[p].spot {
@@ -975,7 +984,7 @@ impl Mori {
             shape,
             who,
             session: s,
-            k: self.sessions[s].members.len(),
+            k,
             parent,
             after,
             first_at: event.at,
