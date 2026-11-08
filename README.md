@@ -109,12 +109,12 @@ Each rule describes a violation privately and says what to do instead.
 |---|---|
 | `match` | Regexes over the call's arguments: `command` (each command the shell runs, and again with `sudo`, `timeout`, `uv run`, `python -m` and the like taken off, so `^pytest\b` fires on `cd api && uv run pytest` and not on `cat pytest.ini`), `script` (the whole shell command, for a pipe or a loop), `path` (any file read or written), `content` (the text written, never the text an edit replaces), or `"*"` for all of them as sent. Deterministic and instant. |
 | `judge` | A plain-English description, decided by the watcher model. |
-| `redirect` | The only thing the agent ever hears. Write it as an instruction, not a prohibition; `reaper lint` flags redirects that say "don't" or open with "if". After the agent's context is compacted, it hears the redirects it got since your last prompt again. |
+| `redirect` | The only thing the agent ever hears. Write it as an instruction, not a prohibition; `reaper lint` flags redirects that say "don't" or open with "if". After the agent's context is compacted, it hears the redirects it got since your last prompt again. When the watcher judged the call, the redirect ends with the agent's own words it found (`The part to change: "…"`), so in a long file the agent knows which sentence to change. |
 | `tools` | Only check these tools. `message` means what the agent says: only rules that list it look at replies, judged by their `text`. |
 | `action: stop` | Terminate on the first violation instead of redirecting. |
 | `strikes` | How many times an agent may break this rule, if not the global `strikes`. |
 | `free` | Only while free memory is below this (`4G`, Linux). The agent is told how much is free, so it can fit its next step to the room there is. |
-| `load` | Only while the load average is above this (`16`, Linux): the machine is busy. With `free` too, the rule applies while either is short. |
+| `load` | Only while the load average is above this (`16`, Linux): the machine is busy. With `free` too, the rule applies while either is short. A rule with `free` or `load` costs no strike, unless the agent keeps making the same call. |
 | `ask: true` | The agent may ask you to allow one blocked call: it runs `reaper ask "<why>"`, tries again, and you answer in its own permission prompt. Once per rule until your next prompt; no strike either way. |
 
 Global rules apply everywhere; project rules apply under the paths you list (`*` matches one

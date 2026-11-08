@@ -80,7 +80,8 @@ folder level, `**` any depth).
   `-n 2`.
 - When the trouble is the machine running out of room, add `free: 4G` (memory) or `load: 16`
   (busy). The rule then only applies while free memory is below that or the load is above it
-  (Linux), and the agent is told which.
+  (Linux), and the agent is told which. Being stopped by it costs the agent no strike, so the
+  redirect can send it on to other work ("Push and let CI run these tests").
 
 ## Examples
 

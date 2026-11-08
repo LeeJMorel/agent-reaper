@@ -528,8 +528,12 @@ impl Engine {
             return Decision::Ask { rule: rule.id.clone(), redirect, why };
         }
 
-        // A strike costs one over the rule's limit of the agent's allowance.
-        let share = 1.0 / f64::from(rule.limit(self.config.strikes));
+        // A strike costs one over the rule's limit of the agent's allowance. A rule that waits for
+        // the machine to be short (`free`, `load`) says "not now", which the agent couldn't have
+        // seen coming: it costs nothing, unless the agent keeps making the same call.
+        let waits = rule.free.is_some() || rule.load.is_some();
+        let share =
+            if waits && !self.repeated(c, &args) { 0.0 } else { 1.0 / f64::from(rule.limit(self.config.strikes)) };
         let (strike, mine) = self
             .store
             .update(&c.host, &c.agent, |s| {
@@ -587,6 +591,11 @@ impl Engine {
         if !short.is_empty() {
             redirect =
                 format!("This machine is {} right now ({}). {redirect}", short.join(" and "), figures.join(", "));
+        }
+        // What the watcher found, in the agent's own words: in a long file or PR body, the
+        // redirect alone doesn't say which sentence to change.
+        if let Some(quote) = &outcome.quote {
+            redirect = format!("{redirect} The part to change: \"{quote}\"");
         }
         if askable && !is_final {
             redirect = format!("{redirect} {ASKING}");
@@ -1014,6 +1023,40 @@ rules:
             matches!(run(&engine), Decision::Kill { ref redirect, .. } if redirect.starts_with("This machine is low on memory right now (4.0G free).")),
             "what can't be read isn't mentioned"
         );
+    }
+
+    #[test]
+    fn a_judged_kill_quotes_the_words_the_watcher_found() {
+        const ANSWER: &str = r#"{"choices":[{"message":{"content":"{\"violated\":[\"story\"],\"quote\":\"so an attacker can hide javascript: behind a tab\"}"}}]}"#;
+        let url = super::backend::tests::picky(Default::default(), "none", ANSWER);
+        let sandbox = Sandbox::new("quote");
+        let engine = sandbox.engine(&format!(
+            "watcher: {{ baseURL: '{url}', model: m }}\nrules: [{{ id: story, judge: telling how a check could be got around, tools: [write], redirect: Say what the code does. }}]"
+        ));
+        let file = "/** Reads the scheme.\n * Browsers skip control characters, so an attacker can hide javascript: behind a tab.\n */\nexport const x = 1;\n";
+        let out = engine.check(&call("write", json!({ "file_path": "a.ts", "content": file })));
+        assert!(
+            matches!(out, Decision::Kill { ref redirect, .. }
+                if redirect == "Say what the code does. The part to change: \"so an attacker can hide javascript: behind a tab\""),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn waiting_for_room_costs_nothing_unless_the_agent_keeps_making_the_same_call() {
+        let sandbox = Sandbox::new("room-free");
+        let mut engine = sandbox
+            .engine("repeats: 3\nrules: [{ id: suite, match: { command: pytest }, free: 12G, redirect: Push and let CI run them. }]");
+        engine.memory = || Some(4 << 30);
+        let run = |command: &str| engine.check(&call("bash", json!({ "command": command })));
+        for file in ["a_test.py", "b_test.py", "c_test.py", "d_test.py"] {
+            assert!(matches!(run(&format!("pytest {file}")), Decision::Kill { is_final: false, .. }), "{file}");
+        }
+        assert_eq!(engine.store.session("test", "s1").pressure, 0.0, "a short machine is no strike");
+        run("pytest a_test.py");
+        run("pytest a_test.py");
+        assert!(matches!(run("pytest a_test.py"), Decision::Kill { is_final: false, .. }));
+        assert!(engine.store.session("test", "s1").pressure > 0.0, "the same call over and over is");
     }
 
     #[test]

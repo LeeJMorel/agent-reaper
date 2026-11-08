@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 use reaper_core::paths;
 use serde::{Deserialize, Serialize};
 
+use super::watcher::Verdict;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Session {
     /// Kills per rule id.
@@ -294,14 +296,14 @@ impl Store {
     }
 
     /// An earlier watcher verdict for the same prefix and action.
-    pub fn verdict(&self, key: &str) -> Option<Vec<String>> {
+    pub fn verdict(&self, key: &str) -> Option<Verdict> {
         serde_json::from_slice(&fs::read(self.verdict_path(key)).ok()?).ok()
     }
 
-    pub fn remember(&self, key: &str, violated: &[String]) {
+    pub fn remember(&self, key: &str, verdict: &Verdict) {
         let path = self.verdict_path(key);
         let _ = fs::create_dir_all(path.parent().expect("verdict dir"));
-        let _ = fs::write(path, serde_json::to_vec(violated).unwrap_or_default());
+        let _ = fs::write(path, serde_json::to_vec(verdict).unwrap_or_default());
     }
 
     fn good_rules_path(&self) -> PathBuf {

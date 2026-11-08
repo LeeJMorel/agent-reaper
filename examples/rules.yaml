@@ -53,6 +53,7 @@ rules:
 
   # `free` applies a rule only while free memory is below it (Linux), and the agent is told
   # how much is free. Here, test runs that name no test file (or variable) wait for room.
+  # Being stopped for want of room costs no strike.
   # - id: whole-test-suite
   #   tools: [bash]
   #   match: { command: '^(pytest|vitest|jest|(npm|pnpm|yarn) (run )?test)\b(?!.*(::|\.(py|[jt]sx?)\b|\$))' }

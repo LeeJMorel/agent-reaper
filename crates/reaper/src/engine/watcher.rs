@@ -6,6 +6,7 @@
 use std::time::{Duration, Instant};
 
 use reaper_core::rules::{Room, Rule};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::backend::Backend;
@@ -39,10 +40,24 @@ pub struct Outcome<'a> {
     pub ms: u64,
     /// Why the watcher could not answer, when `tier` is `Error`.
     pub error: Option<String>,
+    /// The agent's own words that the watcher found break the rule (see `own_words`).
+    pub quote: Option<String>,
 }
 
 /// Room for the verdict, and a little thinking around it.
 const ANSWER_TOKENS: u32 = 400;
+
+/// The longest quote an agent hears back, in characters.
+const MAX_QUOTE: usize = 240;
+
+/// What the watcher answered: the ids of the rules the action breaks, and the words in it that
+/// break them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Verdict {
+    pub violated: Vec<String>,
+    #[serde(default)]
+    pub quote: String,
+}
 
 pub struct Settings<'a> {
     pub backend: Option<&'a dyn Backend>,
@@ -54,18 +69,59 @@ pub struct Settings<'a> {
     pub room: Room,
 }
 
-/// The ids in a watcher reply like `{"violated": ["a"]}`, tolerating text around the JSON.
-pub fn parse_verdict(reply: &str) -> Vec<String> {
-    let (Some(start), Some(end)) = (reply.find('{'), reply.rfind('}')) else { return Vec::new() };
+/// A watcher reply like `{"violated": ["a"], "quote": "…"}`, tolerating text around the JSON
+/// and a reply without a quote.
+pub fn parse_verdict(reply: &str) -> Verdict {
+    let (Some(start), Some(end)) = (reply.find('{'), reply.rfind('}')) else { return Verdict::default() };
     if end < start {
-        return Vec::new();
+        return Verdict::default();
     }
-    serde_json::from_str::<Value>(&reply[start..=end])
-        .ok()
-        .and_then(|v| {
-            v["violated"].as_array().map(|ids| ids.iter().filter_map(|id| id.as_str().map(String::from)).collect())
-        })
-        .unwrap_or_default()
+    let Ok(v) = serde_json::from_str::<Value>(&reply[start..=end]) else { return Verdict::default() };
+    Verdict {
+        violated: v["violated"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(|id| id.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        quote: v["quote"].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+/// The watcher's quote, when it is the agent's own words from this call, so the agent hears back
+/// only what it wrote, never something the watcher made up. Text an edit replaces doesn't count:
+/// the agent is taking it out.
+fn own_words(quote: &str, args: &Value) -> Option<String> {
+    fn written<'v>(value: &'v Value, out: &mut Vec<&'v str>) {
+        match value {
+            Value::String(s) => out.push(s),
+            Value::Array(items) => items.iter().for_each(|v| written(v, out)),
+            Value::Object(map) => map.iter().filter(|(k, _)| !k.starts_with("old")).for_each(|(_, v)| written(v, out)),
+            _ => {}
+        }
+    }
+    let quote = plain(quote);
+    let quote = quote.trim_matches(|c: char| c.is_whitespace() || "\"'…".contains(c));
+    let quote = quote.trim_start_matches("...").trim_end_matches("...").trim();
+    if quote.chars().count() < 8 {
+        return None;
+    }
+    let mut texts = Vec::new();
+    written(args, &mut texts);
+    if !texts.into_iter().any(|t| plain(t).contains(quote)) {
+        return None;
+    }
+    Some(match quote.char_indices().nth(MAX_QUOTE) {
+        Some((cut, _)) => format!("{}…", quote[..cut].trim_end()),
+        None => quote.to_string(),
+    })
+}
+
+/// Text as the watcher may copy it from the JSON it was shown: escapes read, every run of
+/// whitespace one space, and without the comment marks a quote leaves out where a comment runs
+/// on to the next line (`*`, `//`, `#`).
+fn plain(text: &str) -> String {
+    let text = text.replace("\\n", " ").replace("\\t", " ").replace("\\\"", "\"");
+    let words = text.split_whitespace().filter(|w| !w.chars().all(|c| "/*#".contains(c)));
+    words.collect::<Vec<_>>().join(" ")
 }
 
 pub fn check<'a>(
@@ -84,6 +140,7 @@ pub fn check<'a>(
         judged,
         ms: start.elapsed().as_millis() as u64,
         error,
+        quote: None,
     };
     // Only rules in force can be broken, but the watcher's prompt lists them all, so its
     // prefix stays the same as memory comes and goes.
@@ -104,18 +161,19 @@ pub fn check<'a>(
 
     let prompt = layout(global, project, goal, tool, args);
     let key = hash(&[&prompt.prefix_id, tool, &canonical(args)]);
-    let (violated, tier) = match store.verdict(&key) {
-        Some(violated) => (violated, Tier::Cache),
+    let (verdict, tier) = match store.verdict(&key) {
+        Some(verdict) => (verdict, Tier::Cache),
         None => match backend.complete(&prompt, settings.timeout, ANSWER_TOKENS) {
             Ok(reply) => {
-                let violated = parse_verdict(&reply);
-                store.remember(&key, &violated);
-                (violated, Tier::Watcher)
+                let verdict = parse_verdict(&reply);
+                store.remember(&key, &verdict);
+                (verdict, Tier::Watcher)
             }
             Err(error) => return done(settings.kill_on_error.then(|| candidates[0]), Tier::Error, true, Some(error)),
         },
     };
-    done(candidates.into_iter().find(|r| violated.contains(&r.id)), tier, true, None)
+    let rule = candidates.into_iter().find(|r| verdict.violated.contains(&r.id));
+    Outcome { quote: rule.and_then(|_| own_words(&verdict.quote, args)), ..done(rule, tier, true, None) }
 }
 
 #[cfg(test)]
@@ -232,9 +290,50 @@ mod tests {
 
     #[test]
     fn verdict_parsing_tolerates_chatter_and_junk() {
-        assert_eq!(parse_verdict("<think>hm</think>\n{\"violated\": [\"a\", \"b\"]}"), ["a", "b"]);
-        assert!(parse_verdict("no json here").is_empty());
-        assert!(parse_verdict(r#"{"violated": "a"}"#).is_empty());
-        assert!(parse_verdict("} {").is_empty());
+        assert_eq!(parse_verdict("<think>hm</think>\n{\"violated\": [\"a\", \"b\"]}").violated, ["a", "b"]);
+        assert_eq!(
+            parse_verdict(r#"{"violated": ["a"], "quote": "an attacker could"}"#),
+            Verdict { violated: vec!["a".into()], quote: "an attacker could".into() }
+        );
+        assert_eq!(parse_verdict("no json here"), Verdict::default());
+        assert!(parse_verdict(r#"{"violated": "a"}"#).violated.is_empty());
+        assert_eq!(parse_verdict("} {"), Verdict::default());
+    }
+
+    #[test]
+    fn the_agent_hears_back_only_its_own_words() {
+        let config =
+            parse("rules: [{ id: story, judge: telling how a check could be got around, tools: [write, edit] }]")
+                .unwrap();
+        let rules: Vec<&Rule> = config.rules.iter().collect();
+        let file = "/** Reads the scheme.\n *\n * Browsers skip control characters, so an attacker can\n * hide javascript: behind a tab.\n */\nexport const x = 1;\n";
+        let quoted = |quote: &str, args: &Value| {
+            let reply = json!({ "violated": ["story"], "quote": quote }).to_string();
+            let backend = fake(&reply);
+            check(&[], &rules, "", "write", args, &settings(&backend), &store(&format!("quote-{}", quote.len()))).quote
+        };
+        let write = json!({ "path": "a.ts", "content": file });
+        assert_eq!(
+            quoted("so an attacker can\\n * hide javascript: behind a tab.", &write).as_deref(),
+            Some("so an attacker can hide javascript: behind a tab."),
+            "copied from the JSON it was shown, line breaks and all"
+        );
+        assert_eq!(
+            quoted("Browsers skip control characters, so an attacker can hide javascript: behind a tab.", &write)
+                .as_deref(),
+            Some("Browsers skip control characters, so an attacker can hide javascript: behind a tab."),
+            "across a line break, without the comment's *"
+        );
+        assert_eq!(quoted("an attacker could read every guild's rows", &write), None, "words it made up");
+        assert_eq!(quoted("tab", &write), None, "too short to point at anything");
+        let edit = json!({ "path": "a.ts", "old_string": file, "new_string": "/** Reads the scheme. */\n", "content": "/** Reads the scheme. */\n" });
+        assert_eq!(quoted("so an attacker can", &edit), None, "what an edit takes out");
+        let long = format!("{} the end.", "word ".repeat(100));
+        let said = quoted(&long, &json!({ "path": "a.ts", "content": format!("{long}\n{long}") })).unwrap();
+        assert!(said.chars().count() <= MAX_QUOTE + 1 && said.ends_with('…'), "{said}");
+        let reply = json!({ "violated": [], "quote": "so an attacker can hide javascript" }).to_string();
+        let backend = fake(&reply);
+        let o = check(&[], &rules, "", "write", &write, &settings(&backend), &store("quote-pass"));
+        assert_eq!((o.rule.is_some(), o.quote), (false, None), "no rule broken, nothing to quote");
     }
 }

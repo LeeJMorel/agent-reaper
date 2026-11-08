@@ -182,12 +182,16 @@ struct OpenAi<'a> {
     store: &'a Store,
 }
 
-/// The verdict's JSON schema: it can name only the rules' ids.
+/// The verdict's JSON schema: it can name only the rules' ids, and quotes the words that break
+/// them. Strict schemas need every property required, so an empty quote stands for none.
 fn verdict(ids: &[String]) -> Value {
     json!({
         "type": "object",
-        "properties": { "violated": { "type": "array", "items": { "type": "string", "enum": ids } } },
-        "required": ["violated"],
+        "properties": {
+            "violated": { "type": "array", "items": { "type": "string", "enum": ids } },
+            "quote": { "type": "string" },
+        },
+        "required": ["violated", "quote"],
         "additionalProperties": false,
     })
 }
@@ -297,13 +301,13 @@ impl Backend for ClaudeCode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
     /// An endpoint that turns down one parameter, the way OpenAI's non-reasoning models do
     /// `reasoning_effort`, and otherwise sends `answer`.
-    fn picky(bodies: Arc<Mutex<Vec<Value>>>, refuses: &'static str, answer: &'static str) -> String {
+    pub(crate) fn picky(bodies: Arc<Mutex<Vec<Value>>>, refuses: &'static str, answer: &'static str) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -539,7 +543,7 @@ mod tests {
             let args = json!({ "command": command });
             let prompt = super::super::prefix::layout(&[&config.rules[0]], &[], "fix the signup bug", "bash", &args);
             let reply = backend.complete(&prompt, Duration::from_secs(20), 400).unwrap();
-            assert_eq!(super::super::watcher::parse_verdict(&reply), verdict, "{command}: {reply}");
+            assert_eq!(super::super::watcher::parse_verdict(&reply).violated, verdict, "{command}: {reply}");
         }
     }
 
