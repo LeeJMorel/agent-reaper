@@ -311,7 +311,11 @@ fn self_rules() -> [Rule; 2] {
         tools: None,
         pattern: Some([(arg.to_string(), escaped.join("|"))].into()),
         judge: None,
-        redirect: Some("Continue the task using the files inside the project workspace.".into()),
+        redirect: Some(
+            "Leave reaper's own directories out of it; the rest of the system is fine. For rules, \
+             `reaper rules` lists them and `reaper rules guide` shows how to write one."
+                .into(),
+        ),
         action: None,
         strikes: None,
         free: None,

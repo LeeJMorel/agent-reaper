@@ -15,7 +15,8 @@ use reaper_core::paths::{self, tilde};
 use reaper_core::rules::{ParseError, parse};
 
 /// How to write a rule (SKILL.md, beside Cargo.toml): the console's writer gets it as its
-/// instructions, and `reaper install claude-code` offers it to Claude Code as a skill.
+/// instructions, `reaper install claude-code` offers it to Claude Code as a skill, and
+/// `reaper rules guide` prints it for any agent.
 pub const SKILL: &str = include_str!("../SKILL.md");
 
 fn usage() -> String {
@@ -30,6 +31,7 @@ usage:
   reaper uninstall AGENT         stop guarding them (when an agent runs it, you're asked first)
   reaper lint [FILE]             check a rules file
   reaper rules [--json] [FILE]   show the rules (--json: for scripts)
+  reaper rules guide             how to write a rule (the reaper-rule skill)
   reaper rules add [--check]     add the rule snippet on stdin, once its examples pass
                                  (the reaper-rule skill; in the console, press n on the rules tab)
   reaper rules add --replace     write it over the rule with its id, in its place
@@ -170,6 +172,10 @@ fn show_rules(args: &[String]) -> Result<ExitCode, String> {
     match args.first().map(String::as_str) {
         Some("add") => return add_rule(&args[1..]),
         Some("remove") => return remove_rule(&args[1..]),
+        Some("guide") => {
+            print!("{SKILL}");
+            return Ok(ExitCode::SUCCESS);
+        }
         _ => {}
     }
     let (path, text) = read_rules(args)?;

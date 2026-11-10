@@ -698,7 +698,8 @@ fn peel(words: &[String]) -> Option<Vec<String>> {
                 if w == "-m" {
                     break rest.get(i + 1..)?;
                 }
-                if w == "-c" {
+                // `-` reads the program from stdin, often a heredoc, which is code, not a path.
+                if w == "-c" || w == "-" {
                     return None;
                 }
                 if !w.starts_with('-') {
@@ -711,7 +712,7 @@ fn peel(words: &[String]) -> Option<Vec<String>> {
             if rest
                 .iter()
                 .take_while(|w| w.starts_with('-'))
-                .any(|w| ["-e", "--eval", "-p", "--print"].contains(&w.as_str())) =>
+                .any(|w| ["-e", "--eval", "-p", "--print", "-"].contains(&w.as_str())) =>
         {
             return None;
         }
@@ -853,6 +854,9 @@ mod tests {
         for alone in ["command -v git", "python3 -c 'print(1)'", "node -e 'x()'", "timeout 60", "sudo -v", "git status"]
         {
             assert_eq!(forms(alone).len(), 1, "{alone}");
+        }
+        for stdin in ["python3 - <<'EOF'\nprint(\"backend/vitest\")\nEOF", "node - <<'EOF'\nrun('bin/pytest')\nEOF"] {
+            assert_eq!(forms(stdin).len(), 1, "a program on stdin is code, not a command: {stdin}");
         }
     }
 
