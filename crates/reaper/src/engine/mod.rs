@@ -483,6 +483,9 @@ impl Engine {
             if let Some(error) = &outcome.error {
                 fields["error"] = error.clone().into();
             }
+            if let Some(by) = &outcome.by {
+                fields["by"] = by.clone().into();
+            }
             self.event(&c.host, &c.agent, "agent.checked", fields);
         }
         let looping = loop_rule();

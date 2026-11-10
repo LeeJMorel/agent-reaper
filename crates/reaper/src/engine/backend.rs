@@ -19,6 +19,7 @@
 //! claude-haiku-5-5, 2.3 to 3 s a check, of which starting it was 0.5 to 1 s. Without the
 //! schema it answered in half the time and missed a production query, so the schema stays.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -40,6 +41,12 @@ const ANTHROPIC_EXTRAS: [&str; 2] = ["thinking", "output_config"];
 
 pub trait Backend {
     fn complete(&self, prompt: &Prompt, timeout: Duration, max_tokens: u32) -> Result<String, String>;
+
+    /// Which endpoint gave the last answer, when there's a choice of them (see `Chain`), so a
+    /// verdict can be traced to the model that made it.
+    fn answered_by(&self) -> Option<String> {
+        None
+    }
 }
 
 /// All the time a check spends on watchers, fallbacks included. Claude Code gives a hook 30 s
@@ -57,7 +64,7 @@ pub fn from_config<'a>(watcher: &Watcher, store: &'a Store) -> Option<Box<dyn Ba
     match endpoints.len() {
         0 => None,
         1 => endpoints.pop().map(|(_, backend)| backend),
-        _ => Some(Box::new(Chain { endpoints, store })),
+        _ => Some(Box::new(Chain { endpoints, store, answered: RefCell::default() })),
     }
 }
 
@@ -99,6 +106,7 @@ fn one<'a>(watcher: &Watcher, store: &'a Store) -> Option<Box<dyn Backend + 'a>>
 struct Chain<'a> {
     endpoints: Vec<(String, Box<dyn Backend + 'a>)>,
     store: &'a Store,
+    answered: RefCell<Option<String>>,
 }
 
 impl Backend for Chain<'_> {
@@ -116,6 +124,7 @@ impl Backend for Chain<'_> {
             match backend.complete(prompt, timeout.min(left), max_tokens) {
                 Ok(reply) => {
                     self.store.set_down(name, None);
+                    self.answered.replace(Some(name.clone()));
                     return Ok(reply);
                 }
                 Err(error) => {
@@ -125,6 +134,10 @@ impl Backend for Chain<'_> {
             }
         }
         Err(errors.join("; then "))
+    }
+
+    fn answered_by(&self) -> Option<String> {
+        self.answered.borrow().clone()
     }
 }
 
@@ -377,6 +390,7 @@ pub(crate) mod tests {
                 })
                 .collect(),
             store: &store,
+            answered: RefCell::default(),
         };
         let prompt = Prompt {
             system: Default::default(),
@@ -424,6 +438,7 @@ pub(crate) mod tests {
         };
         assert_eq!(backend.complete(&prompt, Duration::from_secs(5), 10).unwrap(), r#"{"violated":["prod"]}"#);
         assert!(store.down().contains_key("http://127.0.0.1:1/v1 m"));
+        assert_eq!(backend.answered_by(), Some(format!("{url}/v1 m")), "the fallback answered");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

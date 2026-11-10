@@ -42,6 +42,8 @@ pub struct Outcome<'a> {
     pub error: Option<String>,
     /// The agent's own words that the watcher found break the rule (see `own_words`).
     pub quote: Option<String>,
+    /// The watcher or fallback that answered, when one of several did.
+    pub by: Option<String>,
 }
 
 /// Room for the verdict, and a little thinking around it.
@@ -141,6 +143,7 @@ pub fn check<'a>(
         ms: start.elapsed().as_millis() as u64,
         error,
         quote: None,
+        by: None,
     };
     // Only rules in force can be broken, but the watcher's prompt lists them all, so its
     // prefix stays the same as memory comes and goes.
@@ -173,7 +176,8 @@ pub fn check<'a>(
         },
     };
     let rule = candidates.into_iter().find(|r| verdict.violated.contains(&r.id));
-    Outcome { quote: rule.and_then(|_| own_words(&verdict.quote, args)), ..done(rule, tier, true, None) }
+    let by = (tier == Tier::Watcher).then(|| backend.answered_by()).flatten();
+    Outcome { quote: rule.and_then(|_| own_words(&verdict.quote, args)), by, ..done(rule, tier, true, None) }
 }
 
 #[cfg(test)]
