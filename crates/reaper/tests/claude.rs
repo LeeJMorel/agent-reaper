@@ -502,7 +502,11 @@ fn a_stopped_session_compacted_carries_on_with_a_clean_slate() {
     let mut terminal = Terminal::open(h.command(SCRIPT), &line);
     terminal.screen.wait_for("/clear starts a fresh", 1);
     terminal.press(b"/compact\r");
-    terminal.screen.wait_for("clean slate", 1);
+    // Not the hook's line on screen: Claude Code redraws only the cells that changed, so the
+    // text can arrive split by cursor moves.
+    common::wait_until("it to carry on after compacting", || {
+        events(&h.home).iter().filter(|e| e["type"] == "agent.spawned" && e["parent"].is_null()).count() == 2
+    });
     terminal.press(b"go on\r");
     common::wait_until("it to do it", || h.project.join("allowed.txt").exists());
     terminal.press(b"/exit\r");
