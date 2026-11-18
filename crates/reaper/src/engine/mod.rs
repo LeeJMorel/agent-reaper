@@ -91,6 +91,9 @@ pub enum Decision {
 pub(crate) const ASKING: &str =
     "If this case needs it anyway, run reaper ask \"<why>\" and then make the same call again; the person decides.";
 
+/// What `reaper ask` answers, the call it's about set to go to the person when it's made again.
+pub(crate) const ASKED: &str = "Asked. Make the same call again: the person sees your reason and decides.";
+
 /// What an agent hears when it would change reaper and nobody can be asked.
 pub(crate) const FOR_THE_PERSON: &str =
     "Changing what reaper guards is the person's to do. Ask them to run it themselves.";
@@ -211,15 +214,21 @@ fn changes_reaper(c: &Check) -> Option<String> {
     (!said.is_empty()).then(|| said.join(" and "))
 }
 
-/// Where a call works: the session's directory, the file it names, and wherever its commands
-/// `cd` to. A project's rules apply when any of them is inside the project.
+/// Where a call works: the file it names, or the session's directory and wherever its commands
+/// `cd` to. A project's rules apply when any of them is inside the project. A file is where a
+/// file tool works, wherever the session is, and a command that starts by changing directory
+/// runs nothing in the session's.
 pub(crate) fn places(dir: &Path, args: &Value) -> Vec<PathBuf> {
-    let mut places = vec![dir.to_path_buf()];
     if let Some(path) = args["path"].as_str() {
-        places.push(resolve(dir, path));
+        return vec![resolve(dir, path)];
     }
+    let commands = shell::commands(args["command"].as_str().unwrap_or_default());
+    let leaves = commands
+        .first()
+        .is_some_and(|words| matches!(words[0].as_str(), "cd" | "pushd") && words.get(1).is_none_or(|to| to != "-"));
+    let mut places = if leaves { Vec::new() } else { vec![dir.to_path_buf()] };
     let mut here = dir.to_path_buf();
-    for words in shell::commands(args["command"].as_str().unwrap_or_default()) {
+    for words in commands {
         if matches!(words[0].as_str(), "cd" | "pushd") {
             match words[1..].iter().find(|w| *w == "-" || !w.starts_with('-')) {
                 Some(back) if back == "-" => continue,
@@ -614,10 +623,22 @@ impl Engine {
     /// about once more.
     pub fn restart(&self, host: &str, session: &str) {
         let team = self.store.session(host, session).team;
-        if team.stopped.is_some() || !team.asked.is_empty() {
+        // Stopped together, they all start over: kept, one agent's old strikes would stop
+        // everyone again at the next one.
+        if team.stopped.is_some() {
+            for member in team.members.iter().filter(|m| *m != session) {
+                let _ = self.store.update(host, member, |s| s.wipe_record());
+            }
+            let _ = self.store.update(host, session, |s| s.wipe_record());
+            self.event(host, session, "agent.revived", json!({}));
+        }
+        // The team is whoever works on this prompt: helpers that finished on an earlier one stop
+        // counting, and one still going joins again, with its record, at its next call.
+        if !team.members.is_empty() || !team.asked.is_empty() {
             let _ = self.store.update(host, session, |s| {
                 s.team.stopped = None;
                 s.team.asked.clear();
+                s.team.members.clear();
             });
         }
     }
@@ -650,7 +671,7 @@ impl Engine {
             return note("The person has answered about this already, until their next message. Continue another way.");
         }
         let _ = self.store.update(&c.host, &c.agent, |s| s.asking = Some((rule.clone(), call.clone(), why.clone())));
-        note("Asked. Make the same call again: the person sees your reason and decides.")
+        note(ASKED)
     }
 }
 
@@ -779,6 +800,27 @@ rules:
         assert_eq!(as_("s1", "ls"), Decision::Stopped { rule: "push".into() }, "the main agent too");
         engine.restart("test", "s1");
         assert_eq!(as_("s1", "ls"), Decision::Allow, "a new prompt starts again");
+        assert!(
+            matches!(as_("b", "push 3"), Decision::Kill { strike: 1, is_final: false, .. }),
+            "with a clean record for everyone stopped, not a strike away from stopping them all again"
+        );
+        assert!(matches!(as_("c", "push"), Decision::Kill { is_final: false, .. }), "a new helper too");
+
+        // Helpers that went too far on an earlier prompt and finished stop counting on the next.
+        let sandbox = Sandbox::new("together-later");
+        let engine = sandbox.engine("strikes: 1\nrules: [{ id: push, match: { command: push } }]");
+        let as_ = |agent: &str, command: &str| {
+            engine.check(&Check { agent: agent.into(), ..call("bash", json!({ "command": command })) })
+        };
+        assert_eq!(as_("s1", "ls"), Decision::Allow);
+        assert!(matches!(as_("old", "push"), Decision::Kill { is_final: true, .. }));
+        engine.restart("test", "s1");
+        assert_eq!(as_("s1", "ls"), Decision::Allow);
+        assert!(
+            matches!(as_("new", "push"), Decision::Kill { is_final: true, .. }),
+            "the new helper goes alone, without the finished one taking everyone with it"
+        );
+        assert_eq!(as_("s1", "ls"), Decision::Allow);
 
         // A big team gets no more room: two going too far stop everyone.
         let sandbox = Sandbox::new("together-big");
@@ -1168,6 +1210,19 @@ rules:
         assert!(broke(from_tools("bash", json!({ "command": "cd ../app && pytest" })), "suite"));
         assert_eq!(from_tools("bash", json!({ "command": "pytest" })), Decision::Allow, "not in the project");
         assert_eq!(from_tools("Edit", json!({ "file_path": "/work/tools/generated/x.ts" })), Decision::Allow);
+        let from_app = |tool: &str, args: Value| engine.check(&Check { dir: "/work/app".into(), ..call(tool, args) });
+        assert!(broke(from_app("bash", json!({ "command": "pytest" })), "suite"), "where the session is");
+        assert_eq!(
+            from_app("bash", json!({ "command": "cd /work/tools && pytest" })),
+            Decision::Allow,
+            "gone to another checkout before running anything"
+        );
+        assert!(broke(from_app("bash", json!({ "command": "ls; cd /work/tools && pytest" })), "suite"), "ls ran here");
+        assert_eq!(
+            from_app("Write", json!({ "file_path": "/tmp/scratch/generated/x.ts", "content": "" })),
+            Decision::Allow,
+            "a file outside the project, written from it"
+        );
         assert_eq!(resolve(Path::new("/a/b"), "../c/./d"), PathBuf::from("/a/c/d"));
         assert_eq!(resolve(Path::new("/a"), "$HOME/x"), paths::home().join("x"));
     }

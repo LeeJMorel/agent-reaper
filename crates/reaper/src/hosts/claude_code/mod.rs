@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use reaper_core::rules::MESSAGE;
 
-use crate::engine::{CARRY_ON, Check, Decision, Engine, FOR_THE_PERSON};
+use crate::engine::{ASKED, CARRY_ON, Check, Decision, Engine, FOR_THE_PERSON};
 
 pub const HOST: &str = "claude-code";
 
@@ -82,6 +82,58 @@ fn cleared_from(engine: &Engine) -> Option<String> {
 /// modes that never ask.
 fn unattended(event: &Value) -> bool {
     matches!(event["permission_mode"].as_str(), Some("auto" | "bypassPermissions" | "dontAsk"))
+}
+
+/// The answer that lets one blocked call through, when the person is asked with Claude Code's
+/// question tool.
+const ALLOW_ONCE: &str = "Allow once";
+
+/// What `reaper ask` answers when nobody sees Claude Code's permission prompts (auto mode and
+/// the modes that skip them): its question tool still reaches the person, in every mode.
+const ASK_BY_QUESTION: &str = "Ask the person with AskUserQuestion: say what the blocked call does and why it's needed, \
+     with the options \"Allow once\" and \"Don't\". Then make the same call again; it runs only if they pick Allow once.";
+
+/// A subagent has no question tool to reach the person with.
+const ASK_THROUGH_MAIN: &str =
+    "Only the main agent can ask the person. Say in your report that this call needs their go-ahead, and why.";
+
+const NOT_ALLOWED: &str = "The person didn't allow it. Continue the task another way.";
+const NOT_ASKED: &str =
+    "The person wasn't asked with AskUserQuestion, so it stays blocked. Continue the task another way.";
+
+/// What the person picked when asked with the question tool since the agent's latest
+/// `reaper ask`: whether it was Allow once, or `None` if nothing was asked and answered. Claude
+/// Code writes the answer from the person's own choice.
+fn question_answer(path: &str) -> Option<bool> {
+    let text = fs::read_to_string(path).ok()?;
+    let (mut questions, mut answer) = (Vec::<String>::new(), None);
+    for entry in text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        for block in entry["message"]["content"].as_array().into_iter().flatten() {
+            match block["type"].as_str() {
+                Some("tool_use") if block["name"] == "Bash" => {
+                    let words: Vec<&str> =
+                        block["input"]["command"].as_str().unwrap_or_default().split_whitespace().take(2).collect();
+                    if let [program, "ask"] = words.as_slice()
+                        && (*program == "reaper" || program.ends_with("/reaper"))
+                    {
+                        questions.clear();
+                        answer = None;
+                    }
+                }
+                Some("tool_use") if block["name"] == "AskUserQuestion" => {
+                    questions.extend(block["id"].as_str().map(String::from));
+                }
+                Some("tool_result")
+                    if block["tool_use_id"].as_str().is_some_and(|id| questions.iter().any(|q| q == id)) =>
+                {
+                    let answers = entry["toolUseResult"]["answers"].as_object();
+                    answer = Some(answers.is_some_and(|a| a.values().any(|v| v == ALLOW_ONCE)));
+                }
+                _ => {}
+            }
+        }
+    }
+    answer
 }
 
 /// For sessions that started before reaper was installed, so no `UserPromptSubmit` recorded
@@ -384,6 +436,24 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
                 }
                 Decision::Kill { rule, is_final: true, .. } => Some(refused(died(&rule, false))),
                 Decision::Stopped { rule } => Some(refused(died(&rule, true))),
+                // Nobody sees permission prompts: the person was asked with the question tool, or
+                // wasn't asked at all.
+                Decision::Ask { rule, .. } if unattended(event) => {
+                    let allowed = (agent == session)
+                        .then(|| event["transcript_path"].as_str().and_then(question_answer))
+                        .flatten();
+                    engine.event(
+                        HOST,
+                        agent,
+                        "agent.answered",
+                        json!({ "rule": rule, "allowed": allowed == Some(true) }),
+                    );
+                    match allowed {
+                        Some(true) => None,
+                        Some(false) => Some(deny(NOT_ALLOWED)),
+                        None => Some(deny(NOT_ASKED)),
+                    }
+                }
                 // Claude Code's own permission prompt: only the person can answer it.
                 Decision::Ask { rule, redirect, why } => Some(json!({
                     "hookSpecificOutput": {
@@ -392,6 +462,9 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
                         "permissionDecisionReason": format!("reaper: allow this call just once? It breaks the rule {rule} ({redirect}) The agent's reason: {why}"),
                     }
                 })),
+                Decision::Noted { message } if message == ASKED && unattended(event) => {
+                    Some(deny(if agent == session { ASK_BY_QUESTION } else { ASK_THROUGH_MAIN }))
+                }
                 Decision::Noted { message } => Some(deny(&message)),
                 // Changing reaper itself: the person decides, in the same prompt. A session that
                 // never prompts can't ask them.
@@ -506,6 +579,60 @@ mod tests {
             "{reason}"
         );
         assert!(out.get("continue").is_none(), "nothing is stopped");
+    }
+
+    #[test]
+    fn with_nobody_seeing_permission_prompts_the_person_is_asked_with_the_question_tool() {
+        let sandbox = Sandbox::new("cc-ask-auto");
+        let engine = sandbox.engine(
+            "strikes: 3\nrules: [{ id: no-prod, tools: [bash], match: { command: prod }, redirect: Use the staging database., ask: true }]",
+        );
+        let transcript = sandbox.root.join("s1.jsonl");
+        let call = |id: &str, name: &str, input: Value| json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": id, "name": name, "input": input }] } });
+        let answered = |id: &str, choice: &str| {
+            json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": "answered" }] },
+                    "toolUseResult": { "questions": [], "answers": { "Run the query on prod?": choice } } })
+        };
+        let write = |lines: &[Value]| {
+            fs::write(&transcript, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        };
+        let auto = |agent: Option<&str>, command: &str| {
+            let mut event = pre_tool_use(command);
+            event["permission_mode"] = "auto".into();
+            event["transcript_path"] = transcript.to_string_lossy().into();
+            if let Some(agent) = agent {
+                event["agent_id"] = agent.into();
+            }
+            reply(&engine, &event)
+        };
+        let ask = call("t1", "Bash", json!({ "command": "reaper ask 'read-only query for the incident'" }));
+        let question = call("q1", "AskUserQuestion", json!({ "questions": [] }));
+
+        // Allowed once: that call runs, and the next one like it is blocked as before.
+        auto(None, "psql prod");
+        assert_eq!(auto(None, "reaper ask 'read-only query for the incident'"), Some(deny(ASK_BY_QUESTION)));
+        write(&[answered("q0", ALLOW_ONCE), ask.clone(), question.clone(), answered("q1", ALLOW_ONCE)]);
+        assert_eq!(auto(None, "psql prod"), None, "the person picked Allow once");
+        assert!(sandbox.events().ends_with(&["agent.asked".into(), "agent.answered".into()]));
+        assert_eq!(auto(None, "psql prod"), Some(deny("Use the staging database.")), "once");
+
+        // Refused, or never asked: still blocked.
+        engine.restart(HOST, "s1");
+        auto(None, "psql prod -c 2");
+        auto(None, "reaper ask 'again'");
+        write(&[ask.clone(), question.clone(), answered("q1", "Don't")]);
+        assert_eq!(auto(None, "psql prod -c 2"), Some(deny(NOT_ALLOWED)));
+        engine.restart(HOST, "s1");
+        auto(None, "psql prod -c 3");
+        auto(None, "reaper ask 'again'");
+        write(&[question, answered("q1", ALLOW_ONCE), ask]);
+        assert_eq!(auto(None, "psql prod -c 3"), Some(deny(NOT_ASKED)), "an answer from before the ask doesn't count");
+
+        // A subagent can't reach the person itself.
+        engine.restart(HOST, "s1");
+        auto(Some("sub"), "psql prod -c 4");
+        assert_eq!(auto(Some("sub"), "reaper ask 'needed'"), Some(deny(ASK_THROUGH_MAIN)));
+        assert_eq!(auto(Some("sub"), "psql prod -c 4"), Some(deny(NOT_ASKED)));
     }
 
     #[test]
