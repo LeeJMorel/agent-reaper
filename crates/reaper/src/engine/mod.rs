@@ -91,6 +91,13 @@ pub enum Decision {
 pub(crate) const ASKING: &str =
     "If this case needs it anyway, run reaper ask \"<why>\" and then make the same call again; the person decides.";
 
+/// What's said when a session is stopped, on every host: to the human, and to whatever carries
+/// its work on (a parent agent, a script, an agent briefing a fresh one). The way to go on,
+/// `redirect`, never the rule.
+pub fn stopped(redirect: &str) -> String {
+    format!("reaper stopped this session. To carry on its work: {redirect}")
+}
+
 /// What `reaper ask` answers, the call it's about set to go to the person when it's made again.
 pub(crate) const ASKED: &str = "Asked. Make the same call again: the person sees your reason and decides.";
 
@@ -438,6 +445,19 @@ impl Engine {
 
     pub fn relieve(&self, crowding: bool) {
         pressure::relieve(&self.config, &self.store, crowding);
+    }
+
+    /// What rule `id` tells an agent to do instead: for whatever carries on a session it stopped.
+    pub fn redirect_of(&self, id: &str) -> String {
+        let (own, looping) = (self_rules(), loop_rule());
+        self.config
+            .all_rules()
+            .map(|(_, r)| r)
+            .chain(&own)
+            .chain([&looping])
+            .find(|r| r.id == id)
+            .and_then(|r| r.redirect.clone())
+            .unwrap_or_else(|| DEFAULT_REDIRECT.to_string())
     }
 
     pub fn check(&self, c: &Check) -> Decision {

@@ -16,13 +16,10 @@ use serde_json::{Value, json};
 
 use reaper_core::rules::MESSAGE;
 
-use crate::engine::{ASKED, CARRY_ON, Check, Decision, Engine, FOR_THE_PERSON};
+use crate::engine::{ASKED, CARRY_ON, Check, Decision, Engine, FOR_THE_PERSON, stopped};
 
 pub const HOST: &str = "claude-code";
 
-/// What the human sees when a session is stopped. Claude sees it too if the conversation
-/// continues, so it names no rule.
-const STOPPED: &str = "reaper stopped this session. The reaper console shows why.";
 /// For the human, in a terminal, when its work waits for a fresh session to take it over.
 const HANDED_ON: &str = "reaper stopped this session. /clear starts a fresh one that takes its work over.";
 /// The same in a chat (the editor's, an app's), where carrying on means staying in it.
@@ -44,10 +41,10 @@ fn deny(reason: &str) -> Value {
 }
 
 /// Denied, and the agent making the call stops. `note` is for the human: how to carry it on.
-fn stop(note: Option<&str>) -> Value {
-    let mut output = deny("Stopped.");
+fn stop(note: Option<&str>, redirect: &str) -> Value {
+    let mut output = deny(&stopped(redirect));
     output["continue"] = false.into();
-    output["stopReason"] = STOPPED.into();
+    output["stopReason"] = stopped(redirect).into();
     if let Some(note) = note {
         output["systemMessage"] = note.into();
     }
@@ -344,7 +341,7 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
     let end_turn = |rule: &str, together: bool| match died(rule, together) {
         Ending::Stop(note) => {
             engine.event(HOST, agent, "agent.idle", json!({}));
-            let mut output = json!({ "continue": false, "stopReason": STOPPED });
+            let mut output = json!({ "continue": false, "stopReason": stopped(&engine.redirect_of(rule)) });
             if let Some(note) = note {
                 output["systemMessage"] = note.into();
             }
@@ -353,8 +350,8 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
         Ending::CarryOn(work) => Some(json!({ "decision": "block", "reason": work, "systemMessage": CARRIED_ON })),
     };
     // Its call is refused either way: stopped, or told its work instead.
-    let refused = |ending: Ending| match ending {
-        Ending::Stop(note) => stop(note),
+    let refused = |rule: &str, together: bool| match died(rule, together) {
+        Ending::Stop(note) => stop(note, &engine.redirect_of(rule)),
         Ending::CarryOn(work) => {
             let mut output = deny(&work);
             output["systemMessage"] = CARRIED_ON.into();
@@ -434,8 +431,8 @@ fn reply_in(engine: &Engine, event: &Value, entrypoint: &str) -> Option<Value> {
                     engine.event(HOST, agent, "agent.redirected", json!({ "rule": rule, "redirect": redirect }));
                     Some(deny(&redirect))
                 }
-                Decision::Kill { rule, is_final: true, .. } => Some(refused(died(&rule, false))),
-                Decision::Stopped { rule } => Some(refused(died(&rule, true))),
+                Decision::Kill { rule, is_final: true, .. } => Some(refused(&rule, false)),
+                Decision::Stopped { rule } => Some(refused(&rule, true)),
                 // Nobody sees permission prompts: the person was asked with the question tool, or
                 // wasn't asked at all.
                 Decision::Ask { rule, .. } if unattended(event) => {
@@ -662,7 +659,9 @@ mod tests {
         let out = reply(&engine, &pre_tool_use("psql prod -c 3")).unwrap();
         assert_eq!(out["continue"], false);
         assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert!(!out.to_string().contains("no-prod") && !out.to_string().contains("staging"));
+        // Whatever carries its work on hears the way to go, not the rule.
+        assert!(!out.to_string().contains("no-prod"), "{out}");
+        assert_eq!(out["stopReason"], crate::engine::stopped("Use the staging database."));
         assert!(sandbox.events().ends_with(&["agent.killed".to_string(), "agent.died".to_string()]));
     }
 
@@ -687,7 +686,10 @@ mod tests {
         let engine = sandbox.engine(RULES);
         let stopped = stopped_and_cleared(&engine);
         // The human hears how to carry it on; the stopped session only that it stopped.
-        assert_eq!((&stopped["systemMessage"], &stopped["stopReason"]), (&json!(HANDED_ON), &json!(STOPPED)));
+        assert_eq!(
+            (&stopped["systemMessage"], &stopped["stopReason"]),
+            (&json!(HANDED_ON), &json!(crate::engine::stopped("Use the staging database.")))
+        );
         let log = std::fs::read_to_string(sandbox.root.join("events.jsonl")).unwrap();
         assert!(log.contains(r#""carry_on":"/clear""#), "the console hears it too: {log}");
 
@@ -802,7 +804,7 @@ mod tests {
         engine.prompted(HOST, "s1", "Load the fixtures.");
         reply_in(&engine, &pre_tool_use("psql prod -c 6"), "sdk-cli");
         let out = reply_in(&engine, &pre_tool_use("psql prod -c 7"), "sdk-cli").unwrap();
-        assert_eq!(out["stopReason"], STOPPED, "nobody is there to /clear");
+        assert_eq!(out["stopReason"], stopped("Use the staging database."), "nobody is there to /clear");
         assert_eq!(engine.store.session(HOST, "s1").handoff, None);
     }
 

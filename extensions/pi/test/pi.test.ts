@@ -87,6 +87,7 @@ describe("talking to the reaper binary", () => {
       strike: 2,
       final: true,
       reason: "strikes",
+      stopped: "reaper stopped this session. To carry on its work: Open a pull request.",
     })
   })
 

@@ -3,6 +3,7 @@
 //!
 //!   {"op":"check","host":"pi","session":…,"agent":…,"dir":…,"tool":…,"args":{…},"goal":…}
 //!     → {"kind":"allow"} | {"kind":"kill","rule":…,"redirect":…,"strike":n,"final":bool,"reason"?:…}
+//!       (a final kill adds "stopped": what's said of the stop, with the redirect, never the rule)
 //!       | {"kind":"ask","rule":…,"redirect":…,"why":…} | {"kind":"noted","message":…}
 //!       | {"kind":"confirm","change":…}, for the person to allow: the call changes reaper itself
 //!       (plus "problem" when the rules on disk can't be used)
@@ -28,7 +29,7 @@ use std::path::PathBuf;
 use reaper_core::events::{now, written};
 use serde_json::{Map, Value, json};
 
-use crate::engine::{Check, Decision, Engine};
+use crate::engine::{Check, Decision, Engine, stopped};
 
 /// Enough of a prompt to tell sessions apart by, and to read in the console.
 const MAX_PROMPT: usize = 2000;
@@ -57,13 +58,15 @@ pub fn reply(engine: &Engine, request: &Value) -> Value {
                     if is_final {
                         let stops = engine.config.all_rules().any(|(_, r)| r.id == rule && r.stops());
                         kill["reason"] = (if stops { "stop" } else { "strikes" }).into();
+                        kill["stopped"] = stopped(&engine.redirect_of(&rule)).into();
                     }
                     kill
                 }
                 // A pi session is one agent, which its own limit stops first; kept for any host
                 // with helpers that talks to the engine this way.
                 Decision::Stopped { rule } => {
-                    json!({ "kind": "kill", "rule": rule, "redirect": "", "strike": 0, "final": true, "reason": "together" })
+                    let redirect = engine.redirect_of(&rule);
+                    json!({ "kind": "kill", "rule": rule, "redirect": redirect, "strike": 0, "final": true, "reason": "together", "stopped": stopped(&redirect) })
                 }
                 Decision::Ask { rule, redirect, why } => {
                     json!({ "kind": "ask", "rule": rule, "redirect": redirect, "why": why })
@@ -179,7 +182,7 @@ mod tests {
         let request = json!({ "op": "check", "session": "s", "agent": "s", "dir": "/w", "tool": "bash", "args": { "command": "git push" }, "goal": "" });
         assert_eq!(
             reply(&engine, &request),
-            json!({ "kind": "kill", "rule": "push", "redirect": "Open a PR.", "strike": 1, "final": true, "reason": "strikes" })
+            json!({ "kind": "kill", "rule": "push", "redirect": "Open a PR.", "strike": 1, "final": true, "reason": "strikes", "stopped": "reaper stopped this session. To carry on its work: Open a PR." })
         );
     }
 

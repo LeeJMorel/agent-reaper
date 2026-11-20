@@ -105,6 +105,7 @@ struct Outcome {
     agent_requests: Vec<String>,
     watcher_systems: Vec<String>,
     watcher_asks: Vec<String>,
+    stderr: String,
 }
 
 /// A home directory with pi set up against the fake model, and reaper's rules.
@@ -215,6 +216,7 @@ fn run_task(name: &str, settings: &str, task: &str) -> Outcome {
         agent_requests: seen.agent.clone(),
         watcher_systems: seen.watcher.clone(),
         watcher_asks: seen.asks.clone(),
+        stderr: String::from_utf8_lossy(&output.stderr).into(),
     }
 }
 
@@ -304,6 +306,11 @@ fn hitting_the_strike_limit_kills_the_agent_for_good() {
     assert!(event(&o.events, "agent.died").is_some());
     assert!(event(&o.events, "agent.redirected").is_none());
     assert_eq!(o.agent_requests.len(), 1, "no model call after death");
+    // What runs it carries the work on: it hears the way to go, never the rule.
+    let stopped = format!("reaper stopped this session. To carry on its work: {REDIRECT}");
+    assert!(o.stderr.contains(&stopped), "{}", o.stderr);
+    assert!(o.sessions.contains(&stopped), "{}", o.sessions);
+    assert!(!o.stderr.contains(RULE_ID) && !o.stderr.contains(RULE_TEXT), "{}", o.stderr);
 }
 
 /// In a terminal, in a git worktree, a session that starts the work and then keeps breaking a

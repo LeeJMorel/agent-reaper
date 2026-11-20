@@ -40,6 +40,8 @@ type Kill = {
   strike: number
   final: boolean
   reason?: "strikes" | "stop" | "together"
+  /** On a final kill: what's said of the stop, with the redirect and never the rule. */
+  stopped?: string
 }
 /** The agent asked (`reaper ask`) and made the blocked call again: the person decides, for this call only. */
 type AskThePerson = { kind: "ask"; rule: string; redirect: string; why: string }
@@ -405,9 +407,21 @@ export function reaper(ask: Ask = askReaper) {
           dir: ctx.cwd,
         })
         handoff = reply?.handoff
-        const next = handoff ? " A fresh session takes its work over." : ""
-        if (ctx.hasUI) ctx.ui.notify(`reaper stopped this session (rule ${rule}).${next}`, "error")
-        return { entries }
+        if (ctx.hasUI) {
+          const next = handoff ? " A fresh session takes its work over." : ""
+          ctx.ui.notify(`reaper stopped this session (rule ${rule}).${next}`, "error")
+          return { entries }
+        }
+        // Print, JSON and RPC runs get no fresh session: the script or agent driving them carries
+        // the work on, so it hears the way to go, on stderr and in the session, never the rule.
+        const stopped = final.stopped ?? `reaper stopped this session. To carry on its work: ${final.redirect}`
+        process.stderr.write(`${stopped}\n`)
+        return {
+          entries: [
+            ...entries,
+            { type: "custom_message", customType: "reaper.stopped", content: stopped, display: true },
+          ],
+        }
       }
       const redirect = [...new Set(decisions.map((d) => d.redirect))].join("\n")
       await emit(ctx, id, "agent.redirected", { rule, redirect })
